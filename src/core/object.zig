@@ -59,6 +59,38 @@ pub fn encodeObject(
     return obj_hash;
 }
 
+pub fn encodeObjectFromReader(
+    writer: anytype,
+    obj_type: ObjectType,
+    payload_len: usize,
+    reader: *std.Io.Reader,
+) !Hash {
+    const type_byte = [1]u8{@intFromEnum(obj_type)};
+    var hasher = hash_mod.Hasher.init();
+    hasher.update(&type_byte);
+
+    try writer.writeInt(u32, MAGIC, .little);
+    try writer.writeByte(VERSION);
+    try writer.writeByte(@intFromEnum(obj_type));
+    try writer.writeInt(u32, @intCast(payload_len), .little);
+
+    var copy_buf: [4096]u8 = undefined;
+    var remaining = payload_len;
+    while (remaining > 0) {
+        const chunk = copy_buf[0..@min(copy_buf.len, remaining)];
+        const n = try reader.readSliceShort(chunk);
+        if (n == 0) return error.EndOfStream;
+
+        hasher.update(chunk[0..n]);
+        try writer.writeAll(chunk[0..n]);
+        remaining -= n;
+    }
+
+    const obj_hash = hasher.final();
+    try writer.writeAll(&obj_hash);
+    return obj_hash;
+}
+
 pub fn decodeObjectHeader(reader: anytype) !ObjectHeader {
     const magic = try reader.takeInt(u32, .little);
     if (magic != MAGIC) return error.CorruptObject;
@@ -123,20 +155,23 @@ pub const Store = struct {
     /// Store raw payload bytes under the given type
     /// Returns the content hash (BLAKE3 of type-byte ++ payload)
     pub fn put(self: *const Store, obj_type: ObjectType, payload: []const u8) !Hash {
-        const type_byte = [1]u8{@intFromEnum(obj_type)};
-        const parts: []const []const u8 = &.{ &type_byte, payload };
-        const obj_hash = hash_mod.blake3Many(parts);
+        var reader = std.io.Reader.fixed(payload);
+        return self.putReader(obj_type, payload.len, &reader);
+    }
 
-        const path = try self.objectPath(obj_hash);
-        defer self.alloc.free(path);
+    /// Store payload bytes from a reader under the given type.
+    /// Caller must provide the exact payload length in bytes.
+    pub fn putReader(
+        self: *const Store,
+        obj_type: ObjectType,
+        payload_len: usize,
+        reader: *std.Io.Reader,
+    ) !Hash {
+        try self.dir.makePath(".tmp");
 
-        // Skip if already stored (idempotent)
-        if (self.exists(obj_hash)) return obj_hash;
-
-        const dir_path = std.fs.path.dirname(path).?;
-        try self.dir.makePath(dir_path);
-
-        const tmp_path = try std.fmt.allocPrint(self.alloc, "{s}.tmp", .{path});
+        var rand_buf: [8]u8 = undefined;
+        std.crypto.random.bytes(&rand_buf);
+        const tmp_path = try std.fmt.allocPrint(self.alloc, ".tmp/{x}.tmp", .{rand_buf});
         defer self.alloc.free(tmp_path);
 
         const f = try self.dir.createFile(tmp_path, .{});
@@ -146,10 +181,21 @@ pub const Store = struct {
         var file_writer = f.writer(&write_buf);
         const w = &file_writer.interface;
 
-        _ = try encodeObject(w, obj_type, payload);
+        const obj_hash = try encodeObjectFromReader(w, obj_type, payload_len, reader);
 
         try w.flush();
 
+        const path = try self.objectPath(obj_hash);
+        defer self.alloc.free(path);
+
+        // Skip if already stored (idempotent)
+        if (self.exists(obj_hash)) {
+            self.dir.deleteFile(tmp_path) catch {};
+            return obj_hash;
+        }
+
+        const dir_path = std.fs.path.dirname(path).?;
+        try self.dir.makePath(dir_path);
         try self.dir.rename(tmp_path, path);
         return obj_hash;
     }
@@ -243,6 +289,25 @@ test "store deduplication" {
     const h1 = try store.put(.blob, "dedup test");
     const h2 = try store.put(.blob, "dedup test");
     try std.testing.expectEqualSlices(u8, &h1, &h2);
+}
+
+test "store putReader streams payload into object" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var objects_dir = try tmp_dir.dir.openDir(".", .{});
+    defer objects_dir.close();
+
+    var store = Store{ .dir = objects_dir, .alloc = alloc };
+
+    var reader = std.io.Reader.fixed("streamed payload");
+    const h = try store.putReader(.blob, "streamed payload".len, &reader);
+
+    const obj = try store.get(h);
+    defer alloc.free(obj.payload);
+
+    try std.testing.expectEqual(ObjectType.blob, obj.obj_type);
+    try std.testing.expectEqualStrings("streamed payload", obj.payload);
 }
 
 test "store missing hash returns NotFound" {
