@@ -29,6 +29,8 @@ pub const ObjectType = enum(u8) {
 
 pub const MAGIC: u32 = 0x4E_4F_44_55; // "NODU"
 pub const VERSION: u8 = 1;
+const object_rel_path_len = 2 + 1 + 2 + 1 + 64; // xx/yy/full-hex-hash
+const object_dir_path_len = 2 + 1 + 2; // xx/yy
 
 pub const ObjectHeader = struct {
     obj_type: ObjectType,
@@ -147,11 +149,6 @@ pub const Store = struct {
         self.dir.close();
     }
 
-    /// Create the on-disk directory tree if it doesn't exist
-    pub fn ensureExists(self: *const Store) !void {
-        _ = self;
-    }
-
     /// Store raw payload bytes under the given type
     /// Returns the content hash (BLAKE3 of type-byte ++ payload)
     pub fn put(self: *const Store, obj_type: ObjectType, payload: []const u8) !Hash {
@@ -186,10 +183,11 @@ pub const Store = struct {
 
         try w.flush();
 
-        const path = try self.objectPath(obj_hash);
-        defer self.alloc.free(path);
+        var path_buf: [object_rel_path_len]u8 = undefined;
+        const path = self.objectPath(&path_buf, obj_hash);
 
-        const dir_path = std.fs.path.dirname(path).?;
+        var dir_path_buf: [object_dir_path_len]u8 = undefined;
+        const dir_path = self.objectDirPath(&dir_path_buf, obj_hash);
         try self.dir.makePath(dir_path);
         self.dir.rename(tmp_path, path) catch |err| switch (err) {
             error.PathAlreadyExists => {
@@ -203,8 +201,8 @@ pub const Store = struct {
 
     /// Load an object by hash.  Returns error.NotFound if missing.
     pub fn get(self: *const Store, obj_hash: Hash) !Object {
-        const path = try self.objectPath(obj_hash);
-        defer self.alloc.free(path);
+        var path_buf: [object_rel_path_len]u8 = undefined;
+        const path = self.objectPath(&path_buf, obj_hash);
 
         const f = self.dir.openFile(path, .{}) catch |e| {
             if (e == error.FileNotFound) return error.NotFound;
@@ -220,8 +218,8 @@ pub const Store = struct {
 
     /// Load only the object header. Returns error.NotFound if missing
     pub fn getHeader(self: *const Store, obj_hash: Hash) !ObjectHeader {
-        const path = try self.objectPath(obj_hash);
-        defer self.alloc.free(path);
+        var path_buf: [object_rel_path_len]u8 = undefined;
+        const path = self.objectPath(&path_buf, obj_hash);
 
         const f = self.dir.openFile(path, .{}) catch |e| {
             if (e == error.FileNotFound) return error.NotFound;
@@ -237,22 +235,29 @@ pub const Store = struct {
 
     /// Check existence without loading
     pub fn exists(self: *const Store, obj_hash: Hash) bool {
-        const path = self.objectPath(obj_hash) catch return false;
-        defer self.alloc.free(path);
+        var path_buf: [object_rel_path_len]u8 = undefined;
+        const path = self.objectPath(&path_buf, obj_hash);
         self.dir.access(path, .{}) catch return false;
         return true;
     }
 
-    fn objectPath(self: *const Store, obj_hash: Hash) ![]u8 {
-        // hex of full hash
+    fn objectPath(_: *const Store, buf: *[object_rel_path_len]u8, obj_hash: Hash) []const u8 {
         var hex_buf: [64]u8 = undefined;
         const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{obj_hash}) catch unreachable;
-
-        return std.fs.path.join(self.alloc, &.{
+        return std.fmt.bufPrint(buf, "{s}/{s}/{s}", .{
             hex[0..2],
             hex[2..4],
             hex,
-        });
+        }) catch unreachable;
+    }
+
+    fn objectDirPath(_: *const Store, buf: *[object_dir_path_len]u8, obj_hash: Hash) []const u8 {
+        var hex_buf: [64]u8 = undefined;
+        const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{obj_hash}) catch unreachable;
+        return std.fmt.bufPrint(buf, "{s}/{s}", .{
+            hex[0..2],
+            hex[2..4],
+        }) catch unreachable;
     }
 };
 
