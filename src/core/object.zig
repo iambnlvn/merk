@@ -176,6 +176,7 @@ pub const Store = struct {
 
         const f = try self.dir.createFile(tmp_path, .{});
         defer f.close();
+        errdefer self.dir.deleteFile(tmp_path) catch {};
 
         var write_buf: [4096]u8 = undefined;
         var file_writer = f.writer(&write_buf);
@@ -188,15 +189,15 @@ pub const Store = struct {
         const path = try self.objectPath(obj_hash);
         defer self.alloc.free(path);
 
-        // Skip if already stored (idempotent)
-        if (self.exists(obj_hash)) {
-            self.dir.deleteFile(tmp_path) catch {};
-            return obj_hash;
-        }
-
         const dir_path = std.fs.path.dirname(path).?;
         try self.dir.makePath(dir_path);
-        try self.dir.rename(tmp_path, path);
+        self.dir.rename(tmp_path, path) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                self.dir.deleteFile(tmp_path) catch {};
+                return obj_hash;
+            },
+            else => return err,
+        };
         return obj_hash;
     }
 
@@ -289,6 +290,28 @@ test "store deduplication" {
     const h1 = try store.put(.blob, "dedup test");
     const h2 = try store.put(.blob, "dedup test");
     try std.testing.expectEqualSlices(u8, &h1, &h2);
+}
+
+test "store putReader tolerates destination appearing before rename" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var objects_dir = try tmp_dir.dir.openDir(".", .{});
+    defer objects_dir.close();
+
+    var store = Store{ .dir = objects_dir, .alloc = alloc };
+
+    const payload = "race-safe payload";
+    const h = try store.put(.blob, payload);
+
+    var reader = std.io.Reader.fixed(payload);
+    const h2 = try store.putReader(.blob, payload.len, &reader);
+
+    try std.testing.expectEqualSlices(u8, &h, &h2);
+
+    const obj = try store.get(h2);
+    defer alloc.free(obj.payload);
+    try std.testing.expectEqualStrings(payload, obj.payload);
 }
 
 test "store putReader streams payload into object" {
