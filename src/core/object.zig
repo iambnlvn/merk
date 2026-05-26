@@ -172,8 +172,15 @@ pub const Store = struct {
         defer self.alloc.free(tmp_path);
 
         const f = try self.dir.createFile(tmp_path, .{});
-        defer f.close();
-        errdefer self.dir.deleteFile(tmp_path) catch {};
+        var file_closed = false;
+        defer if (!file_closed) f.close();
+        errdefer {
+            if (!file_closed) {
+                f.close();
+                file_closed = true;
+            }
+            self.dir.deleteFile(tmp_path) catch {};
+        }
 
         var write_buf: [4096]u8 = undefined;
         var file_writer = f.writer(&write_buf);
@@ -182,14 +189,19 @@ pub const Store = struct {
         const obj_hash = try encodeObjectFromReader(w, obj_type, payload_len, reader);
 
         try w.flush();
+        f.close();
+        file_closed = true;
 
         var path_buf: [object_rel_path_len]u8 = undefined;
         const path = self.objectPath(&path_buf, obj_hash);
 
         var dir_path_buf: [object_dir_path_len]u8 = undefined;
         const dir_path = self.objectDirPath(&dir_path_buf, obj_hash);
-        try self.dir.makePath(dir_path);
         self.dir.rename(tmp_path, path) catch |err| switch (err) {
+            error.FileNotFound => {
+                try self.dir.makePath(dir_path);
+                try self.dir.rename(tmp_path, path);
+            },
             error.PathAlreadyExists => {
                 self.dir.deleteFile(tmp_path) catch {};
                 return obj_hash;
