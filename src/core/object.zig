@@ -31,6 +31,7 @@ pub const MAGIC: u32 = 0x4E_4F_44_55; // "NODU"
 pub const VERSION: u8 = 1;
 const object_rel_path_len = 2 + 1 + 2 + 1 + 64; // xx/yy/full-hex-hash
 const object_dir_path_len = 2 + 1 + 2; // xx/yy
+const object_header_len = 10;
 
 pub const ObjectHeader = struct {
     obj_type: ObjectType,
@@ -106,6 +107,20 @@ pub fn decodeObjectHeader(reader: anytype) !ObjectHeader {
     return .{
         .obj_type = obj_type,
         .payload_len = try reader.takeInt(u32, .little),
+    };
+}
+
+fn decodeObjectHeaderBytes(bytes: *const [object_header_len]u8) !ObjectHeader {
+    if (std.mem.readInt(u32, bytes[0..4], .little) != MAGIC) {
+        return error.CorruptObject;
+    }
+    if (bytes[4] != VERSION) {
+        return error.UnsupportedVersion;
+    }
+
+    return .{
+        .obj_type = @enumFromInt(bytes[5]),
+        .payload_len = std.mem.readInt(u32, bytes[6..10], .little),
     };
 }
 
@@ -270,6 +285,84 @@ pub const Store = struct {
             hex[0..2],
             hex[2..4],
         }) catch unreachable;
+    }
+};
+
+pub const ObjectReader = struct {
+    file: std.fs.File,
+    header: ObjectHeader,
+    hasher: hash_mod.Hasher,
+    remaining_bytes: usize,
+    trailer_verified: bool,
+
+    pub fn init(store: *const Store, obj_hash: Hash) !ObjectReader {
+        var path_buf: [object_rel_path_len]u8 = undefined;
+        const path = store.objectPath(&path_buf, obj_hash);
+
+        const file = store.dir.openFile(path, .{}) catch |e| {
+            if (e == error.FileNotFound) return error.NotFound;
+            return e;
+        };
+        errdefer file.close();
+
+        var header_buf: [object_header_len]u8 = undefined;
+        const n = try file.readAll(&header_buf);
+        if (n != header_buf.len) return error.EndOfStream;
+
+        const header = try decodeObjectHeaderBytes(&header_buf);
+        var hasher = hash_mod.Hasher.init();
+        hasher.update(&[1]u8{@intFromEnum(header.obj_type)});
+
+        return .{
+            .file = file,
+            .header = header,
+            .hasher = hasher,
+            .remaining_bytes = header.payload_len,
+            .trailer_verified = false,
+        };
+    }
+
+    pub fn deinit(self: *ObjectReader) void {
+        self.file.close();
+    }
+
+    pub fn read(self: *ObjectReader, buffer: []u8) !usize {
+        if (buffer.len == 0) {
+            if (self.remaining_bytes == 0 and !self.trailer_verified) {
+                try self.verifyTrailer();
+            }
+            return 0;
+        }
+
+        if (self.remaining_bytes == 0) {
+            if (!self.trailer_verified) {
+                try self.verifyTrailer();
+            }
+            return 0;
+        }
+
+        const to_read = @min(buffer.len, self.remaining_bytes);
+        const n = try self.file.readAll(buffer[0..to_read]);
+        if (n != to_read) return error.EndOfStream;
+
+        self.hasher.update(buffer[0..n]);
+        self.remaining_bytes -= n;
+        if (self.remaining_bytes == 0) {
+            try self.verifyTrailer();
+        }
+        return n;
+    }
+
+    fn verifyTrailer(self: *ObjectReader) !void {
+        if (self.trailer_verified) return;
+
+        var stored_hash: Hash = undefined;
+        const n = try self.file.readAll(&stored_hash);
+        if (n != stored_hash.len) return error.EndOfStream;
+
+        const computed = self.hasher.final();
+        if (!std.mem.eql(u8, &computed, &stored_hash)) return error.HashMismatch;
+        self.trailer_verified = true;
     }
 };
 
@@ -484,4 +577,65 @@ test "decodeObject rejects hash mismatch" {
 
     var reader = std.io.Reader.fixed(bytes.items);
     try std.testing.expectError(error.HashMismatch, decodeObject(std.testing.allocator, &reader));
+}
+
+test "ObjectReader streams payload and verifies trailer" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var objects_dir = try tmp_dir.dir.openDir(".", .{});
+    defer objects_dir.close();
+
+    var store = Store{ .dir = objects_dir, .alloc = alloc };
+    const payload = "stream me in chunks";
+    const h = try store.put(.blob, payload);
+
+    var object_reader = try ObjectReader.init(&store, h);
+    defer object_reader.deinit();
+
+    try std.testing.expectEqual(ObjectType.blob, object_reader.header.obj_type);
+    try std.testing.expectEqual(@as(u32, payload.len), object_reader.header.payload_len);
+
+    var out: [8]u8 = undefined;
+    var collected: std.ArrayList(u8) = .empty;
+    defer collected.deinit(alloc);
+
+    while (true) {
+        const n = try object_reader.read(&out);
+        if (n == 0) break;
+        try collected.appendSlice(alloc, out[0..n]);
+    }
+
+    try std.testing.expectEqualStrings(payload, collected.items);
+}
+
+test "ObjectReader detects hash mismatch at end of stream" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var objects_dir = try tmp_dir.dir.openDir(".", .{});
+    defer objects_dir.close();
+
+    var store = Store{ .dir = objects_dir, .alloc = alloc };
+    const payload = "verify me";
+    const h = try store.put(.blob, payload);
+
+    var path_buf: [object_rel_path_len]u8 = undefined;
+    const path = store.objectPath(&path_buf, h);
+
+    var file = try store.dir.openFile(path, .{ .mode = .read_write });
+    defer file.close();
+
+    const hash_offset = object_header_len + payload.len;
+    try file.pwriteAll(&[_]u8{0xFF}, hash_offset);
+
+    var object_reader = try ObjectReader.init(&store, h);
+    defer object_reader.deinit();
+
+    var out: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), try object_reader.read(&out));
+    try std.testing.expectEqualStrings(payload[0..4], out[0..4]);
+    try std.testing.expectEqual(@as(usize, 4), try object_reader.read(&out));
+    try std.testing.expectEqualStrings(payload[4..8], out[0..4]);
+    try std.testing.expectError(error.HashMismatch, object_reader.read(&out));
 }
