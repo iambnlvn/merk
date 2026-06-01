@@ -70,11 +70,7 @@ pub fn fromHex(s: []const u8) !Hash {
 
 /// First 8 hex chars — useful for display / directory sharding
 pub fn shortHex(h: Hash) [8]u8 {
-    var buf: [8]u8 = undefined;
-    _ = std.fmt.bufPrint(&buf, "{}", .{
-        std.fmt.fmtSliceHexLower(h[0..4]),
-    }) catch unreachable;
-    return buf;
+    return std.fmt.bytesToHex(h[0..4].*, .lower);
 }
 
 test "blake3 deterministic" {
