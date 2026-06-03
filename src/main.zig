@@ -60,6 +60,20 @@ pub fn main() !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "write-tree")) {
+        var store = try nodus.object.Store.init(alloc, repo_root);
+        defer store.deinit();
+        var index = try nodus.index.Index.init(alloc, repo_root);
+        defer index.deinit();
+        try index.load();
+
+        const tree_hash = try nodus.tree.writeFromIndex(alloc, &store, index.entries.items);
+        const hex = try nodus.hash.toHex(alloc, tree_hash);
+        defer alloc.free(hex);
+        std.debug.print("{s}\n", .{hex});
+        return;
+    }
+
     return usage();
 }
 
@@ -69,6 +83,7 @@ fn usage() void {
         \\  nodus init
         \\  nodus add <path>...
         \\  nodus status
+        \\  nodus write-tree
         \\
     , .{});
 }
