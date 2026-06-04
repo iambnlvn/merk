@@ -71,31 +71,29 @@ pub fn encodeObject(
     return obj_hash;
 }
 
-pub fn decodeObject(alloc: std.mem.Allocator, reader: anytype) !Object {
-    const header = try decodeObjectHeader(reader);
+pub fn decodeObject(alloc: std.mem.Allocator, file: std.fs.File) !Object {
+    var header_buf: [object_header_len]u8 = undefined;
+    var header_reader = file.readerStreaming(&header_buf);
+    const header = try decodeObjectHeader(&header_reader.interface);
 
-    const payload = switch (header.codec) {
-        .none => blk: {
-            const bytes = try alloc.alloc(u8, header.payload_len);
-            errdefer alloc.free(bytes);
-            @memcpy(bytes, try reader.take(header.payload_len));
-            break :blk bytes;
-        },
-    };
+    const payload = try alloc.alloc(u8, header.payload_len);
     errdefer alloc.free(payload);
 
+    // payload IS the reader buffer, so take() returns a slice into it
+    var payload_reader = file.readerStreaming(payload);
+    _ = try payload_reader.interface.take(header.payload_len);
+
+    var hash_buf: [32]u8 = undefined;
+    var hash_reader = file.readerStreaming(&hash_buf);
     var stored_hash: Hash = undefined;
-    @memcpy(&stored_hash, try reader.take(stored_hash.len));
+    @memcpy(&stored_hash, try hash_reader.interface.take(stored_hash.len));
 
     const type_byte = [1]u8{@intFromEnum(header.obj_type)};
     const parts: []const []const u8 = &.{ &type_byte, payload };
     const computed = hash_mod.blake3Many(parts);
     if (!std.mem.eql(u8, &computed, &stored_hash)) return error.HashMismatch;
 
-    return .{
-        .obj_type = header.obj_type,
-        .payload = payload,
-    };
+    return .{ .obj_type = header.obj_type, .payload = payload };
 }
 
 pub fn decodeObjectHeader(reader: anytype) !ObjectHeader {
@@ -245,9 +243,7 @@ pub const Store = struct {
         };
         defer f.close();
 
-        var read_buf: [4096]u8 = undefined;
-        var file_reader = f.readerStreaming(&read_buf);
-        return decodeObject(self.alloc, &file_reader.interface);
+        return decodeObject(self.alloc, f);
     }
 
     pub fn getHeader(self: *const Store, obj_hash: Hash) !ObjectHeader {
