@@ -260,7 +260,7 @@ pub const DiffArgs = struct {
     }
 };
 
-fn parseFormat(s: []const u8) ?Format {
+pub fn parseFormat(s: []const u8) ?Format {
     const map = std.StaticStringMap(Format).initComptime(.{
         .{ "unified", .unified },
         .{ "side-by-side", .side_by_side },
@@ -271,7 +271,7 @@ fn parseFormat(s: []const u8) ?Format {
     return map.get(s);
 }
 
-fn parseLevel(s: []const u8) ?Level {
+pub fn parseLevel(s: []const u8) ?Level {
     const map = std.StaticStringMap(Level).initComptime(.{
         .{ "file", .file },
         .{ "hunk", .hunk },
@@ -281,7 +281,7 @@ fn parseLevel(s: []const u8) ?Level {
     return map.get(s);
 }
 
-fn parseContext(s: []const u8) ?Context {
+pub fn parseContext(s: []const u8) ?Context {
     if (std.mem.eql(u8, s, "minimal")) return .minimal;
     if (std.mem.eql(u8, s, "normal")) return .normal;
     if (std.mem.eql(u8, s, "full")) return .full;
@@ -289,7 +289,7 @@ fn parseContext(s: []const u8) ?Context {
     return .{ .exact = n };
 }
 
-fn parseGroupBy(s: []const u8) ?GroupBy {
+pub fn parseGroupBy(s: []const u8) ?GroupBy {
     const map = std.StaticStringMap(GroupBy).initComptime(.{
         .{ "none", .none },
         .{ "files", .files },
@@ -864,7 +864,7 @@ fn makeWordDelta(op: Op, word: []const u8, _: u32, _: u32) WordDelta {
     return .{ .op = op, .word = word, .lineno = 0 };
 }
 
-fn fileStatus(fd: *const FileDiff) FileStatus {
+pub fn fileStatus(fd: *const FileDiff) FileStatus {
     var has_ins = false;
     var has_del = false;
     for (fd.line_deltas) |d| switch (d.op) {
