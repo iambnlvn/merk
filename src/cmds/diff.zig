@@ -11,7 +11,7 @@ const Error = error{
 };
 fn printUsage() void {
     std.debug.print(
-        "usage: nodus diff [--format=<side-by-side|grouped|block|word-highlight|summary|operations|modern>] [--color] [--no-color]\n",
+        "usage: nodus diff [--format=<side-by-side|grouped|block|word-highlight|operations|modern>] [--color] [--no-color]\n",
         .{},
     );
 }
@@ -97,12 +97,16 @@ pub fn run(
 
     if (file_diffs.items.len == 0) return;
 
-    if (options.view == .summary) {
-        try diff.renderSummaryView(writer, file_diffs.items, options);
-    } else {
-        for (file_diffs.items) |fd| {
-            try diff.renderDiff(writer, &fd, options);
-        }
+    // if (options.view == .summary) {
+    //     @panic("NOT IMPLEMENTED");
+    // } else {
+    //     for (file_diffs.items) |fd| {
+    //         try diff.renderDiff(writer, &fd, options);
+    //     }
+    // }
+
+    for (file_diffs.items) |fd| {
+        try diff.renderDiff(writer, &fd, options);
     }
 
     try writer.flush();
