@@ -187,9 +187,9 @@ pub const DiffArgs = struct {
     working: bool = false,
     config: RenderConfig = .{},
 
-    pub fn parse(alloc: std.mem.Allocator, args: [][:0]const u8) !DiffArgs {
-        var da = DiffArgs{ .paths = std.ArrayList([]const u8).init(alloc) };
-        errdefer da.paths.deinit();
+    pub fn parse(alloc: std.mem.Allocator, args: []const []const u8) !DiffArgs {
+        var da = DiffArgs{ .paths = .empty };
+        errdefer da.paths.deinit(alloc);
 
         var i: usize = 2; // skip argv[0] and subcommand "diff"
         while (i < args.len) : (i += 1) {
@@ -248,15 +248,15 @@ pub const DiffArgs = struct {
                 } else if (da.refs[1] == null) {
                     da.refs[1] = arg;
                 } else {
-                    try da.paths.append(arg);
+                    try da.paths.append(alloc, arg);
                 }
             }
         }
         return da;
     }
 
-    pub fn deinit(self: *DiffArgs) void {
-        self.paths.deinit();
+    pub fn deinit(self: *DiffArgs, alloc: std.mem.Allocator) void {
+        self.paths.deinit(alloc);
     }
 };
 
@@ -1029,24 +1029,30 @@ test "summarize aggregates across files" {
     try std.testing.expectEqual(@as(u32, 1), s.lines_removed);
 }
 
-// test "DiffArgs parse format and level" {
-//     const alloc = std.testing.allocator;
-//     const args = &[_][:0]const u8{ "nodus", "diff", "--format", "side-by-side", "--level", "word" };
-//     var da = try DiffArgs.parse(alloc, args);
-//     defer da.deinit();
-//     try std.testing.expectEqual(Format.side_by_side, da.config.format);
-//     try std.testing.expectEqual(Level.word, da.config.level);
-// }
+test "DiffArgs parse format and level" {
+    const alloc = std.testing.allocator;
 
-// test "DiffArgs parse profile review" {
-//     const alloc = std.testing.allocator;
-//     const args = &[_][:0]const u8{ "nodus", "diff", "--profile", "review" };
-//     var da = try DiffArgs.parse(alloc, args);
-//     defer da.deinit();
-//     try std.testing.expectEqual(Format.side_by_side, da.config.format);
-//     try std.testing.expectEqual(Level.line, da.config.level);
-//     try std.testing.expectEqual(GroupBy.files, da.config.group_by);
-// }
+    const args = [_][]const u8{ "nodus", "diff", "--format", "side-by-side", "--level", "word" };
+    var da = try DiffArgs.parse(alloc, &args);
+    defer da.deinit(alloc);
+    try std.testing.expectEqual(Format.side_by_side, da.config.format);
+    try std.testing.expectEqual(Level.word, da.config.level);
+}
+
+test "DiffArgs parse profile review" {
+    const alloc = std.testing.allocator;
+    const args = [_][:0]const u8{
+        @as([:0]const u8, "nodus"),
+        @as([:0]const u8, "diff"),
+        @as([:0]const u8, "--profile"),
+        @as([:0]const u8, "review"),
+    };
+    var da = try DiffArgs.parse(alloc, &args);
+    defer da.deinit(alloc);
+    try std.testing.expectEqual(Format.side_by_side, da.config.format);
+    try std.testing.expectEqual(Level.line, da.config.level);
+    try std.testing.expectEqual(GroupBy.files, da.config.group_by);
+}
 
 test "ChangeFilter parse comma list" {
     const f = ChangeFilter.parse("added,modified");
