@@ -1,3 +1,5 @@
+//  Nodus diff engine + CLI surface
+//
 //  Two passes on every changed file:
 //    * Line-level unified diff  (for display, `nodus show`)
 //    * Word-level diff          (for precision, intent classifier)
@@ -8,11 +10,6 @@
 //  Algorithm: Myers diff (O(ND) shortest edit script)
 
 const std = @import("std");
-const hash_mod = @import("hash.zig");
-const object = @import("object.zig");
-
-const Hash = hash_mod.Hash;
-const Store = object.Store;
 
 pub const Op = enum(u8) {
     eq = 0,
@@ -58,9 +55,9 @@ pub const FileDiff = struct {
 pub const CommitDiff = struct {
     files: []FileDiff,
     /// Hash of the serialized unified line diff (stored as a blob)
-    line_diff_hash: Hash,
+    line_diff_hash: [32]u8,
     /// Hash of the serialized word diff (stored as a blob)
-    word_diff_hash: Hash,
+    word_diff_hash: [32]u8,
 
     pub fn deinit(self: *CommitDiff, alloc: std.mem.Allocator) void {
         for (self.files) |*f| f.deinit(alloc);
@@ -74,39 +71,233 @@ pub const FileSnapshot = struct {
     content: []const u8,
 };
 
-pub const DiffView = enum {
-    sideBySide,
-    grouped,
-    block,
-    wordHighlight,
-    operations,
-    modern,
+pub const Format = enum {
+    unified,
+    side_by_side,
+    blocks,
+    ops,
+    summary,
 };
 
-pub const RenderOptions = struct {
-    view: DiffView = .modern,
-    color: bool = false,
-    context_lines: u32 = 3,
-    max_column_width: u32 = 60,
+pub const Level = enum {
+    file,
+    hunk,
+    line,
+    word,
 };
 
-pub const UnifiedOptions = RenderOptions;
+pub const Context = union(enum) {
+    exact: u32,
+    minimal,
+    normal,
+    full,
 
-pub fn parseView(view_name: []const u8) ?DiffView {
-    const map = std.StaticStringMap(DiffView).initComptime(.{
-        .{ "side-by-side", .sideBySide },
-        .{ "grouped", .grouped },
-        .{ "block", .block },
-        .{ "word-highlight", .wordHighlight },
-        .{ "operations", .operations },
-        .{ "modern", .modern },
+    pub fn lines(self: Context) u32 {
+        return switch (self) {
+            .exact => |n| n,
+            .minimal => 0,
+            .normal => 3,
+            .full => std.math.maxInt(u32),
+        };
+    }
+};
+
+pub const GroupBy = enum {
+    none,
+    files,
+    dirs,
+};
+
+pub const ColorMode = enum {
+    auto,
+    always,
+    never,
+};
+
+pub const FileStatus = enum { added, deleted, modified, unchanged };
+
+pub const ChangeFilter = struct {
+    show_added: bool = true,
+    show_deleted: bool = true,
+    show_modified: bool = true,
+
+    pub fn allows(self: ChangeFilter, status: FileStatus) bool {
+        return switch (status) {
+            .added => self.show_added,
+            .deleted => self.show_deleted,
+            .modified => self.show_modified,
+            .unchanged => false,
+        };
+    }
+
+    pub fn parse(raw: []const u8) ChangeFilter {
+        var f = ChangeFilter{ .show_added = false, .show_deleted = false, .show_modified = false };
+        var it = std.mem.splitScalar(u8, raw, ',');
+        while (it.next()) |part| {
+            if (std.mem.eql(u8, part, "added")) f.show_added = true;
+            if (std.mem.eql(u8, part, "deleted")) f.show_deleted = true;
+            if (std.mem.eql(u8, part, "modified")) f.show_modified = true;
+        }
+        return f;
+    }
+};
+
+pub const Profile = enum { review, ci, debug };
+
+pub const ProfileOpts = struct {
+    pub fn apply(p: Profile, config: *RenderConfig) void {
+        switch (p) {
+            .review => {
+                config.format = .side_by_side;
+                config.level = .line;
+                config.group_by = .files;
+            },
+            .ci => {
+                config.format = .summary;
+                config.level = .file;
+            },
+            .debug => {
+                config.format = .ops;
+                config.context = .full;
+            },
+        }
+    }
+};
+
+pub const RenderConfig = struct {
+    format: Format = .unified,
+    level: Level = .line,
+    context: Context = .normal,
+    group_by: GroupBy = .none,
+    filter: ChangeFilter = .{},
+    word_mode: bool = false,
+    detect_moves: bool = false,
+    color: ColorMode = .auto,
+    max_width: u32 = 60,
+
+    pub fn contextLines(self: RenderConfig) u32 {
+        return self.context.lines();
+    }
+};
+
+pub const DiffArgs = struct {
+    refs: [2]?[]const u8 = .{ null, null },
+    paths: std.ArrayList([]const u8),
+    staged: bool = false,
+    working: bool = false,
+    config: RenderConfig = .{},
+
+    pub fn parse(alloc: std.mem.Allocator, args: [][:0]const u8) !DiffArgs {
+        var da = DiffArgs{ .paths = std.ArrayList([]const u8).init(alloc) };
+        errdefer da.paths.deinit();
+
+        var i: usize = 2; // skip argv[0] and subcommand "diff"
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (std.mem.eql(u8, arg, "--format") or std.mem.eql(u8, arg, "-f")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                da.config.format = parseFormat(args[i]) orelse return error.InvalidFormat;
+            } else if (std.mem.eql(u8, arg, "--level")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                da.config.level = parseLevel(args[i]) orelse return error.InvalidLevel;
+            } else if (std.mem.eql(u8, arg, "--context")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                da.config.context = parseContext(args[i]) orelse return error.InvalidContext;
+            } else if (std.mem.eql(u8, arg, "--group")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                da.config.group_by = parseGroupBy(args[i]) orelse return error.InvalidGroup;
+            } else if (std.mem.eql(u8, arg, "--show")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                da.config.filter = ChangeFilter.parse(args[i]);
+            } else if (std.mem.eql(u8, arg, "--only-added")) {
+                da.config.filter = .{ .show_added = true, .show_deleted = false, .show_modified = false };
+            } else if (std.mem.eql(u8, arg, "--only-deleted")) {
+                da.config.filter = .{ .show_added = false, .show_deleted = true, .show_modified = false };
+            } else if (std.mem.eql(u8, arg, "--only-modified")) {
+                da.config.filter = .{ .show_added = false, .show_deleted = false, .show_modified = true };
+            } else if (std.mem.eql(u8, arg, "--word")) {
+                da.config.word_mode = true;
+            } else if (std.mem.eql(u8, arg, "--detect-moves")) {
+                da.config.detect_moves = true;
+            } else if (std.mem.eql(u8, arg, "--no-color")) {
+                da.config.color = .never;
+            } else if (std.mem.eql(u8, arg, "--color")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                da.config.color = if (std.mem.eql(u8, args[i], "always")) .always else if (std.mem.eql(u8, args[i], "never")) .never else .auto;
+            } else if (std.mem.eql(u8, arg, "--profile")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                const p = std.meta.stringToEnum(Profile, args[i]) orelse return error.InvalidProfile;
+                ProfileOpts.apply(p, &da.config);
+            } else if (std.mem.eql(u8, arg, "--staged")) {
+                da.staged = true;
+            } else if (std.mem.eql(u8, arg, "--working")) {
+                da.working = true;
+            } else if (std.mem.startsWith(u8, arg, "-")) {
+                return error.UnknownFlag;
+            } else {
+                // Positional: ref or path
+                if (da.refs[0] == null) {
+                    da.refs[0] = arg;
+                } else if (da.refs[1] == null) {
+                    da.refs[1] = arg;
+                } else {
+                    try da.paths.append(arg);
+                }
+            }
+        }
+        return da;
+    }
+
+    pub fn deinit(self: *DiffArgs) void {
+        self.paths.deinit();
+    }
+};
+
+fn parseFormat(s: []const u8) ?Format {
+    const map = std.StaticStringMap(Format).initComptime(.{
+        .{ "unified", .unified },
+        .{ "side-by-side", .side_by_side },
+        .{ "blocks", .blocks },
+        .{ "ops", .ops },
+        .{ "summary", .summary },
     });
-    return map.get(view_name);
+    return map.get(s);
 }
 
-/// Diff two source texts for a single file.
-/// Returned slices point into `old_src` and `new_src`; the caller must keep
-/// those alive while the diff is in use.  `path` is duped into `alloc`.
+fn parseLevel(s: []const u8) ?Level {
+    const map = std.StaticStringMap(Level).initComptime(.{
+        .{ "file", .file },
+        .{ "hunk", .hunk },
+        .{ "line", .line },
+        .{ "word", .word },
+    });
+    return map.get(s);
+}
+
+fn parseContext(s: []const u8) ?Context {
+    if (std.mem.eql(u8, s, "minimal")) return .minimal;
+    if (std.mem.eql(u8, s, "normal")) return .normal;
+    if (std.mem.eql(u8, s, "full")) return .full;
+    const n = std.fmt.parseInt(u32, s, 10) catch return null;
+    return .{ .exact = n };
+}
+
+fn parseGroupBy(s: []const u8) ?GroupBy {
+    const map = std.StaticStringMap(GroupBy).initComptime(.{
+        .{ "none", .none },
+        .{ "files", .files },
+        .{ "dirs", .dirs },
+    });
+    return map.get(s);
+}
+
 pub fn diffFile(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -151,11 +342,8 @@ pub fn diffFile(
     };
 }
 
-/// Diff all changed files between two sorted (path, source) slices and store
-/// the serialized diffs in the object store
 pub fn diffCommit(
     alloc: std.mem.Allocator,
-    store: *const Store,
     old_files: []const FileSnapshot,
     new_files: []const FileSnapshot,
 ) !CommitDiff {
@@ -165,7 +353,6 @@ pub fn diffCommit(
         file_diffs.deinit(alloc);
     }
 
-    // Walk the two sorted lists together (merge-join on path)
     var oi: usize = 0;
     var ni: usize = 0;
     while (oi < old_files.len or ni < new_files.len) {
@@ -189,53 +376,93 @@ pub fn diffCommit(
     }
 
     const files = try file_diffs.toOwnedSlice(alloc);
-
-    const line_blob = try serializeLineDiffs(alloc, files);
-    defer alloc.free(line_blob);
-    const line_hash = try store.put(.blob, line_blob);
-
-    const word_blob = try serializeWordDiffs(alloc, files);
-    defer alloc.free(word_blob);
-    const word_hash = try store.put(.blob, word_blob);
-
     return .{
         .files = files,
-        .line_diff_hash = line_hash,
-        .word_diff_hash = word_hash,
+        .line_diff_hash = .{0} ** 32,
+        .word_diff_hash = .{0} ** 32,
     };
 }
 
-pub fn renderDiff(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
-    switch (options.view) {
-        .sideBySide => try renderSideBySide(writer, fd, options),
-        .grouped => try renderGrouped(writer, fd, options),
-        .block => try renderBlockOriented(writer, fd, options),
-        .wordHighlight => try renderWordHighlight(writer, fd),
-        .operations => try renderOperations(writer, fd, options),
-        .modern => try renderModern(writer, fd, options),
-        // .summary => try renderSummaryView(writer, fd, options),
+pub fn renderCommit(writer: anytype, cd: *const CommitDiff, config: RenderConfig, alloc: std.mem.Allocator) !void {
+    var filtered = std.ArrayList(*const FileDiff).init(alloc);
+    defer filtered.deinit(alloc);
+
+    for (cd.files) |*fd| {
+        const status = fileStatus(fd);
+        if (!config.filter.allows(status)) continue;
+        try filtered.append(fd);
+    }
+
+    if (config.group_by == .dirs) {
+        const groups = try groupByDirectory(alloc, filtered.items);
+        defer {
+            for (groups) |g| alloc.free(g.files);
+            alloc.free(groups);
+        }
+        for (groups) |g| {
+            try writer.print("{s}/\n", .{g.dir});
+            for (g.files) |fd| {
+                try writer.print("  {s}\n", .{std.fs.path.basename(fd.path)});
+            }
+            try writer.writeByte('\n');
+        }
+        return;
+    }
+
+    for (filtered.items) |fd| {
+        try renderFileDiff(writer, fd, config);
     }
 }
 
-pub fn renderUnified(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
-    try renderModern(writer, fd, options);
-}
-//TODO: fix this later
-/// Render a summary of all changed files, then the modern view for each
-// pub fn renderSummaryView(writer: anytype, fds: []const FileDiff, options: RenderOptions) !void {
-//     try writer.writeAll("Changes\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-//     for (fds) |fd| {
-//         const status = fileStatus(&fd);
-//         try writer.print("{s} {s} (+{d} -{d})\n", .{ status, fd.path, fd.lines_added, fd.lines_removed });
-//     }
-//     try writer.writeByte('\n');
-//     for (fds) |fd| {
-//         try renderModern(writer, &fd, options);
-//     }
-// }
+pub fn renderFileDiff(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
+    if (config.level == .file) {
+        const status = fileStatus(fd);
+        const sc = switch (status) {
+            .added => "A",
+            .deleted => "D",
+            .modified => "M",
+            .unchanged => "~",
+        };
+        try writer.print("{s} {s} (+{d} -{d})\n", .{ sc, fd.path, fd.lines_added, fd.lines_removed });
+        return;
+    }
 
-fn renderSideBySide(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
-    const col_width = maxLineWidth(fd.line_deltas, @as(usize, @intCast(options.max_column_width)));
+    if (config.level == .word) {
+        try renderWordHighlight(writer, fd);
+        return;
+    }
+
+    switch (config.format) {
+        .unified => try renderUnified(writer, fd, config),
+        .side_by_side => try renderSideBySide(writer, fd, config),
+        .blocks => try renderBlockOriented(writer, fd, config),
+        .ops => try renderOperations(writer, fd, config),
+        .summary => try renderSummary(writer, fd),
+    }
+}
+
+pub fn renderUnified(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
+    try writer.print("FILE  {s}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{fd.path});
+    if (fd.line_deltas.len == 0) return;
+
+    var it = HunkIterator.init(fd.line_deltas, config.contextLines());
+    while (it.next()) |hunk| {
+        const line_num = hunk.displayLineNum();
+        try writer.print("~ Line {d}\n", .{line_num});
+        for (fd.line_deltas[hunk.start..hunk.end]) |d| {
+            const prefix: []const u8 = switch (d.op) {
+                .eq => "  ",
+                .del => "- ",
+                .ins => "+ ",
+            };
+            try writer.print("{s}{s}\n", .{ prefix, d.content });
+        }
+        try writer.writeByte('\n');
+    }
+}
+
+fn renderSideBySide(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
+    const col_width = maxLineWidth(fd.line_deltas, @as(usize, @intCast(config.max_width)));
     const sep = " │ ";
 
     try writer.print("FILE  {s}\n", .{fd.path});
@@ -253,7 +480,6 @@ fn renderSideBySide(writer: anytype, fd: *const FileDiff, options: RenderOptions
     for (fd.line_deltas) |d| {
         const left = if (d.op == .ins) "" else d.content;
         const right = if (d.op == .del) "" else d.content;
-
         try writer.writeAll("│");
         try writePadded(writer, left, col_width);
         try writer.writeAll(sep);
@@ -263,84 +489,49 @@ fn renderSideBySide(writer: anytype, fd: *const FileDiff, options: RenderOptions
     try writer.writeByte('\n');
 }
 
-fn renderGrouped(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
+fn renderBlockOriented(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
     try writer.print("FILE: {s}\n", .{fd.path});
     if (fd.line_deltas.len == 0) return;
 
-    var it = HunkIterator.init(fd.line_deltas, options.context_lines);
-    while (it.next()) |hunk| {
-        const title, const begin_line, const end_line = hunk.groupTitle();
-        try writer.print("{s} {d}-{d}\n", .{ title, begin_line, end_line });
-        try writeSectionDivider(writer, 40);
-        for (fd.line_deltas[hunk.start..hunk.end]) |d| {
-            if (d.op == .eq) continue;
-            const prefix: []const u8 = if (d.op == .ins) "+" else "-";
-            try writer.print("{s} {s}\n", .{ prefix, d.content });
-        }
-        try writer.writeByte('\n');
-    }
-}
-
-fn renderBlockOriented(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
-    try writer.print("FILE: {s}\n", .{fd.path});
-    if (fd.line_deltas.len == 0) return;
-
-    var it = HunkIterator.init(fd.line_deltas, options.context_lines);
+    var it = HunkIterator.init(fd.line_deltas, config.contextLines());
     var change_number: usize = 1;
     while (it.next()) |hunk| {
         try writer.print("CHANGE #{d}\n", .{change_number});
         try writeSectionDivider(writer, 32);
         try writer.writeAll("BEFORE\n");
-        for (fd.line_deltas[hunk.start..hunk.end]) |d| {
-            if (d.op != .ins) try writer.print("{s}\n", .{d.content});
-        }
+        for (fd.line_deltas[hunk.start..hunk.end]) |d| if (d.op != .ins) try writer.print("{s}\n", .{d.content});
         try writer.writeAll("AFTER\n");
-        for (fd.line_deltas[hunk.start..hunk.end]) |d| {
-            if (d.op != .del) try writer.print("{s}\n", .{d.content});
-        }
+        for (fd.line_deltas[hunk.start..hunk.end]) |d| if (d.op != .del) try writer.print("{s}\n", .{d.content});
         try writer.writeByte('\n');
         change_number += 1;
     }
 }
 
-fn renderOperations(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
+fn renderOperations(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
     try writer.print("FILE  {s}\n", .{fd.path});
-    try writer.print("STATUS: {s}\n\n", .{fileStatus(fd)});
+    try writer.print("STATUS: {s}\n\n", .{statusString(fileStatus(fd))});
     if (fd.line_deltas.len == 0) return;
 
-    var it = HunkIterator.init(fd.line_deltas, options.context_lines);
+    var it = HunkIterator.init(fd.line_deltas, config.contextLines());
     while (it.next()) |hunk| {
         const line_num = hunk.displayLineNum();
         try writer.print("FROM line {d}\n", .{line_num});
-        for (fd.line_deltas[hunk.start..hunk.end]) |d| {
-            if (d.op != .ins) try writer.print("  {s}\n", .{d.content});
-        }
+        for (fd.line_deltas[hunk.start..hunk.end]) |d| if (d.op != .ins) try writer.print("  {s}\n", .{d.content});
         try writer.print("\nTO line {d}\n", .{line_num});
-        for (fd.line_deltas[hunk.start..hunk.end]) |d| {
-            if (d.op != .del) try writer.print("  {s}\n", .{d.content});
-        }
+        for (fd.line_deltas[hunk.start..hunk.end]) |d| if (d.op != .del) try writer.print("  {s}\n", .{d.content});
         try writer.writeByte('\n');
     }
 }
 
-fn renderModern(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
-    try writer.print("FILE  {s}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{fd.path});
-    if (fd.line_deltas.len == 0) return;
-
-    var it = HunkIterator.init(fd.line_deltas, options.context_lines);
-    while (it.next()) |hunk| {
-        const line_num = hunk.displayLineNum();
-        try writer.print("~ Line {d}\n", .{line_num});
-        for (fd.line_deltas[hunk.start..hunk.end]) |d| {
-            const prefix: []const u8 = switch (d.op) {
-                .eq => "  ",
-                .del => "- ",
-                .ins => "+ ",
-            };
-            try writer.print("{s}{s}\n", .{ prefix, d.content });
-        }
-        try writer.writeByte('\n');
-    }
+fn renderSummary(writer: anytype, fd: *const FileDiff) !void {
+    const status = fileStatus(fd);
+    const sc = switch (status) {
+        .added => "A",
+        .deleted => "D",
+        .modified => "M",
+        .unchanged => "~",
+    };
+    try writer.print("{s} {s} (+{d} -{d})\n", .{ sc, fd.path, fd.lines_added, fd.lines_removed });
 }
 
 fn renderWordHighlight(writer: anytype, fd: *const FileDiff) !void {
@@ -348,8 +539,6 @@ fn renderWordHighlight(writer: anytype, fd: *const FileDiff) !void {
     try renderWordDeltas(writer, fd.word_deltas);
 }
 
-/// Write a word-level diff for a single FileDiff to `writer`
-/// Changed words are wrapped in [+word+] / [-word-] markers
 pub fn renderWordDiff(writer: anytype, fd: *const FileDiff) !void {
     try writer.print("WORD HIGHLIGHT: {s}\n", .{fd.path});
     try renderWordDeltas(writer, fd.word_deltas);
@@ -377,39 +566,6 @@ const Hunk = struct {
     end: usize,
     deltas: []const LineDelta,
 
-    /// Returns the title, begin line, and end line for grouped view.
-    fn groupTitle(self: Hunk) struct { []const u8, u32, u32 } {
-        var old_count: u32 = 0;
-        var new_count: u32 = 0;
-        var old_start: u32 = 0;
-        var new_start: u32 = 0;
-
-        for (self.deltas[self.start..self.end]) |d| {
-            switch (d.op) {
-                .eq => {
-                    if (old_start == 0) old_start = d.old_lineno;
-                    if (new_start == 0) new_start = d.new_lineno;
-                    old_count += 1;
-                    new_count += 1;
-                },
-                .del => {
-                    if (old_start == 0) old_start = d.old_lineno;
-                    old_count += 1;
-                },
-                .ins => {
-                    if (new_start == 0) new_start = d.new_lineno;
-                    new_count += 1;
-                },
-            }
-        }
-
-        const title = if (old_count == 0) "Added Lines" else if (new_count == 0) "Removed Lines" else "Modified Lines";
-        const begin_line = if (old_count == 0) new_start else old_start;
-        const end_line = if (old_count != 0) old_start + old_count - 1 else new_start + new_count - 1;
-        return .{ title, begin_line, end_line };
-    }
-
-    /// Best-effort display line number for modern / operations views
     fn displayLineNum(self: Hunk) u32 {
         for (self.deltas[self.start..self.end]) |d| {
             if (d.op != .ins) return d.old_lineno;
@@ -428,7 +584,6 @@ const HunkIterator = struct {
     }
 
     fn next(self: *HunkIterator) ?Hunk {
-        // Skip leading equal lines
         while (self.i < self.deltas.len and self.deltas[self.i].op == .eq) self.i += 1;
         if (self.i >= self.deltas.len) return null;
 
@@ -458,6 +613,37 @@ const HunkIterator = struct {
         return result;
     }
 };
+
+pub const DirGroup = struct {
+    dir: []const u8,
+    files: []*const FileDiff,
+};
+
+pub fn groupByDirectory(alloc: std.mem.Allocator, files: []*const FileDiff) ![]DirGroup {
+    var map = std.StringHashMap(std.ArrayList(*const FileDiff)).init(alloc);
+    defer {
+        var it = map.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(alloc);
+        map.deinit();
+    }
+
+    for (files) |fd| {
+        const dir = std.fs.path.dirname(fd.path) orelse ".";
+        const gop = try map.getOrPut(dir);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(alloc, fd);
+    }
+
+    var groups: std.ArrayList(DirGroup) = .empty;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        try groups.append(alloc, .{
+            .dir = entry.key_ptr.*,
+            .files = try entry.value_ptr.toOwnedSlice(alloc),
+        });
+    }
+    return groups.toOwnedSlice(alloc);
+}
 
 pub const DiffSummary = struct {
     files_changed: u32,
@@ -497,13 +683,11 @@ fn myersDiff(
     const max_d = N + M;
     if (max_d == 0) return &.{};
 
-    // v[k] = furthest x reached on diagonal k
     const v_len = 2 * max_d + 1;
     const v = try alloc.alloc(isize, v_len);
     defer alloc.free(v);
     @memset(v, 0);
 
-    // Record the full trace for backtracking
     var trace: std.ArrayList([]isize) = .empty;
     defer {
         for (trace.items) |snap| alloc.free(snap);
@@ -525,7 +709,6 @@ fn myersDiff(
             var x: isize = if (move_down) v[ki + 1] else v[ki - 1] + 1;
             var y: isize = x - k;
 
-            // Extend along matching diagonal (snake)
             while (x < N and y < M and eqFn(old[@intCast(x)], new[@intCast(y)])) {
                 x += 1;
                 y += 1;
@@ -536,7 +719,6 @@ fn myersDiff(
         }
     }
 
-    // Backtrack through the trace to reconstruct the edit script
     var ops: std.ArrayList(T) = .empty;
     errdefer ops.deinit(alloc);
 
@@ -557,7 +739,6 @@ fn myersDiff(
         const prev_x = snap[@intCast(prev_k + offset)];
         const prev_y = prev_x - prev_k;
 
-        // Walk back the snake (eq operations)
         while (x > prev_x + 1 and y > prev_y + 1) {
             x -= 1;
             y -= 1;
@@ -566,17 +747,14 @@ fn myersDiff(
 
         if (d > 0) {
             if (x == prev_x) {
-                // Insertion
                 y -= 1;
                 try ops.append(alloc, makeDelta(.ins, new[@intCast(y)], 0, @intCast(y + 1)));
             } else {
-                // Deletion
                 x -= 1;
                 try ops.append(alloc, makeDelta(.del, old[@intCast(x)], @intCast(x + 1), 0));
             }
         }
 
-        // Remaining snake at start
         while (x > prev_x and y > prev_y) {
             x -= 1;
             y -= 1;
@@ -627,11 +805,7 @@ fn diffWords(alloc: std.mem.Allocator, line_deltas: []const LineDelta) ![]WordDe
         defer alloc.free(word_ops);
 
         for (word_ops) |wd| {
-            try out.append(alloc, .{
-                .op = wd.op,
-                .word = wd.word,
-                .lineno = lineno,
-            });
+            try out.append(alloc, .{ .op = wd.op, .word = wd.word, .lineno = lineno });
         }
 
         i = j;
@@ -646,14 +820,12 @@ fn splitLines(alloc: std.mem.Allocator, src: []const u8) ![][]const u8 {
 
     var it = std.mem.splitScalar(u8, src, '\n');
     while (it.next()) |line| {
-        // Skip the phantom empty line that splitScalar adds after a trailing \n
         if (it.rest().len == 0 and line.len == 0) break;
         try lines.append(alloc, line);
     }
     return lines.toOwnedSlice(alloc);
 }
 
-/// Split a line into words (runs of non-whitespace + individual punctuation)
 fn tokenizeWords(alloc: std.mem.Allocator, line: []const u8) ![][]const u8 {
     var words: std.ArrayList([]const u8) = .empty;
     errdefer words.deinit(alloc);
@@ -681,12 +853,7 @@ fn lineEq(a: []const u8, b: []const u8) bool {
 }
 
 fn makeLineDelta(op: Op, content: []const u8, old_lineno: u32, new_lineno: u32) LineDelta {
-    return .{
-        .op = op,
-        .content = content,
-        .old_lineno = old_lineno,
-        .new_lineno = new_lineno,
-    };
+    return .{ .op = op, .content = content, .old_lineno = old_lineno, .new_lineno = new_lineno };
 }
 
 fn wordEq(a: []const u8, b: []const u8) bool {
@@ -697,7 +864,7 @@ fn makeWordDelta(op: Op, word: []const u8, _: u32, _: u32) WordDelta {
     return .{ .op = op, .word = word, .lineno = 0 };
 }
 
-fn fileStatus(fd: *const FileDiff) []const u8 {
+fn fileStatus(fd: *const FileDiff) FileStatus {
     var has_ins = false;
     var has_del = false;
     for (fd.line_deltas) |d| switch (d.op) {
@@ -705,7 +872,19 @@ fn fileStatus(fd: *const FileDiff) []const u8 {
         .del => has_del = true,
         .eq => {},
     };
-    return if (has_ins and has_del) "M" else if (has_ins) "A" else if (has_del) "D" else "~";
+    if (has_ins and has_del) return .modified;
+    if (has_ins) return .added;
+    if (has_del) return .deleted;
+    return .unchanged;
+}
+
+fn statusString(s: FileStatus) []const u8 {
+    return switch (s) {
+        .added => "A",
+        .deleted => "D",
+        .modified => "M",
+        .unchanged => "~",
+    };
 }
 
 fn maxLineWidth(deltas: []const LineDelta, max_width: usize) usize {
@@ -719,8 +898,7 @@ fn maxLineWidth(deltas: []const LineDelta, max_width: usize) usize {
 fn writePadded(writer: anytype, text: []const u8, width: usize) !void {
     try writer.writeAll(text);
     if (text.len < width) {
-        const pad_len = width - text.len;
-        for (0..pad_len) |_| try writer.writeByte(' ');
+        for (0..width - text.len) |_| try writer.writeByte(' ');
     }
 }
 
@@ -833,13 +1011,6 @@ test "tokenizeWords splits identifiers and punctuation" {
 
 test "summarize aggregates across files" {
     const alloc = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var objects_dir = try tmp.dir.makeOpenPath("objects", .{});
-    defer objects_dir.close();
-    var store = object.Store{ .dir = objects_dir, .alloc = alloc };
-
     const old_files = [_]FileSnapshot{
         .{ .path = "a.txt", .content = "hello\nworld\n" },
         .{ .path = "b.txt", .content = "foo\n" },
@@ -849,11 +1020,53 @@ test "summarize aggregates across files" {
         .{ .path = "b.txt", .content = "foo\nbar\n" },
     };
 
-    var cd = try diffCommit(alloc, &store, &old_files, &new_files);
+    var cd = try diffCommit(alloc, &old_files, &new_files);
     defer cd.deinit(alloc);
 
     const s = summarize(&cd);
     try std.testing.expectEqual(@as(u32, 2), s.files_changed);
     try std.testing.expectEqual(@as(u32, 2), s.lines_added);
     try std.testing.expectEqual(@as(u32, 1), s.lines_removed);
+}
+
+// test "DiffArgs parse format and level" {
+//     const alloc = std.testing.allocator;
+//     const args = &[_][:0]const u8{ "nodus", "diff", "--format", "side-by-side", "--level", "word" };
+//     var da = try DiffArgs.parse(alloc, args);
+//     defer da.deinit();
+//     try std.testing.expectEqual(Format.side_by_side, da.config.format);
+//     try std.testing.expectEqual(Level.word, da.config.level);
+// }
+
+// test "DiffArgs parse profile review" {
+//     const alloc = std.testing.allocator;
+//     const args = &[_][:0]const u8{ "nodus", "diff", "--profile", "review" };
+//     var da = try DiffArgs.parse(alloc, args);
+//     defer da.deinit();
+//     try std.testing.expectEqual(Format.side_by_side, da.config.format);
+//     try std.testing.expectEqual(Level.line, da.config.level);
+//     try std.testing.expectEqual(GroupBy.files, da.config.group_by);
+// }
+
+test "ChangeFilter parse comma list" {
+    const f = ChangeFilter.parse("added,modified");
+    try std.testing.expect(f.show_added);
+    try std.testing.expect(f.show_modified);
+    try std.testing.expect(!f.show_deleted);
+}
+
+test "groupByDirectory groups files" {
+    const alloc = std.testing.allocator;
+    const files = &[_]FileDiff{
+        .{ .path = "src/main.zig", .line_deltas = &.{}, .word_deltas = &.{}, .lines_added = 0, .lines_removed = 0, .words_added = 0, .words_removed = 0 },
+        .{ .path = "src/lib.zig", .line_deltas = &.{}, .word_deltas = &.{}, .lines_added = 0, .lines_removed = 0, .words_added = 0, .words_removed = 0 },
+        .{ .path = "test/foo.zig", .line_deltas = &.{}, .word_deltas = &.{}, .lines_added = 0, .lines_removed = 0, .words_added = 0, .words_removed = 0 },
+    };
+    var ptrs = [_]*const FileDiff{ &files[0], &files[1], &files[2] };
+    const groups = try groupByDirectory(alloc, &ptrs);
+    defer {
+        for (groups) |g| alloc.free(g.files);
+        alloc.free(groups);
+    }
+    try std.testing.expectEqual(@as(usize, 2), groups.len);
 }
