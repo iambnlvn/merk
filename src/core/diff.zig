@@ -186,39 +186,141 @@ pub const FileSnapshot = struct {
     content: []const u8,
 };
 
-pub const UnifiedOptions = struct {
-    context_lines: u32 = 3,
-    color: bool = false,
+pub const DiffView = enum {
+    sideBySide,
+    grouped,
+    block,
+    wordHighlight,
+    summary,
+    operations,
+    modern,
 };
 
-/// Write a unified diff (like `git diff`) for a single FileDiff to `writer`
-pub fn renderUnified(
-    writer: anytype,
-    fd: *const FileDiff,
-    options: UnifiedOptions,
-) !void {
-    try writer.print("--- a/{s}\n+++ b/{s}\n", .{ fd.path, fd.path });
+pub const RenderOptions = struct {
+    view: DiffView = .modern,
+    color: bool = false,
+    context_lines: u32 = 3,
+    max_column_width: u32 = 60,
+};
 
-    // Group deltas into hunks separated by context.
+pub const UnifiedOptions = RenderOptions;
+
+pub fn parseView(view_name: []const u8) ?DiffView {
+    const map = std.StaticStringMap(DiffView).initComptime(.{
+        .{ "side-by-side", .sideBySide },
+        .{ "grouped", .grouped },
+        .{ "block", .block },
+        .{ "word-highlight", .wordHighlight },
+        .{ "summary", .summary },
+        .{ "operations", .operations },
+        .{ "modern", .modern },
+    });
+
+    return map.get(view_name);
+}
+
+fn fileStatus(fd: *const FileDiff) []const u8 {
+    var has_ins = false;
+    var has_del = false;
+    for (fd.line_deltas) |d| switch (d.op) {
+        .ins => has_ins = true,
+        .del => has_del = true,
+        .eq => {},
+    };
+    return if (has_ins and has_del) "M" else if (has_ins) "A" else if (has_del) "D" else "~";
+}
+
+fn maxLineWidth(deltas: []const LineDelta, max_width: usize) usize {
+    var max: usize = 0;
+    for (deltas) |d| {
+        if (d.content.len > max) max = d.content.len;
+    }
+    return if (max < max_width) max else max_width;
+}
+
+fn writePadded(writer: anytype, text: []const u8, width: usize) !void {
+    try writer.writeAll(text);
+    if (text.len < width) {
+        const pad_len = width - text.len;
+        for (0..pad_len) |_| try writer.writeByte(' ');
+    }
+}
+
+pub fn renderDiff(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
+    switch (options.view) {
+        .sideBySide => try renderSideBySide(writer, fd, options),
+        .grouped => try renderGrouped(writer, fd, options),
+        .block => try renderBlockOriented(writer, fd, options),
+        .wordHighlight => try renderWordHighlight(writer, fd, options),
+        .summary => try renderModern(writer, fd, options),
+        .operations => try renderOperations(writer, fd, options),
+        .modern => try renderModern(writer, fd, options),
+    }
+}
+
+pub fn renderUnified(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
+    try renderModern(writer, fd, options);
+}
+
+fn writeSectionDivider(writer: anytype, width: usize) !void {
+    for (0..width) |_| try writer.writeAll("━");
+    try writer.writeByte('\n');
+}
+
+fn renderSideBySide(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
+    const col_width = maxLineWidth(fd.line_deltas, @as(usize, @intCast(options.max_column_width)));
+    const sep = " │ ";
+
+    try writer.print("FILE  {s}\n", .{fd.path});
+    try writer.writeAll("│ Before");
+    if (col_width > 6) for (0..col_width - 6) |_| try writer.writeByte(' ');
+    try writer.writeAll(sep);
+    try writer.writeAll("After");
+    if (col_width > 5) for (0..col_width - 5) |_| try writer.writeByte(' ');
+    try writer.writeByte('\n');
+
+    const total_width = 1 + col_width + sep.len + col_width + 1;
+    for (0..total_width) |_| try writer.writeAll("─");
+    try writer.writeByte('\n');
+
+    for (fd.line_deltas) |d| {
+        const left = switch (d.op) {
+            .ins => "",
+            .del => d.content,
+            .eq => d.content,
+        };
+        const right = switch (d.op) {
+            .del => "",
+            .ins => d.content,
+            .eq => d.content,
+        };
+
+        try writer.writeAll("│");
+        try writePadded(writer, left, col_width);
+        try writer.writeAll(sep);
+        try writePadded(writer, right, col_width);
+        try writer.writeByte('\n');
+    }
+    try writer.writeByte('\n');
+}
+
+fn renderGrouped(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
+    try writer.print("FILE: {s}\n", .{fd.path});
+
     const deltas = fd.line_deltas;
     if (deltas.len == 0) return;
 
     var i: usize = 0;
     while (i < deltas.len) {
-        // Find the next non-eq delta
         while (i < deltas.len and deltas[i].op == .eq) i += 1;
         if (i >= deltas.len) break;
 
-        // Hunk start: back up by context_lines
-        const hunk_start = if (i >= options.context_lines) i - options.context_lines else 0;
-
-        // Hunk end: scan forward past all changes + context
-        var hunk_end = i;
+        const start = if (i >= options.context_lines) i - options.context_lines else 0;
+        var hunk_end: usize = i;
         while (hunk_end < deltas.len) {
             if (deltas[hunk_end].op != .eq) {
-                hunk_end = @min(hunk_end + options.context_lines + 1, deltas.len);
+                hunk_end = @min(hunk_end + @as(usize, @intCast(options.context_lines)) + 1, deltas.len);
             } else {
-                // eq run — check if a change is within context_lines ahead
                 var lookahead = hunk_end;
                 var eq_run: u32 = 0;
                 while (lookahead < deltas.len and deltas[lookahead].op == .eq) {
@@ -226,19 +328,18 @@ pub fn renderUnified(
                     eq_run += 1;
                 }
                 if (eq_run > options.context_lines * 2 or lookahead >= deltas.len) {
-                    hunk_end = @min(hunk_end + options.context_lines, deltas.len);
+                    hunk_end = @min(hunk_end + @as(usize, @intCast(options.context_lines)), deltas.len);
                     break;
                 }
                 hunk_end = lookahead;
             }
         }
 
-        // Compute old/new line ranges for the @@ header
         var old_start: u32 = 0;
-        var new_start: u32 = 0;
         var old_count: u32 = 0;
+        var new_start: u32 = 0;
         var new_count: u32 = 0;
-        for (deltas[hunk_start..hunk_end]) |d| {
+        for (deltas[start..hunk_end]) |d| {
             switch (d.op) {
                 .eq => {
                     if (old_start == 0) old_start = d.old_lineno;
@@ -257,29 +358,190 @@ pub fn renderUnified(
             }
         }
 
-        try writer.print("@@ -{d},{d} +{d},{d} @@\n", .{
-            old_start, old_count, new_start, new_count,
-        });
+        const title = if (old_count == 0) "Added Lines" else if (new_count == 0) "Removed Lines" else "Modified Lines";
+        const begin_line = if (old_count == 0) new_start else old_start;
+        const end_line = if (old_count != 0) old_start + old_count - 1 else new_start + new_count - 1;
+        try writer.print("{s} {d}-{d}\n", .{ title, begin_line, end_line });
+        try writeSectionDivider(writer, 40);
+        for (deltas[start..hunk_end]) |d| {
+            if (d.op == .eq) continue;
+            const prefix = if (d.op == .ins) "+" else "-";
+            try writer.print("{s} {s}\n", .{ prefix, d.content });
+        }
+        try writer.writeByte('\n');
+        i = hunk_end;
+    }
+}
 
-        for (deltas[hunk_start..hunk_end]) |d| {
-            const prefix: u8 = switch (d.op) {
-                .eq => ' ',
-                .ins => '+',
-                .del => '-',
-            };
-            if (options.color) {
-                const color: []const u8 = switch (d.op) {
-                    .eq => "",
-                    .ins => "\x1b[32m",
-                    .del => "\x1b[31m",
-                };
-                const reset = if (d.op != .eq) "\x1b[0m" else "";
-                try writer.print("{s}{c}{s}{s}\n", .{ color, prefix, d.content, reset });
+fn renderBlockOriented(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
+    try writer.print("FILE: {s}\n", .{fd.path});
+
+    const deltas = fd.line_deltas;
+    if (deltas.len == 0) return;
+
+    var i: usize = 0;
+    var change_number: usize = 1;
+    while (i < deltas.len) {
+        while (i < deltas.len and deltas[i].op == .eq) i += 1;
+        if (i >= deltas.len) break;
+
+        const start = if (i >= options.context_lines) i - options.context_lines else 0;
+        var hunk_end: usize = i;
+        while (hunk_end < deltas.len) {
+            if (deltas[hunk_end].op != .eq) {
+                hunk_end = @min(hunk_end + @as(usize, @intCast(options.context_lines)) + 1, deltas.len);
             } else {
-                try writer.print("{c}{s}\n", .{ prefix, d.content });
+                var lookahead = hunk_end;
+                var eq_run: u32 = 0;
+                while (lookahead < deltas.len and deltas[lookahead].op == .eq) {
+                    lookahead += 1;
+                    eq_run += 1;
+                }
+                if (eq_run > options.context_lines * 2 or lookahead >= deltas.len) {
+                    hunk_end = @min(hunk_end + @as(usize, @intCast(options.context_lines)), deltas.len);
+                    break;
+                }
+                hunk_end = lookahead;
             }
         }
 
+        try writer.print("CHANGE #{d}\n", .{change_number});
+        try writeSectionDivider(writer, 32);
+        try writer.print("BEFORE\n", .{});
+        for (deltas[start..hunk_end]) |d| if (d.op != .ins) try writer.print("{s}\n", .{d.content});
+        try writer.print("AFTER\n", .{});
+        for (deltas[start..hunk_end]) |d| if (d.op != .del) try writer.print("{s}\n", .{d.content});
+        try writer.writeByte('\n');
+        change_number += 1;
+        i = hunk_end;
+    }
+}
+
+fn renderWordHighlight(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
+    try writer.print("WORD HIGHLIGHT: {s}\n", .{fd.path});
+    _ = options;
+    var current_line: u32 = 0;
+    for (fd.word_deltas) |d| {
+        if (d.lineno != current_line) {
+            if (current_line != 0) try writer.writeByte('\n');
+            try writer.print("Line {d}: ", .{d.lineno});
+            current_line = d.lineno;
+        }
+        switch (d.op) {
+            .eq => try writer.print("{s}", .{d.word}),
+            .ins => try writer.print("[+{s}+]", .{d.word}),
+            .del => try writer.print("[-{s}-]", .{d.word}),
+        }
+    }
+    if (current_line != 0) try writer.writeByte('\n');
+    try writer.writeByte('\n');
+}
+
+fn renderOperations(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
+    const status = fileStatus(fd);
+    try writer.print("FILE  {s}\n", .{fd.path});
+    try writer.print("STATUS: {s}\n\n", .{status});
+
+    const deltas = fd.line_deltas;
+    if (deltas.len == 0) return;
+
+    var i: usize = 0;
+    while (i < deltas.len) {
+        while (i < deltas.len and deltas[i].op == .eq) i += 1;
+        if (i >= deltas.len) break;
+
+        const start = if (i >= options.context_lines) i - options.context_lines else 0;
+        var hunk_end: usize = i;
+        while (hunk_end < deltas.len) {
+            if (deltas[hunk_end].op != .eq) {
+                hunk_end = @min(hunk_end + @as(usize, @intCast(options.context_lines)) + 1, deltas.len);
+            } else {
+                var lookahead = hunk_end;
+                var eq_run: u32 = 0;
+                while (lookahead < deltas.len and deltas[lookahead].op == .eq) {
+                    lookahead += 1;
+                    eq_run += 1;
+                }
+                if (eq_run > options.context_lines * 2 or lookahead >= deltas.len) {
+                    hunk_end = @min(hunk_end + @as(usize, @intCast(options.context_lines)), deltas.len);
+                    break;
+                }
+                hunk_end = lookahead;
+            }
+        }
+
+        var line_num: u32 = 0;
+        for (deltas[start..hunk_end]) |d| {
+            if (d.op != .ins) line_num = d.old_lineno;
+        }
+        if (line_num == 0) line_num = deltas[start].new_lineno;
+
+        try writer.print("FROM line {d}\n", .{line_num});
+        for (deltas[start..hunk_end]) |d| if (d.op != .ins) try writer.print("  {s}\n", .{d.content});
+        try writer.print("\nTO line {d}\n", .{line_num});
+        for (deltas[start..hunk_end]) |d| if (d.op != .del) try writer.print("  {s}\n", .{d.content});
+        try writer.writeByte('\n');
+        i = hunk_end;
+    }
+}
+
+pub fn renderSummaryView(writer: anytype, fds: []const FileDiff, options: RenderOptions) !void {
+    try writer.writeAll("Changes\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    for (fds) |fd| {
+        const status = fileStatus(&fd);
+        try writer.print("{s} {s} (+{d} -{d})\n", .{ status, fd.path, fd.lines_added, fd.lines_removed });
+    }
+    try writer.writeAll("\n");
+    for (fds) |fd| {
+        try renderModern(writer, &fd, options);
+    }
+}
+
+pub fn renderModern(writer: anytype, fd: *const FileDiff, options: RenderOptions) !void {
+    try writer.print("FILE  {s}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{fd.path});
+    const deltas = fd.line_deltas;
+    if (deltas.len == 0) return;
+
+    var i: usize = 0;
+    while (i < deltas.len) {
+        while (i < deltas.len and deltas[i].op == .eq) i += 1;
+        if (i >= deltas.len) break;
+
+        const start = if (i >= options.context_lines) i - options.context_lines else 0;
+        var hunk_end: usize = i;
+        while (hunk_end < deltas.len) {
+            if (deltas[hunk_end].op != .eq) {
+                hunk_end = @min(hunk_end + @as(usize, @intCast(options.context_lines)) + 1, deltas.len);
+            } else {
+                var lookahead = hunk_end;
+                var eq_run: u32 = 0;
+                while (lookahead < deltas.len and deltas[lookahead].op == .eq) {
+                    lookahead += 1;
+                    eq_run += 1;
+                }
+                if (eq_run > options.context_lines * 2 or lookahead >= deltas.len) {
+                    hunk_end = @min(hunk_end + @as(usize, @intCast(options.context_lines)), deltas.len);
+                    break;
+                }
+                hunk_end = lookahead;
+            }
+        }
+
+        var line_num: u32 = 0;
+        for (deltas[start..hunk_end]) |d| {
+            if (d.op != .ins) line_num = d.old_lineno;
+        }
+        if (line_num == 0) line_num = deltas[start].new_lineno;
+        try writer.print("~ Line {d}\n", .{line_num});
+
+        for (deltas[start..hunk_end]) |d| {
+            switch (d.op) {
+                .eq => try writer.print("  {s}\n", .{d.content}),
+                .del => try writer.print("- {s}\n", .{d.content}),
+                .ins => try writer.print("+ {s}\n", .{d.content}),
+            }
+        }
+        try writer.writeByte('\n');
         i = hunk_end;
     }
 }
@@ -287,18 +549,19 @@ pub fn renderUnified(
 /// Write a word-level diff for a single FileDiff to `writer`
 /// Changed words are wrapped in [+word+] / [-word-] markers
 pub fn renderWordDiff(writer: anytype, fd: *const FileDiff) !void {
-    try writer.print("--- a/{s}\n+++ b/{s}\n", .{ fd.path, fd.path });
+    try writer.print("WORD HIGHLIGHT: {s}\n", .{fd.path});
 
     var current_line: u32 = 0;
     for (fd.word_deltas) |d| {
         if (d.lineno != current_line) {
             if (current_line != 0) try writer.writeByte('\n');
+            try writer.print("Line {d}: ", .{d.lineno});
             current_line = d.lineno;
         }
         switch (d.op) {
-            .eq => try writer.print("{s} ", .{d.word}),
-            .ins => try writer.print("[+{s}+] ", .{d.word}),
-            .del => try writer.print("[-{s}-] ", .{d.word}),
+            .eq => try writer.print("{s}", .{d.word}),
+            .ins => try writer.print("[+{s}+]", .{d.word}),
+            .del => try writer.print("[-{s}-]", .{d.word}),
         }
     }
     if (current_line != 0) try writer.writeByte('\n');
