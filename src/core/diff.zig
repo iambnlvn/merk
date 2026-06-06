@@ -130,17 +130,33 @@ pub const ChangeFilter = struct {
         };
     }
 
-    pub fn parse(raw: []const u8) ChangeFilter {
+    pub fn parse(raw: []const u8) !ChangeFilter {
         var f = ChangeFilter{ .show_added = false, .show_deleted = false, .show_modified = false };
         var it = std.mem.splitScalar(u8, raw, ',');
+        var seen = false;
         while (it.next()) |part| {
-            if (std.mem.eql(u8, part, "added")) f.show_added = true;
-            if (std.mem.eql(u8, part, "deleted")) f.show_deleted = true;
-            if (std.mem.eql(u8, part, "modified")) f.show_modified = true;
+            seen = true;
+            if (std.mem.eql(u8, part, "added")) {
+                f.show_added = true;
+            } else if (std.mem.eql(u8, part, "deleted")) {
+                f.show_deleted = true;
+            } else if (std.mem.eql(u8, part, "modified")) {
+                f.show_modified = true;
+            } else {
+                return error.InvalidChangeFilter;
+            }
         }
+        if (!seen) return error.InvalidChangeFilter;
         return f;
     }
 };
+
+pub fn parseColorMode(raw: []const u8) ?ColorMode {
+    if (std.mem.eql(u8, raw, "auto")) return .auto;
+    if (std.mem.eql(u8, raw, "always")) return .always;
+    if (std.mem.eql(u8, raw, "never")) return .never;
+    return null;
+}
 
 pub const Profile = enum { review, ci, debug };
 
@@ -213,7 +229,7 @@ pub const DiffArgs = struct {
             } else if (std.mem.eql(u8, arg, "--show")) {
                 i += 1;
                 if (i >= args.len) return error.MissingValue;
-                da.config.filter = ChangeFilter.parse(args[i]);
+                da.config.filter = try ChangeFilter.parse(args[i]);
             } else if (std.mem.eql(u8, arg, "--only-added")) {
                 da.config.filter = .{ .show_added = true, .show_deleted = false, .show_modified = false };
             } else if (std.mem.eql(u8, arg, "--only-deleted")) {
@@ -229,7 +245,7 @@ pub const DiffArgs = struct {
             } else if (std.mem.eql(u8, arg, "--color")) {
                 i += 1;
                 if (i >= args.len) return error.MissingValue;
-                da.config.color = if (std.mem.eql(u8, args[i], "always")) .always else if (std.mem.eql(u8, args[i], "never")) .never else .auto;
+                da.config.color = parseColorMode(args[i]) orelse return error.InvalidColorMode;
             } else if (std.mem.eql(u8, arg, "--profile")) {
                 i += 1;
                 if (i >= args.len) return error.MissingValue;
@@ -1055,7 +1071,7 @@ test "DiffArgs parse profile review" {
 }
 
 test "ChangeFilter parse comma list" {
-    const f = ChangeFilter.parse("added,modified");
+    const f = try ChangeFilter.parse("added,modified");
     try std.testing.expect(f.show_added);
     try std.testing.expect(f.show_modified);
     try std.testing.expect(!f.show_deleted);
