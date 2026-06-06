@@ -11,9 +11,6 @@ pub fn print() void {
     , .{});
 
     for (registry.commands) |cmd| {
-        std.debug.print(
-            "  {s: <12} {s}\n",
-            .{ cmd.name, "" },
-        );
+        std.debug.print("  {s: <12} {s}\n", .{ cmd.name, cmd.description });
     }
 }
