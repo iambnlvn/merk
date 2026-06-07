@@ -1,7 +1,10 @@
 const std = @import("std");
 const nodus = @import("nodus");
 const diff = nodus.diff;
-const Command = @import("../cli/command.zig").Command;
+const cli = @import("../cli/command.zig");
+const Command = cli.Command;
+const Flag = cli.Flag;
+const flags = @import("../cli/flags.zig");
 
 const repo_root = ".";
 
@@ -11,33 +14,32 @@ const Error = error{
     InvalidContext,
     InvalidGroup,
     InvalidProfile,
+    InvalidColorMode,
+    InvalidChangeFilter,
     UnknownOption,
     MissingValue,
 };
 
+const command_flags = [_]Flag{
+    .{ .short = 'f', .long = "format", .kind = .value, .value_name = "fmt", .help = "unified, side-by-side, blocks, ops, summary" },
+    .{ .short = 'l', .long = "level", .kind = .value, .value_name = "lvl", .help = "file, hunk, line, word" },
+    .{ .short = 'c', .long = "context", .kind = .value, .value_name = "n", .help = "context lines (number, minimal, normal, full)" },
+    .{ .short = 'g', .long = "group", .kind = .value, .value_name = "mode", .help = "none, files, dirs" },
+    .{ .long = "word", .kind = .boolean, .help = "enable inline word highlighting" },
+    .{ .long = "only-added", .kind = .boolean, .help = "show only added files" },
+    .{ .long = "only-deleted", .kind = .boolean, .help = "show only deleted files" },
+    .{ .long = "only-modified", .kind = .boolean, .help = "show only modified files" },
+    .{ .long = "show", .kind = .value, .value_name = "types", .help = "comma-separated: added,deleted,modified" },
+    .{ .long = "detect-moves", .kind = .boolean, .help = "heuristic move detection" },
+    .{ .long = "no-color", .kind = .boolean, .help = "disable color" },
+    .{ .long = "color", .kind = .value, .value_name = "when", .help = "auto, always, never" },
+    .{ .long = "profile", .kind = .value, .value_name = "name", .help = "review, ci, debug" },
+    .{ .long = "staged", .kind = .boolean, .help = "diff staged changes" },
+    .{ .long = "working", .kind = .boolean, .help = "diff working tree changes (default)" },
+};
+
 fn printUsage() void {
-    std.debug.print(
-        \\usage: nodus diff [options] [<path>...]
-        \\
-        \\options:
-        \\  -f, --format <fmt>      unified, side-by-side, blocks, ops, summary
-        \\  -l, --level <lvl>       file, hunk, line, word
-        \\  -c, --context <n>       context lines (number, minimal, normal, full)
-        \\  -g, --group <mode>      none, files, dirs
-        \\      --word              enable inline word highlighting
-        \\      --only-added        show only added files
-        \\      --only-deleted      show only deleted files
-        \\      --only-modified     show only modified files
-        \\      --show <types>      comma-separated: added,deleted,modified
-        \\      --detect-moves      heuristic move detection
-        \\      --no-color          disable color
-        \\      --color <when>      auto, always, never
-        \\      --profile <name>    review, ci, debug
-        \\      --staged            diff staged changes
-        \\      --working           diff working tree changes (default)
-        \\  -h, --help              show this help
-        \\
-    , .{});
+    cli.printHelpToStdout(command);
 }
 
 pub fn run(
@@ -55,25 +57,29 @@ pub fn run(
             printUsage();
             return;
         } else if (std.mem.eql(u8, arg, "--format") or std.mem.eql(u8, arg, "-f")) {
-            const value = args.next() orelse return Error.MissingValue;
+            const value = try flags.nextValue(args);
             config.format = diff.parseFormat(value) orelse return Error.InvalidFormat;
         } else if (std.mem.startsWith(u8, arg, "--format=")) {
-            config.format = diff.parseFormat(arg[9..]) orelse return Error.InvalidFormat;
+            const value = flags.inlineValue(arg, "--format") orelse return Error.InvalidFormat;
+            config.format = diff.parseFormat(value) orelse return Error.InvalidFormat;
         } else if (std.mem.eql(u8, arg, "--level") or std.mem.eql(u8, arg, "-l")) {
-            const value = args.next() orelse return Error.MissingValue;
+            const value = try flags.nextValue(args);
             config.level = diff.parseLevel(value) orelse return Error.InvalidLevel;
         } else if (std.mem.startsWith(u8, arg, "--level=")) {
-            config.level = diff.parseLevel(arg[8..]) orelse return Error.InvalidLevel;
+            const value = flags.inlineValue(arg, "--level") orelse return Error.InvalidLevel;
+            config.level = diff.parseLevel(value) orelse return Error.InvalidLevel;
         } else if (std.mem.eql(u8, arg, "--context") or std.mem.eql(u8, arg, "-c")) {
-            const value = args.next() orelse return Error.MissingValue;
+            const value = try flags.nextValue(args);
             config.context = diff.parseContext(value) orelse return Error.InvalidContext;
         } else if (std.mem.startsWith(u8, arg, "--context=")) {
-            config.context = diff.parseContext(arg[10..]) orelse return Error.InvalidContext;
+            const value = flags.inlineValue(arg, "--context") orelse return Error.InvalidContext;
+            config.context = diff.parseContext(value) orelse return Error.InvalidContext;
         } else if (std.mem.eql(u8, arg, "--group") or std.mem.eql(u8, arg, "-g")) {
-            const value = args.next() orelse return Error.MissingValue;
+            const value = try flags.nextValue(args);
             config.group_by = diff.parseGroupBy(value) orelse return Error.InvalidGroup;
         } else if (std.mem.startsWith(u8, arg, "--group=")) {
-            config.group_by = diff.parseGroupBy(arg[8..]) orelse return Error.InvalidGroup;
+            const value = flags.inlineValue(arg, "--group") orelse return Error.InvalidGroup;
+            config.group_by = diff.parseGroupBy(value) orelse return Error.InvalidGroup;
         } else if (std.mem.eql(u8, arg, "--word")) {
             config.word_mode = true;
         } else if (std.mem.eql(u8, arg, "--only-added")) {
@@ -83,10 +89,11 @@ pub fn run(
         } else if (std.mem.eql(u8, arg, "--only-modified")) {
             config.filter = .{ .show_added = false, .show_deleted = false, .show_modified = true };
         } else if (std.mem.eql(u8, arg, "--show")) {
-            const value = args.next() orelse return Error.MissingValue;
-            config.filter = diff.ChangeFilter.parse(value);
+            const value = try flags.nextValue(args);
+            config.filter = try diff.ChangeFilter.parse(value);
         } else if (std.mem.startsWith(u8, arg, "--show=")) {
-            config.filter = diff.ChangeFilter.parse(arg[7..]);
+            const value = flags.inlineValue(arg, "--show") orelse return Error.InvalidChangeFilter;
+            config.filter = try diff.ChangeFilter.parse(value);
         } else if (std.mem.eql(u8, arg, "--detect-moves")) {
             config.detect_moves = true;
         } else if (std.mem.eql(u8, arg, "--no-color")) {
@@ -94,48 +101,21 @@ pub fn run(
         } else if (std.mem.eql(u8, arg, "--color")) {
             const value = args.next();
             if (value) |v| {
-                config.color = if (std.mem.eql(u8, v, "always")) .always else if (std.mem.eql(u8, v, "never")) .never else .auto;
+                config.color = diff.parseColorMode(v) orelse return Error.InvalidColorMode;
             } else {
                 config.color = .always;
             }
         } else if (std.mem.startsWith(u8, arg, "--color=")) {
-            const value = arg[8..];
-            config.color = if (std.mem.eql(u8, value, "always")) .always else if (std.mem.eql(u8, value, "never")) .never else .auto;
+            const value = flags.inlineValue(arg, "--color") orelse return Error.InvalidColorMode;
+            config.color = diff.parseColorMode(value) orelse return Error.InvalidColorMode;
         } else if (std.mem.eql(u8, arg, "--profile")) {
-            const value = args.next() orelse return Error.MissingValue;
-            const p = std.meta.stringToEnum(diff.Profile, value) orelse return Error.InvalidProfile;
-            switch (p) {
-                .review => {
-                    config.format = .side_by_side;
-                    config.level = .line;
-                    config.group_by = .files;
-                },
-                .ci => {
-                    config.format = .summary;
-                    config.level = .file;
-                },
-                .debug => {
-                    config.format = .ops;
-                    config.context = .full;
-                },
-            }
+            const value = try flags.nextValue(args);
+            const p = flags.parseEnum(diff.Profile, value) orelse return Error.InvalidProfile;
+            diff.ProfileOpts.apply(p, &config);
         } else if (std.mem.startsWith(u8, arg, "--profile=")) {
-            const p = std.meta.stringToEnum(diff.Profile, arg[10..]) orelse return Error.InvalidProfile;
-            switch (p) {
-                .review => {
-                    config.format = .side_by_side;
-                    config.level = .line;
-                    config.group_by = .files;
-                },
-                .ci => {
-                    config.format = .summary;
-                    config.level = .file;
-                },
-                .debug => {
-                    config.format = .ops;
-                    config.context = .full;
-                },
-            }
+            const value = flags.inlineValue(arg, "--profile") orelse return Error.InvalidProfile;
+            const p = flags.parseEnum(diff.Profile, value) orelse return Error.InvalidProfile;
+            diff.ProfileOpts.apply(p, &config);
         } else if (std.mem.eql(u8, arg, "--staged")) {
             // TODO: diff index against HEAD instead of working tree
         } else if (std.mem.eql(u8, arg, "--working")) {
@@ -250,5 +230,8 @@ pub fn run(
 
 pub const command = Command{
     .name = "diff",
+    .description = "Show changes between the index and working tree.",
+    .usage = "[options] [<path>...]",
+    .flags = &command_flags,
     .run = run,
 };

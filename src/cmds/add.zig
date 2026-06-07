@@ -2,12 +2,22 @@ const std = @import("std");
 const nodus = @import("nodus");
 
 const repo_root = ".";
-const Command = @import("../cli/command.zig").Command;
+const cli = @import("../cli/command.zig");
+const Command = cli.Command;
+
+fn printUsage() void {
+    cli.printHelpToStdout(command);
+}
 
 pub fn run(
     alloc: std.mem.Allocator,
     args: *std.process.ArgIterator,
 ) !void {
+    if (cli.hasHelpFlag(args)) {
+        printUsage();
+        return;
+    }
+
     var store = try nodus.object.Store.init(alloc, repo_root);
     defer store.deinit();
 
@@ -43,5 +53,7 @@ pub fn run(
 
 pub const command = Command{
     .name = "add",
+    .description = "Stage paths in the index.",
+    .usage = "[<path>...]",
     .run = run,
 };
