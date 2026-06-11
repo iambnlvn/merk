@@ -1,24 +1,14 @@
 const std = @import("std");
 const nodus = @import("nodus");
 
-const repo_root = ".";
 const cli = @import("../cli/command.zig");
 const Command = cli.Command;
+const Invocation = cli.Invocation;
 
-fn printUsage() void {
-    cli.printHelpToStdout(command);
-}
+const repo_root = ".";
 
-pub fn run(
-    alloc: std.mem.Allocator,
-    args: *std.process.ArgIterator,
-) !void {
-    if (cli.hasHelpFlag(args)) {
-        printUsage();
-        return;
-    }
-
-    var index = try nodus.index.Index.init(alloc, repo_root);
+pub fn run(inv: *Invocation) !void {
+    var index = try nodus.index.Index.init(inv.alloc, repo_root);
     defer index.deinit();
 
     try index.load();

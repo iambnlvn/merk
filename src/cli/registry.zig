@@ -8,9 +8,9 @@ const diff = @import("../cmds/diff.zig");
 const writeTree = @import("../cmds/write-tree.zig");
 /// To add a new command, import its module and add its `.command` constant
 pub const commands: []const Command = &[_]Command{
-    // init.command,
+    init.command,
     add.command,
-        // status.command,
+    status.command,
         // diff.command,
         // writeTree.command,
 };
