@@ -12,7 +12,7 @@ pub const commands: []const Command = &[_]Command{
     add.command,
     status.command,
     diff.command,
-        // writeTree.command,
+    writeTree.command,
 };
 
 /// Returns a pointer into the `commands` slice
