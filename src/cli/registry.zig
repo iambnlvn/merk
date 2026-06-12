@@ -11,7 +11,7 @@ pub const commands: []const Command = &[_]Command{
     init.command,
     add.command,
     status.command,
-        // diff.command,
+    diff.command,
         // writeTree.command,
 };
 
