@@ -1,5 +1,3 @@
-//  Nodus diff engine + CLI surface
-//
 //  Two passes on every changed file:
 //    * Line-level unified diff  (for display, `nodus show`)
 //    * Word-level diff          (for precision, intent classifier)
@@ -19,6 +17,7 @@
 //  Histogram — uses occurrence-frequency buckets so rarer
 //              lines are preferred as anchors even when not strictly unique
 //              Degrades to Myers when the histogram finds nothing useful
+//
 
 const std = @import("std");
 
@@ -88,15 +87,6 @@ pub const Algorithm = enum {
     histogram,
 };
 
-pub fn parseAlgorithm(s: []const u8) ?Algorithm {
-    const map = std.StaticStringMap(Algorithm).initComptime(.{
-        .{ "myers", .myers },
-        .{ "patience", .patience },
-        .{ "histogram", .histogram },
-    });
-    return map.get(s);
-}
-
 pub const Format = enum {
     unified,
     side_by_side,
@@ -132,12 +122,6 @@ pub const GroupBy = enum {
     none,
     files,
     dirs,
-};
-
-pub const ColorMode = enum {
-    auto,
-    always,
-    never,
 };
 
 pub const FileStatus = enum { added, deleted, modified, unchanged };
@@ -177,35 +161,6 @@ pub const ChangeFilter = struct {
     }
 };
 
-pub fn parseColorMode(raw: []const u8) ?ColorMode {
-    if (std.mem.eql(u8, raw, "auto")) return .auto;
-    if (std.mem.eql(u8, raw, "always")) return .always;
-    if (std.mem.eql(u8, raw, "never")) return .never;
-    return null;
-}
-
-pub const Profile = enum { review, ci, debug };
-
-pub const ProfileOpts = struct {
-    pub fn apply(p: Profile, config: *RenderConfig) void {
-        switch (p) {
-            .review => {
-                config.format = .side_by_side;
-                config.level = .line;
-                config.group_by = .files;
-            },
-            .ci => {
-                config.format = .summary;
-                config.level = .file;
-            },
-            .debug => {
-                config.format = .ops;
-                config.context = .full;
-            },
-        }
-    }
-};
-
 pub const RenderConfig = struct {
     format: Format = .unified,
     level: Level = .line,
@@ -214,7 +169,6 @@ pub const RenderConfig = struct {
     filter: ChangeFilter = .{},
     word_mode: bool = false,
     detect_moves: bool = false,
-    color: ColorMode = .auto,
     max_width: u32 = 60,
     /// Which diff algorithm to use for line-level diffing
     algorithm: Algorithm = .histogram,
@@ -223,128 +177,6 @@ pub const RenderConfig = struct {
         return self.context.lines();
     }
 };
-
-pub const DiffArgs = struct {
-    refs: [2]?[]const u8 = .{ null, null },
-    paths: std.ArrayList([]const u8),
-    staged: bool = false,
-    working: bool = false,
-    config: RenderConfig = .{},
-
-    pub fn parse(alloc: std.mem.Allocator, args: []const []const u8) !DiffArgs {
-        var da = DiffArgs{ .paths = .empty };
-        errdefer da.paths.deinit(alloc);
-
-        var i: usize = 2; // skip argv[0] and subcommand "diff"
-        while (i < args.len) : (i += 1) {
-            const arg = args[i];
-            if (std.mem.eql(u8, arg, "--format") or std.mem.eql(u8, arg, "-f")) {
-                i += 1;
-                if (i >= args.len) return error.MissingValue;
-                da.config.format = parseFormat(args[i]) orelse return error.InvalidFormat;
-            } else if (std.mem.eql(u8, arg, "--level")) {
-                i += 1;
-                if (i >= args.len) return error.MissingValue;
-                da.config.level = parseLevel(args[i]) orelse return error.InvalidLevel;
-            } else if (std.mem.eql(u8, arg, "--context")) {
-                i += 1;
-                if (i >= args.len) return error.MissingValue;
-                da.config.context = parseContext(args[i]) orelse return error.InvalidContext;
-            } else if (std.mem.eql(u8, arg, "--group")) {
-                i += 1;
-                if (i >= args.len) return error.MissingValue;
-                da.config.group_by = parseGroupBy(args[i]) orelse return error.InvalidGroup;
-            } else if (std.mem.eql(u8, arg, "--show")) {
-                i += 1;
-                if (i >= args.len) return error.MissingValue;
-                da.config.filter = try ChangeFilter.parse(args[i]);
-            } else if (std.mem.eql(u8, arg, "--only-added")) {
-                da.config.filter = .{ .show_added = true, .show_deleted = false, .show_modified = false };
-            } else if (std.mem.eql(u8, arg, "--only-deleted")) {
-                da.config.filter = .{ .show_added = false, .show_deleted = true, .show_modified = false };
-            } else if (std.mem.eql(u8, arg, "--only-modified")) {
-                da.config.filter = .{ .show_added = false, .show_deleted = false, .show_modified = true };
-            } else if (std.mem.eql(u8, arg, "--word")) {
-                da.config.word_mode = true;
-            } else if (std.mem.eql(u8, arg, "--detect-moves")) {
-                da.config.detect_moves = true;
-            } else if (std.mem.eql(u8, arg, "--no-color")) {
-                da.config.color = .never;
-            } else if (std.mem.eql(u8, arg, "--color")) {
-                i += 1;
-                if (i >= args.len) return error.MissingValue;
-                da.config.color = parseColorMode(args[i]) orelse return error.InvalidColorMode;
-            } else if (std.mem.eql(u8, arg, "--algo")) {
-                i += 1;
-                if (i >= args.len) return error.MissingValue;
-                da.config.algorithm = parseAlgorithm(args[i]) orelse return error.InvalidAlgorithm;
-            } else if (std.mem.eql(u8, arg, "--profile")) {
-                i += 1;
-                if (i >= args.len) return error.MissingValue;
-                const p = std.meta.stringToEnum(Profile, args[i]) orelse return error.InvalidProfile;
-                ProfileOpts.apply(p, &da.config);
-            } else if (std.mem.eql(u8, arg, "--staged")) {
-                da.staged = true;
-            } else if (std.mem.eql(u8, arg, "--working")) {
-                da.working = true;
-            } else if (std.mem.startsWith(u8, arg, "-")) {
-                return error.UnknownFlag;
-            } else {
-                // Positional: ref or path
-                if (da.refs[0] == null) {
-                    da.refs[0] = arg;
-                } else if (da.refs[1] == null) {
-                    da.refs[1] = arg;
-                } else {
-                    try da.paths.append(alloc, arg);
-                }
-            }
-        }
-        return da;
-    }
-
-    pub fn deinit(self: *DiffArgs, alloc: std.mem.Allocator) void {
-        self.paths.deinit(alloc);
-    }
-};
-
-pub fn parseFormat(s: []const u8) ?Format {
-    const map = std.StaticStringMap(Format).initComptime(.{
-        .{ "unified", .unified },
-        .{ "side-by-side", .side_by_side },
-        .{ "blocks", .blocks },
-        .{ "ops", .ops },
-        .{ "summary", .summary },
-    });
-    return map.get(s);
-}
-
-pub fn parseLevel(s: []const u8) ?Level {
-    const map = std.StaticStringMap(Level).initComptime(.{
-        .{ "file", .file },
-        .{ "hunk", .hunk },
-        .{ "line", .line },
-        .{ "word", .word },
-    });
-    return map.get(s);
-}
-
-pub fn parseContext(s: []const u8) ?Context {
-    if (std.mem.eql(u8, s, "minimal")) return .minimal;
-    if (std.mem.eql(u8, s, "normal")) return .normal;
-    if (std.mem.eql(u8, s, "full")) return .full;
-    const n = std.fmt.parseInt(u32, s, 10) catch return null;
-    return .{ .exact = n };
-}
-
-pub fn parseGroupBy(s: []const u8) ?GroupBy {
-    const map = std.StaticStringMap(GroupBy).initComptime(.{
-        .{ "none", .none },
-        .{ "files", .files },
-        .{ "dirs", .dirs },
-    });
-    return map.get(s);
-}
 
 pub fn diffFile(
     alloc: std.mem.Allocator,
@@ -616,7 +448,6 @@ fn patienceDiffRange(
     new_lo: usize,
     new_hi: usize,
 ) ![]LineDelta {
-    // Strip matching prefix
     var alo = old_lo;
     var nlo = new_lo;
     while (alo < old_hi and nlo < new_hi and lineEq(old[alo], new[nlo])) {
@@ -624,7 +455,6 @@ fn patienceDiffRange(
         nlo += 1;
     }
 
-    // Strip matching suffix
     var ahi = old_hi;
     var nhi = new_hi;
     while (ahi > alo and nhi > nlo and lineEq(old[ahi - 1], new[nhi - 1])) {
@@ -635,7 +465,6 @@ fn patienceDiffRange(
     var out: std.ArrayList(LineDelta) = .empty;
     errdefer out.deinit(alloc);
 
-    // Emit prefix equalities
     for (old_lo..alo) |i| {
         try out.append(alloc, makeLineDelta(.eq, old[i], @intCast(i + 1), @intCast(new_lo + (i - old_lo) + 1)));
     }
@@ -643,12 +472,10 @@ fn patienceDiffRange(
     if (alo == ahi and nlo == nhi) {
         // Nothing left after stripping common prefix/suffix
     } else {
-        // Find unique-line anchors inside the trimmed region
         const anchors = try patienceAnchors(alloc, old, new, alo, ahi, nlo, nhi);
         defer alloc.free(anchors);
 
         if (anchors.len == 0) {
-            // No unique anchors — fall back to Myers for this segment
             const sub = try myersDiff(LineDelta, alloc, old, new, alo, ahi, nlo, nhi, lineEq, makeLineDelta);
             defer alloc.free(sub);
             try out.appendSlice(alloc, sub);
@@ -657,12 +484,10 @@ fn patienceDiffRange(
             var prev_ni = nlo;
 
             for (anchors) |anc| {
-                // Recurse into the gap before this anchor
                 const sub = try patienceDiffRange(alloc, old, new, prev_oi, anc.old_idx, prev_ni, anc.new_idx);
                 defer alloc.free(sub);
                 try out.appendSlice(alloc, sub);
 
-                // Emit the anchor itself as an equality
                 try out.append(alloc, makeLineDelta(
                     .eq,
                     old[anc.old_idx],
@@ -673,14 +498,12 @@ fn patienceDiffRange(
                 prev_ni = anc.new_idx + 1;
             }
 
-            // Recurse into the tail after the last anchor
             const sub = try patienceDiffRange(alloc, old, new, prev_oi, ahi, prev_ni, nhi);
             defer alloc.free(sub);
             try out.appendSlice(alloc, sub);
         }
     }
 
-    // Emit suffix equalities
     for (ahi..old_hi) |i| {
         const new_i = nhi + (i - ahi);
         try out.append(alloc, makeLineDelta(.eq, old[i], @intCast(i + 1), @intCast(new_i + 1)));
@@ -689,11 +512,8 @@ fn patienceDiffRange(
     return out.toOwnedSlice(alloc);
 }
 
-/// An (old_idx, new_idx) pair representing a matched unique line
 const Anchor = struct { old_idx: usize, new_idx: usize };
 
-/// Compute the LCS of unique lines in [old_lo,old_hi) × [new_lo,new_hi)
-/// using the patience sorting algo
 fn patienceAnchors(
     alloc: std.mem.Allocator,
     old: []const []const u8,
@@ -703,8 +523,7 @@ fn patienceAnchors(
     new_lo: usize,
     new_hi: usize,
 ) ![]Anchor {
-    // Build occurrence maps: line -> list of indices in old/new
-    var old_map = std.StringHashMap(u32).init(alloc); // line → old index; maxInt = non-unique
+    var old_map = std.StringHashMap(u32).init(alloc);
     defer old_map.deinit();
     var new_map = std.StringHashMap(u32).init(alloc);
     defer new_map.deinit();
@@ -716,7 +535,7 @@ fn patienceAnchors(
         if (!gop.found_existing) {
             gop.value_ptr.* = @intCast(i);
         } else {
-            gop.value_ptr.* = MULTI; // seen more than once
+            gop.value_ptr.* = MULTI;
         }
     }
 
@@ -729,7 +548,6 @@ fn patienceAnchors(
         }
     }
 
-    // Collect matching unique pairs in new-file order
     var pairs: std.ArrayList(Anchor) = .empty;
     defer pairs.deinit(alloc);
 
@@ -743,27 +561,20 @@ fn patienceAnchors(
 
     if (pairs.items.len == 0) return &.{};
 
-    // Sort by old_idx to enable the patience LCS
     std.sort.insertion(Anchor, pairs.items, {}, struct {
         fn lt(_: void, a: Anchor, b: Anchor) bool {
             return a.old_idx < b.old_idx;
         }
     }.lt);
 
-    // find longest increasing subsequence (LIS) on new_idx
-    // Each pile's top is the smallest new_idx for a run of that length
-    var piles: std.ArrayList(Anchor) = .empty;
-    defer piles.deinit(alloc);
-    // prev[i] = index into `pairs` of the predecessor of pairs[i] in the LIS
     var prev = try alloc.alloc(usize, pairs.items.len);
     defer alloc.free(prev);
-    var pile_top_src = try alloc.alloc(usize, pairs.items.len); // pair index at each pile top
+    var pile_top_src = try alloc.alloc(usize, pairs.items.len);
     defer alloc.free(pile_top_src);
     @memset(prev, std.math.maxInt(usize));
     var pile_count: usize = 0;
 
     for (pairs.items, 0..) |pair, pi| {
-        // Binary search for leftmost pile whose top has new_idx >= pair.new_idx
         var lo2: usize = 0;
         var hi2: usize = pile_count;
         while (lo2 < hi2) {
@@ -779,7 +590,6 @@ fn patienceAnchors(
         if (lo2 == pile_count) pile_count += 1;
     }
 
-    // Backtrack to recover the LIS
     var lis: std.ArrayList(Anchor) = .empty;
     defer lis.deinit(alloc);
 
@@ -813,14 +623,12 @@ fn histogramDiffRange(
     new_lo: usize,
     new_hi: usize,
 ) ![]LineDelta {
-    // Strip common prefix
     var alo = old_lo;
     var nlo = new_lo;
     while (alo < old_hi and nlo < new_hi and lineEq(old[alo], new[nlo])) {
         alo += 1;
         nlo += 1;
     }
-    // Strip common suffix
     var ahi = old_hi;
     var nhi = new_hi;
     while (ahi > alo and nhi > nlo and lineEq(old[ahi - 1], new[nhi - 1])) {
@@ -831,7 +639,6 @@ fn histogramDiffRange(
     var out: std.ArrayList(LineDelta) = .empty;
     errdefer out.deinit(alloc);
 
-    // Emit prefix equalities
     for (old_lo..alo) |i| {
         try out.append(alloc, makeLineDelta(.eq, old[i], @intCast(i + 1), @intCast(new_lo + (i - old_lo) + 1)));
     }
@@ -840,19 +647,16 @@ fn histogramDiffRange(
         const region = try histogramFindRegion(alloc, old, new, alo, ahi, nlo, nhi);
 
         if (region == null) {
-            // No anchor found — fall back to Myers
             const sub = try myersDiff(LineDelta, alloc, old, new, alo, ahi, nlo, nhi, lineEq, makeLineDelta);
             defer alloc.free(sub);
             try out.appendSlice(alloc, sub);
         } else {
             const reg = region.?;
 
-            // Recurse on the part before the anchor region
             const left = try histogramDiffRange(alloc, old, new, alo, reg.old_start, nlo, reg.new_start);
             defer alloc.free(left);
             try out.appendSlice(alloc, left);
 
-            // Emit the anchor region as equalities
             for (0..reg.len) |k| {
                 try out.append(alloc, makeLineDelta(
                     .eq,
@@ -862,7 +666,6 @@ fn histogramDiffRange(
                 ));
             }
 
-            // Recurse on the part after the anchor region
             const right = try histogramDiffRange(
                 alloc,
                 old,
@@ -877,7 +680,6 @@ fn histogramDiffRange(
         }
     }
 
-    // Emit suffix equalities
     for (ahi..old_hi) |i| {
         const new_i = nhi + (i - ahi);
         try out.append(alloc, makeLineDelta(.eq, old[i], @intCast(i + 1), @intCast(new_i + 1)));
@@ -886,17 +688,12 @@ fn histogramDiffRange(
     return out.toOwnedSlice(alloc);
 }
 
-/// An equal region (snake) used as an anchor by histogram diff
 const Region = struct {
     old_start: usize,
     new_start: usize,
     len: usize,
 };
 
-/// Find the best anchor region in old[old_lo..old_hi] × new[new_lo..new_hi]
-///
-/// "Best" = the equal-line region whose anchor line has the lowest frequency
-/// in old, breaking ties by preferring longer regions
 fn histogramFindRegion(
     alloc: std.mem.Allocator,
     old: []const []const u8,
@@ -906,8 +703,6 @@ fn histogramFindRegion(
     new_lo: usize,
     new_hi: usize,
 ) !?Region {
-    // Build frequency table for lines in old[lo..hi]
-    // freq_map: line content -> count in old segment
     var freq_map = std.StringHashMap(u32).init(alloc);
     defer freq_map.deinit();
 
@@ -917,23 +712,17 @@ fn histogramFindRegion(
         gop.value_ptr.* += 1;
     }
 
-    // For each line in new, if it also appears in old, record a candidate
-    // (old_occurrence, new_occurrence) pair and its frequency score
-    // We want the pair with the lowest frequency (rarest line)
     var best: ?Region = null;
     var best_freq: u32 = std.math.maxInt(u32);
     var best_len: usize = 0;
 
     for (new_lo..new_hi) |nj| {
         const freq = freq_map.get(new[nj]) orelse continue;
-        // Only consider if this line is at least as rare as the current best
         if (freq > best_freq) continue;
 
-        // Find every occurrence of new[nj] in old[old_lo..old_hi]
         for (old_lo..old_hi) |oi| {
             if (!lineEq(old[oi], new[nj])) continue;
 
-            // Extend the snake backward from (oi, nj)
             var back: usize = 0;
             while (oi >= old_lo + back + 1 and
                 nj >= new_lo + back + 1 and
@@ -941,7 +730,6 @@ fn histogramFindRegion(
             {
                 back += 1;
             }
-            // Extend forward
             var fwd: usize = 1;
             while (oi + fwd < old_hi and
                 nj + fwd < new_hi and
@@ -1006,8 +794,6 @@ fn diffWords(alloc: std.mem.Allocator, line_deltas: []const LineDelta) ![]WordDe
 
         const lineno = if (ins_lineno != 0) ins_lineno else del_lineno;
 
-        // Word diff always uses Myers; the inputs are already small
-        // Patience/histogram on single-line word tokens rarely helps and adds cost
         const word_ops = try myersDiff(
             WordDelta,
             alloc,
@@ -1319,6 +1105,20 @@ pub fn summarize(cd: *const CommitDiff) DiffSummary {
     return s;
 }
 
+pub fn fileStatus(fd: *const FileDiff) FileStatus {
+    var has_ins = false;
+    var has_del = false;
+    for (fd.line_deltas) |d| switch (d.op) {
+        .ins => has_ins = true,
+        .del => has_del = true,
+        .eq => {},
+    };
+    if (has_ins and has_del) return .modified;
+    if (has_ins) return .added;
+    if (has_del) return .deleted;
+    return .unchanged;
+}
+
 fn splitLines(alloc: std.mem.Allocator, src: []const u8) ![][]const u8 {
     var lines: std.ArrayList([]const u8) = .empty;
     errdefer lines.deinit(alloc);
@@ -1367,20 +1167,6 @@ fn wordEq(a: []const u8, b: []const u8) bool {
 
 fn makeWordDelta(op: Op, word: []const u8, _: u32, _: u32) WordDelta {
     return .{ .op = op, .word = word, .lineno = 0 };
-}
-
-pub fn fileStatus(fd: *const FileDiff) FileStatus {
-    var has_ins = false;
-    var has_del = false;
-    for (fd.line_deltas) |d| switch (d.op) {
-        .ins => has_ins = true,
-        .del => has_del = true,
-        .eq => {},
-    };
-    if (has_ins and has_del) return .modified;
-    if (has_ins) return .added;
-    if (has_del) return .deleted;
-    return .unchanged;
 }
 
 fn statusString(s: FileStatus) []const u8 {
@@ -1511,9 +1297,6 @@ test "diffFile single line removed — all algos" {
 }
 
 test "patience prefers unique anchors over ambiguous matches" {
-    // This is the canonical patience diff example.
-    // Myers would match `}` lines greedily; patience anchors on the unique
-    // function signatures and produces a cleaner diff.
     const alloc = std.testing.allocator;
     const old =
         \\void func1() {
@@ -1540,7 +1323,6 @@ test "patience prefers unique anchors over ambiguous matches" {
     var fd_histogram = try diffFileWith(alloc, "f.c", old, new, .histogram);
     defer fd_histogram.deinit(alloc);
 
-    // Both algorithms should find exactly 2 added lines.
     try std.testing.expectEqual(@as(u32, 2), fd_patience.lines_added);
     try std.testing.expectEqual(@as(u32, 0), fd_patience.lines_removed);
     try std.testing.expectEqual(@as(u32, 2), fd_histogram.lines_added);
@@ -1548,8 +1330,6 @@ test "patience prefers unique anchors over ambiguous matches" {
 }
 
 test "histogram handles repeated lines gracefully" {
-    // When lines repeat (e.g. closing braces), histogram falls back to rarest
-    // lines and still produces a valid diff.
     const alloc = std.testing.allocator;
     const old = "}\n}\n}\n";
     const new = "}\n}\n}\n}\n";
@@ -1559,7 +1339,7 @@ test "histogram handles repeated lines gracefully" {
     try std.testing.expectEqual(@as(u32, 0), fd.lines_removed);
 }
 
-test "all algos agree on line counts" {
+test "all algos agree on net line delta" {
     const alloc = std.testing.allocator;
     const old =
         \\pub fn foo(x: u32) u32 {
@@ -1591,13 +1371,15 @@ test "all algos agree on line counts" {
     var fd_h = try diffFileWith(alloc, "f.zig", old, new, .histogram);
     defer fd_h.deinit(alloc);
 
-    // All three should produce net +4 lines (added - removed may differ in how
-    // they attribute the rewrite of `return x + 1`, but totals must be sane)
+    // Net added-removed must equal new.len - old.len for ANY correct edit
+    // script, regardless of algorithm — this is an algorithm-independent
+    // invariant, not a property specific to one diff strategy
     const net_m: i32 = @as(i32, @intCast(fd_m.lines_added)) - @as(i32, @intCast(fd_m.lines_removed));
     const net_p: i32 = @as(i32, @intCast(fd_p.lines_added)) - @as(i32, @intCast(fd_p.lines_removed));
     const net_h: i32 = @as(i32, @intCast(fd_h.lines_added)) - @as(i32, @intCast(fd_h.lines_removed));
-    try std.testing.expectEqual(net_m, net_p);
-    try std.testing.expectEqual(net_m, net_h);
+    try std.testing.expectEqual(@as(i32, 5), net_m);
+    try std.testing.expectEqual(@as(i32, 5), net_p);
+    try std.testing.expectEqual(@as(i32, 5), net_h);
 }
 
 test "tokenizeWords splits identifiers and punctuation" {
@@ -1628,38 +1410,6 @@ test "summarize aggregates across files" {
     try std.testing.expectEqual(@as(u32, 2), s.files_changed);
     try std.testing.expectEqual(@as(u32, 2), s.lines_added);
     try std.testing.expectEqual(@as(u32, 1), s.lines_removed);
-}
-
-test "DiffArgs parse format and level" {
-    const alloc = std.testing.allocator;
-    const args = [_][]const u8{ "nodus", "diff", "--format", "side-by-side", "--level", "word" };
-    var da = try DiffArgs.parse(alloc, &args);
-    defer da.deinit(alloc);
-    try std.testing.expectEqual(Format.side_by_side, da.config.format);
-    try std.testing.expectEqual(Level.word, da.config.level);
-}
-
-test "DiffArgs parse --algo flag" {
-    const alloc = std.testing.allocator;
-    const args = [_][]const u8{ "nodus", "diff", "--algo", "patience" };
-    var da = try DiffArgs.parse(alloc, &args);
-    defer da.deinit(alloc);
-    try std.testing.expectEqual(Algorithm.patience, da.config.algorithm);
-}
-
-test "DiffArgs parse profile review" {
-    const alloc = std.testing.allocator;
-    const args = [_][:0]const u8{
-        @as([:0]const u8, "nodus"),
-        @as([:0]const u8, "diff"),
-        @as([:0]const u8, "--profile"),
-        @as([:0]const u8, "review"),
-    };
-    var da = try DiffArgs.parse(alloc, &args);
-    defer da.deinit(alloc);
-    try std.testing.expectEqual(Format.side_by_side, da.config.format);
-    try std.testing.expectEqual(Level.line, da.config.level);
-    try std.testing.expectEqual(GroupBy.files, da.config.group_by);
 }
 
 test "ChangeFilter parse comma list" {
