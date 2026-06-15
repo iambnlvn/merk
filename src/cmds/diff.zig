@@ -1,6 +1,7 @@
 const std = @import("std");
 const nodus = @import("nodus");
 const diff = nodus.diff;
+const diff_args = @import("../cli/diff_args.zig");
 const cli = @import("../cli/command.zig");
 const Command = cli.Command;
 const Flag = cli.Flag;
@@ -10,38 +11,46 @@ const repo_root = ".";
 
 pub fn run(inv: *Invocation) !void {
     var config = diff.RenderConfig{};
+    var color_mode: diff_args.ColorMode = .auto;
 
     if (inv.flags.string("format")) |v|
-        config.format = diff.parseFormat(v) orelse {
+        config.format = diff_args.parseFormat(v) orelse {
             std.debug.print("error: invalid format '{s}'\n", .{v});
             command.printHelpToStderr();
             return error.InvalidFormat;
         };
 
     if (inv.flags.string("level")) |v|
-        config.level = diff.parseLevel(v) orelse {
+        config.level = diff_args.parseLevel(v) orelse {
             std.debug.print("error: invalid level '{s}'\n", .{v});
             command.printHelpToStderr();
             return error.InvalidLevel;
         };
 
     if (inv.flags.string("context")) |v|
-        config.context = diff.parseContext(v) orelse {
+        config.context = diff_args.parseContext(v) orelse {
             std.debug.print("error: invalid context '{s}'\n", .{v});
             command.printHelpToStderr();
             return error.InvalidContext;
         };
 
     if (inv.flags.string("group")) |v|
-        config.group_by = diff.parseGroupBy(v) orelse {
+        config.group_by = diff_args.parseGroupBy(v) orelse {
             std.debug.print("error: invalid group '{s}'\n", .{v});
             command.printHelpToStderr();
             return error.InvalidGroup;
         };
 
+    if (inv.flags.string("algo")) |v|
+        config.algorithm = diff_args.parseAlgorithm(v) orelse {
+            std.debug.print("error: invalid algorithm '{s}'\n", .{v});
+            command.printHelpToStderr();
+            return error.InvalidAlgorithm;
+        };
+
     if (inv.flags.boolean("word")) config.word_mode = true;
     if (inv.flags.boolean("detect-moves")) config.detect_moves = true;
-    if (inv.flags.boolean("no-color")) config.color = .never;
+    if (inv.flags.boolean("no-color")) color_mode = .never;
 
     if (inv.flags.boolean("only-added"))
         config.filter = .{ .show_added = true, .show_deleted = false, .show_modified = false };
@@ -50,7 +59,6 @@ pub fn run(inv: *Invocation) !void {
     if (inv.flags.boolean("only-modified"))
         config.filter = .{ .show_added = false, .show_deleted = false, .show_modified = true };
 
-    // --show overrides the shorthand filters above
     if (inv.flags.string("show")) |v|
         config.filter = diff.ChangeFilter.parse(v) catch {
             std.debug.print("error: invalid --show value '{s}'\n", .{v});
@@ -60,27 +68,31 @@ pub fn run(inv: *Invocation) !void {
 
     // --color overrides --no-color if both are given
     if (inv.flags.string("color")) |v|
-        config.color = diff.parseColorMode(v) orelse {
+        color_mode = diff_args.parseColorMode(v) orelse {
             std.debug.print("error: invalid color mode '{s}'\n", .{v});
             command.printHelpToStderr();
             return error.InvalidColorMode;
         };
 
     if (inv.flags.string("profile")) |v| {
-        const p = std.meta.stringToEnum(diff.Profile, v) orelse {
+        const p = std.meta.stringToEnum(diff_args.Profile, v) orelse {
             std.debug.print("error: invalid profile '{s}'\n", .{v});
             command.printHelpToStderr();
             return error.InvalidProfile;
         };
-        diff.ProfileOpts.apply(p, &config);
+        diff_args.ProfileOpts.apply(p, &config);
     }
 
-    // --staged / --working: accepted, --staged is a TODO
-    // inv.flags.boolean("staged"), diff index against HEAD
-    // inv.flags.boolean("working"), default behaviour, no-op
+    if (inv.flags.boolean("staged")) {
+        std.debug.print("error: --staged is not yet implemented\n", .{});
+        return error.NotImplemented;
+    }
+    // --working is the default behaviour (and currently the only one); accepted as a no-op
 
-    if (config.color == .auto)
-        config.color = if (std.fs.File.stdout().isTty()) .always else .never;
+    // Resolved here, in the CLI layer, since "is stdout a tty" is a CLI
+    // concern the core renderers don't need to know about.
+    const use_color = diff_args.resolveColor(color_mode, std.fs.File.stdout().isTty());
+    _ = use_color; //TODO: wire into renderers once color output is implemented
 
     const paths = inv.positional.items;
 
@@ -110,13 +122,13 @@ pub fn run(inv: *Invocation) !void {
         try source_buffers.append(inv.alloc, obj.payload);
 
         var fd: diff.FileDiff = if (state == .deleted)
-            try diff.diffFile(inv.alloc, entry.path, obj.payload, "")
+            try diff.diffFileWith(inv.alloc, entry.path, obj.payload, "", config.algorithm)
         else blk: {
             var file = try cwd.openFile(entry.path, .{});
             defer file.close();
             const new_src = try file.readToEndAlloc(inv.alloc, 64 * 1024 * 1024);
             try source_buffers.append(inv.alloc, new_src);
-            break :blk try diff.diffFile(inv.alloc, entry.path, obj.payload, new_src);
+            break :blk try diff.diffFileWith(inv.alloc, entry.path, obj.payload, new_src, config.algorithm);
         };
 
         if (fd.line_deltas.len != 0) {
@@ -179,6 +191,7 @@ pub const command = Command{
         .{ .short = 'l', .long = "level", .kind = .value, .value_name = "lvl", .help = "file, hunk, line, word" },
         .{ .short = 'c', .long = "context", .kind = .value, .value_name = "n", .help = "context lines (number, minimal, normal, full)" },
         .{ .short = 'g', .long = "group", .kind = .value, .value_name = "mode", .help = "none, files, dirs" },
+        .{ .long = "algo", .kind = .value, .value_name = "name", .help = "myers, patience, histogram (default: histogram)" },
         .{ .long = "word", .kind = .boolean, .help = "enable inline word highlighting" },
         .{ .long = "only-added", .kind = .boolean, .help = "show only added files" },
         .{ .long = "only-deleted", .kind = .boolean, .help = "show only deleted files" },
@@ -188,7 +201,7 @@ pub const command = Command{
         .{ .long = "no-color", .kind = .boolean, .help = "disable color" },
         .{ .long = "color", .kind = .value, .value_name = "when", .help = "auto, always, never" },
         .{ .long = "profile", .kind = .value, .value_name = "name", .help = "review, ci, debug" },
-        .{ .long = "staged", .kind = .boolean, .help = "diff staged changes" },
+        .{ .long = "staged", .kind = .boolean, .help = "diff staged changes (not yet implemented)" },
         .{ .long = "working", .kind = .boolean, .help = "diff working tree changes (default)" },
     },
     .run = run,
