@@ -1,7 +1,6 @@
 const std = @import("std");
 const nodus = @import("nodus");
 const diff = nodus.diff;
-const diff_args = @import("../cli/diff_args.zig");
 const cli = @import("../cli/command.zig");
 const Command = cli.Command;
 const Flag = cli.Flag;
@@ -9,42 +8,130 @@ const Invocation = cli.Invocation;
 
 const repo_root = ".";
 
+/// CLI-only: whether to emit ANSI color codes. The core renderers are
+/// colorless; if/when color support is added to rendering, it should take
+/// a plain `bool` derived from this, not this enum directly
+const ColorMode = enum {
+    auto,
+    always,
+    never,
+};
+
+const Profile = enum { review, ci, debug };
+
+fn parseFormat(s: []const u8) ?diff.Format {
+    const map = std.StaticStringMap(diff.Format).initComptime(.{
+        .{ "unified", .unified },
+        .{ "side-by-side", .side_by_side },
+        .{ "blocks", .blocks },
+        .{ "ops", .ops },
+        .{ "summary", .summary },
+    });
+    return map.get(s);
+}
+
+fn parseLevel(s: []const u8) ?diff.Level {
+    const map = std.StaticStringMap(diff.Level).initComptime(.{
+        .{ "file", .file },
+        .{ "hunk", .hunk },
+        .{ "line", .line },
+        .{ "word", .word },
+    });
+    return map.get(s);
+}
+
+fn parseContext(s: []const u8) ?diff.Context {
+    if (std.mem.eql(u8, s, "minimal")) return .minimal;
+    if (std.mem.eql(u8, s, "normal")) return .normal;
+    if (std.mem.eql(u8, s, "full")) return .full;
+    const n = std.fmt.parseInt(u32, s, 10) catch return null;
+    return .{ .exact = n };
+}
+
+fn parseGroupBy(s: []const u8) ?diff.GroupBy {
+    const map = std.StaticStringMap(diff.GroupBy).initComptime(.{
+        .{ "none", .none },
+        .{ "files", .files },
+        .{ "dirs", .dirs },
+    });
+    return map.get(s);
+}
+
+fn parseAlgorithm(s: []const u8) ?diff.Algorithm {
+    const map = std.StaticStringMap(diff.Algorithm).initComptime(.{
+        .{ "myers", .myers },
+        .{ "patience", .patience },
+        .{ "histogram", .histogram },
+    });
+    return map.get(s);
+}
+
+fn parseColorMode(raw: []const u8) ?ColorMode {
+    if (std.mem.eql(u8, raw, "auto")) return .auto;
+    if (std.mem.eql(u8, raw, "always")) return .always;
+    if (std.mem.eql(u8, raw, "never")) return .never;
+    return null;
+}
+
+/// Resolves `auto` against whether stdout is a TTY. CLI-only — core has no
+/// concept of a terminal.
+fn resolveColor(mode: ColorMode, stdout_is_tty: bool) bool {
+    return switch (mode) {
+        .always => true,
+        .never => false,
+        .auto => stdout_is_tty,
+    };
+}
+
+fn applyProfile(p: Profile, config: *diff.RenderConfig) void {
+    switch (p) {
+        .review => {
+            config.format = .side_by_side;
+            config.level = .line;
+            config.group_by = .files;
+        },
+        .ci => {
+            config.format = .summary;
+            config.level = .file;
+        },
+        .debug => {
+            config.format = .ops;
+            config.context = .full;
+        },
+    }
+}
+
 pub fn run(inv: *Invocation) !void {
     var config = diff.RenderConfig{};
-    var color_mode: diff_args.ColorMode = .auto;
+    var color_mode: ColorMode = .auto;
 
     if (inv.flags.string("format")) |v|
-        config.format = diff_args.parseFormat(v) orelse {
+        config.format = parseFormat(v) orelse {
             std.debug.print("error: invalid format '{s}'\n", .{v});
-            command.printHelpToStderr();
             return error.InvalidFormat;
         };
 
     if (inv.flags.string("level")) |v|
-        config.level = diff_args.parseLevel(v) orelse {
+        config.level = parseLevel(v) orelse {
             std.debug.print("error: invalid level '{s}'\n", .{v});
-            command.printHelpToStderr();
             return error.InvalidLevel;
         };
 
     if (inv.flags.string("context")) |v|
-        config.context = diff_args.parseContext(v) orelse {
+        config.context = parseContext(v) orelse {
             std.debug.print("error: invalid context '{s}'\n", .{v});
-            command.printHelpToStderr();
             return error.InvalidContext;
         };
 
     if (inv.flags.string("group")) |v|
-        config.group_by = diff_args.parseGroupBy(v) orelse {
+        config.group_by = parseGroupBy(v) orelse {
             std.debug.print("error: invalid group '{s}'\n", .{v});
-            command.printHelpToStderr();
             return error.InvalidGroup;
         };
 
     if (inv.flags.string("algo")) |v|
-        config.algorithm = diff_args.parseAlgorithm(v) orelse {
+        config.algorithm = parseAlgorithm(v) orelse {
             std.debug.print("error: invalid algorithm '{s}'\n", .{v});
-            command.printHelpToStderr();
             return error.InvalidAlgorithm;
         };
 
@@ -62,25 +149,22 @@ pub fn run(inv: *Invocation) !void {
     if (inv.flags.string("show")) |v|
         config.filter = diff.ChangeFilter.parse(v) catch {
             std.debug.print("error: invalid --show value '{s}'\n", .{v});
-            command.printHelpToStderr();
             return error.InvalidChangeFilter;
         };
 
     // --color overrides --no-color if both are given
     if (inv.flags.string("color")) |v|
-        color_mode = diff_args.parseColorMode(v) orelse {
+        color_mode = parseColorMode(v) orelse {
             std.debug.print("error: invalid color mode '{s}'\n", .{v});
-            command.printHelpToStderr();
             return error.InvalidColorMode;
         };
 
     if (inv.flags.string("profile")) |v| {
-        const p = std.meta.stringToEnum(diff_args.Profile, v) orelse {
+        const p = std.meta.stringToEnum(Profile, v) orelse {
             std.debug.print("error: invalid profile '{s}'\n", .{v});
-            command.printHelpToStderr();
             return error.InvalidProfile;
         };
-        diff_args.ProfileOpts.apply(p, &config);
+        applyProfile(p, &config);
     }
 
     if (inv.flags.boolean("staged")) {
@@ -91,7 +175,7 @@ pub fn run(inv: *Invocation) !void {
 
     // Resolved here, in the CLI layer, since "is stdout a tty" is a CLI
     // concern the core renderers don't need to know about.
-    const use_color = diff_args.resolveColor(color_mode, std.fs.File.stdout().isTty());
+    const use_color = resolveColor(color_mode, std.fs.File.stdout().isTty());
     _ = use_color; //TODO: wire into renderers once color output is implemented
 
     const paths = inv.positional.items;
