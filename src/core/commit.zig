@@ -8,47 +8,99 @@ const Hash = hash_mod.Hash;
 const Store = object.Store;
 
 pub const COMMIT_MAGIC = 0x4E_4F_44_55;
-pub const COMMIT_VERSION: u8 = 1;
+
 pub const MAX_PARENTS: u8 = 255;
 
-/// Identity string: "Name <email>"  (caller-owned, not validated)
-pub const Identity = []const u8;
+pub const Identity = struct {
+    name: []u8,
+    email: []u8,
+
+    pub fn deinit(self: *Identity, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.email);
+    }
+};
+
+pub const Intent = enum {
+    feature,
+    bugfix,
+    refactor,
+    docs,
+    @"test",
+    release,
+    chore,
+};
+
+pub const CommitStats = struct {
+    files_changed: u32 = 0,
+    additions: u32 = 0,
+    deletions: u32 = 0,
+};
 
 pub const CommitInfo = struct {
-    /// Pre-built root tree hash. Use `tree.writeFromIndex` to obtain it
+    /// Root tree snapshot.
     tree_hash: Hash,
-    /// 0–255 parent hashes. Empty slice = initial commit
+
+    /// Empty slice for initial commit.
     parents: []const Hash,
-    author: Identity,
-    message: []const u8,
-    /// Unix milliseconds. Pass 0 to use the current wall clock.
+
+    author_name: []const u8,
+    author_email: []const u8,
+
+    /// Pass 0 to use current wall clock.
     timestamp_ms: i64,
-    /// Name of the branch this commit belongs to
-    /// Empty slice is acceptable (detached HEAD)
-    branch: []const u8,
+
+    intent: Intent = .chore,
+
+    /// Optional labels such as:
+    /// ["cli", "diff", ""]
+    labels: []const []const u8 = &.{},
+
+    title: []const u8,
+    body: []const u8 = "",
+
+    stats: CommitStats = .{},
 };
 
 pub const Commit = struct {
     hash: Hash,
+
     tree_hash: Hash,
-    /// Caller owns this slice and every element inside it
+
+    /// Owned by caller.
     parents: []Hash,
-    /// Caller owns this slice
-    author: []u8,
-    /// Caller owns this slice
-    message: []u8,
+
+    author: Identity,
+
     timestamp_ms: i64,
-    /// Caller owns this slice
-    branch: []u8,
+
+    intent: Intent,
+
+    /// Owned by caller.
+    labels: [][]u8,
+
+    stats: CommitStats,
+
+    /// Short summary.
+    title: []u8,
+
+    /// Long description.
+    body: []u8,
 
     pub fn deinit(self: *Commit, alloc: std.mem.Allocator) void {
         alloc.free(self.parents);
-        alloc.free(self.author);
-        alloc.free(self.message);
-        alloc.free(self.branch);
+
+        self.author.deinit(alloc);
+
+        for (self.labels) |label| {
+            alloc.free(label);
+        }
+        alloc.free(self.labels);
+
+        alloc.free(self.title);
+        alloc.free(self.body);
     }
 };
-
 /// Write a commit object to the store and return its hash
 ///
 /// The caller must supply a fully-built CommitInfo; use `buildAndWrite` when
@@ -60,39 +112,112 @@ pub fn write(
 ) !Hash {
     if (info.parents.len > MAX_PARENTS)
         return error.TooManyParents;
-    if (info.author.len > std.math.maxInt(u16))
+
+    if (info.author_name.len > std.math.maxInt(u16))
         return error.FieldTooLong;
-    if (info.message.len > std.math.maxInt(u16))
+
+    if (info.author_email.len > std.math.maxInt(u16))
         return error.FieldTooLong;
-    if (info.branch.len > std.math.maxInt(u16))
+
+    if (info.title.len > std.math.maxInt(u16))
         return error.FieldTooLong;
+
+    if (info.body.len > std.math.maxInt(u32))
+        return error.FieldTooLong;
+
+    if (info.labels.len > std.math.maxInt(u16))
+        return error.FieldTooLong;
+
+    for (info.labels) |label| {
+        if (label.len > std.math.maxInt(u16))
+            return error.FieldTooLong;
+    }
 
     const ts: i64 = if (info.timestamp_ms != 0)
         info.timestamp_ms
     else
         std.time.milliTimestamp();
 
-    var buf: std.io.Writer.Allocating = std.io.Writer.Allocating.init(alloc);
+    var buf: std.Io.Writer.Allocating =
+        std.Io.Writer.Allocating.init(alloc);
     defer buf.deinit();
+
     const w = &buf.writer;
 
     try w.writeInt(u32, COMMIT_MAGIC, .little);
-    try w.writeByte(COMMIT_VERSION);
+
     try w.writeAll(&info.tree_hash);
 
     try w.writeByte(@intCast(info.parents.len));
-    for (info.parents) |p| try w.writeAll(&p);
 
-    try w.writeInt(u16, @intCast(info.author.len), .little);
-    try w.writeAll(info.author);
+    for (info.parents) |parent| {
+        try w.writeAll(&parent);
+    }
 
-    try w.writeInt(u16, @intCast(info.message.len), .little);
-    try w.writeAll(info.message);
+    try w.writeInt(
+        u16,
+        @intCast(info.author_name.len),
+        .little,
+    );
+    try w.writeAll(info.author_name);
+
+    try w.writeInt(
+        u16,
+        @intCast(info.author_email.len),
+        .little,
+    );
+    try w.writeAll(info.author_email);
 
     try w.writeInt(i64, ts, .little);
 
-    try w.writeInt(u16, @intCast(info.branch.len), .little);
-    try w.writeAll(info.branch);
+    try w.writeByte(@intFromEnum(info.intent));
+
+    try w.writeInt(
+        u16,
+        @intCast(info.labels.len),
+        .little,
+    );
+
+    for (info.labels) |label| {
+        try w.writeInt(
+            u16,
+            @intCast(label.len),
+            .little,
+        );
+        try w.writeAll(label);
+    }
+
+    try w.writeInt(
+        u32,
+        info.stats.files_changed,
+        .little,
+    );
+
+    try w.writeInt(
+        u32,
+        info.stats.additions,
+        .little,
+    );
+
+    try w.writeInt(
+        u32,
+        info.stats.deletions,
+        .little,
+    );
+
+    try w.writeInt(
+        u16,
+        @intCast(info.title.len),
+        .little,
+    );
+    try w.writeAll(info.title);
+
+    try w.writeInt(
+        u32,
+        @intCast(info.body.len),
+        .little,
+    );
+    try w.writeAll(info.body);
 
     return store.put(.commit, buf.written());
 }
@@ -103,20 +228,22 @@ pub fn buildAndWrite(
     alloc: std.mem.Allocator,
     store: *const Store,
     index: *const index_mod.Index,
-    parents: []const Hash,
-    author: Identity,
-    message: []const u8,
-    branch: []const u8,
+    info: CommitInfo,
 ) !Hash {
-    const tree_hash = try tree.writeFromIndex(alloc, store, index.entries.items);
-    return write(alloc, store, .{
-        .tree_hash = tree_hash,
-        .parents = parents,
-        .author = author,
-        .message = message,
-        .timestamp_ms = 0,
-        .branch = branch,
-    });
+    const tree_hash = try tree.writeFromIndex(
+        alloc,
+        store,
+        index.entries.items,
+    );
+
+    var commit_info = info;
+    commit_info.tree_hash = tree_hash;
+
+    return write(
+        alloc,
+        store,
+        commit_info,
+    );
 }
 
 /// Read and decode a commit object from the store.
@@ -129,52 +256,110 @@ pub fn read(
     const obj = try store.get(commit_hash);
     defer alloc.free(obj.payload);
 
-    if (obj.obj_type != .commit) return error.WrongObjectType;
+    if (obj.obj_type != .commit)
+        return error.WrongObjectType;
 
     var reader = std.Io.Reader.fixed(obj.payload);
 
     const magic = try reader.takeInt(u32, .little);
-    if (magic != COMMIT_MAGIC) return error.CorruptCommit;
+    if (magic != COMMIT_MAGIC)
+        return error.CorruptCommit;
 
-    const version = try reader.takeByte();
-    if (version != COMMIT_VERSION) return error.UnsupportedCommitVersion;
-
-    var commit_tree_hash: Hash = undefined;
-    @memcpy(&commit_tree_hash, try reader.take(32));
+    var tree_hash: Hash = undefined;
+    @memcpy(&tree_hash, try reader.take(32));
 
     const parent_count = try reader.takeByte();
+
     const parents = try alloc.alloc(Hash, parent_count);
     errdefer alloc.free(parents);
-    for (parents) |*p| @memcpy(p, try reader.take(32));
 
-    const author_len = try reader.takeInt(u16, .little);
-    const author_raw = try reader.take(author_len);
-    const author = try alloc.dupe(u8, author_raw);
-    errdefer alloc.free(author);
+    for (parents) |*parent| {
+        @memcpy(parent, try reader.take(32));
+    }
 
-    const msg_len = try reader.takeInt(u16, .little);
-    const msg_raw = try reader.take(msg_len);
-    const message = try alloc.dupe(u8, msg_raw);
-    errdefer alloc.free(message);
+    const name_len = try reader.takeInt(u16, .little);
+    const author_name = try alloc.dupe(
+        u8,
+        try reader.take(name_len),
+    );
+    errdefer alloc.free(author_name);
 
-    const ts = try reader.takeInt(i64, .little);
+    const email_len = try reader.takeInt(u16, .little);
+    const author_email = try alloc.dupe(
+        u8,
+        try reader.take(email_len),
+    );
+    errdefer alloc.free(author_email);
 
-    const branch_len = try reader.takeInt(u16, .little);
-    const branch_raw = try reader.take(branch_len);
-    const branch = try alloc.dupe(u8, branch_raw);
-    errdefer alloc.free(branch);
+    const timestamp_ms = try reader.takeInt(i64, .little);
+
+    const intent_raw = try reader.takeByte();
+    const intent: Intent = std.meta.intToEnum(
+        Intent,
+        intent_raw,
+    ) catch return error.CorruptCommit;
+
+    const label_count = try reader.takeInt(u16, .little);
+
+    const labels = try alloc.alloc([]u8, label_count);
+    errdefer {
+        for (labels) |label| {
+            alloc.free(label);
+        }
+        alloc.free(labels);
+    }
+
+    for (labels) |*label| {
+        const len = try reader.takeInt(u16, .little);
+
+        label.* = try alloc.dupe(
+            u8,
+            try reader.take(len),
+        );
+    }
+
+    const stats = CommitStats{
+        .files_changed = try reader.takeInt(u32, .little),
+        .additions = try reader.takeInt(u32, .little),
+        .deletions = try reader.takeInt(u32, .little),
+    };
+
+    const title_len = try reader.takeInt(u16, .little);
+
+    const title = try alloc.dupe(
+        u8,
+        try reader.take(title_len),
+    );
+    errdefer alloc.free(title);
+
+    const body_len = try reader.takeInt(u32, .little);
+
+    const body = try alloc.dupe(
+        u8,
+        try reader.take(body_len),
+    );
+    errdefer alloc.free(body);
 
     return .{
         .hash = commit_hash,
-        .tree_hash = commit_tree_hash,
+        .tree_hash = tree_hash,
         .parents = parents,
-        .author = author,
-        .message = message,
-        .timestamp_ms = ts,
-        .branch = branch,
+
+        .author = .{
+            .name = author_name,
+            .email = author_email,
+        },
+
+        .timestamp_ms = timestamp_ms,
+
+        .intent = intent,
+        .labels = labels,
+        .stats = stats,
+
+        .title = title,
+        .body = body,
     };
 }
-
 /// Resolve HEAD to a commit hash, or null for an empty repo.
 /// HEAD file format: "refs/heads/<branch>" or a bare 64-char hex hash
 pub fn resolveHead(
@@ -256,105 +441,309 @@ fn writeFile(dir: std.fs.Dir, path: []const u8, content: []const u8) !void {
 
 test "commit write and read round-trip" {
     const alloc = std.testing.allocator;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var objects_dir = try tmp.dir.makeOpenPath("objects", .{});
     defer objects_dir.close();
-    var store = Store{ .dir = objects_dir, .alloc = alloc };
 
-    // We need a valid tree hash — store a dummy tree object
-    const tree_hash = try store.put(.tree, &[_]u8{0} ** 4); // empty tree (count=0)
+    var store = Store{
+        .dir = objects_dir,
+        .alloc = alloc,
+    };
+
+    // Valid tree object
+    const tree_hash = try store.put(
+        .tree,
+        &[_]u8{0} ** 4,
+    );
 
     const commit_hash = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{},
-        .author = "Bruce Wayne <bruce@wayne.corp>",
-        .message = "initial commit",
+
+        .author_name = "Bruce Wayne",
+        .author_email = "bruce@wayne.corp",
+
         .timestamp_ms = 1_700_000_000_000,
-        .branch = "main",
+
+        .intent = .feature,
+
+        .labels = &.{
+            "core",
+            "storage",
+        },
+
+        .stats = .{
+            .files_changed = 1,
+            .additions = 10,
+            .deletions = 2,
+        },
+
+        .title = "Initial commit",
+        .body = "Create the initial repository structure.",
     });
 
-    var c = try read(alloc, &store, commit_hash);
+    var c = try read(
+        alloc,
+        &store,
+        commit_hash,
+    );
     defer c.deinit(alloc);
 
-    try std.testing.expectEqualSlices(u8, &tree_hash, &c.tree_hash);
-    try std.testing.expectEqual(@as(usize, 0), c.parents.len);
-    try std.testing.expectEqualStrings("Bruce Wayne <bruce@wayne.corp>", c.author);
-    try std.testing.expectEqualStrings("initial commit", c.message);
-    try std.testing.expectEqual(@as(i64, 1_700_000_000_000), c.timestamp_ms);
-    try std.testing.expectEqualStrings("main", c.branch);
-    try std.testing.expectEqualSlices(u8, &commit_hash, &c.hash);
-}
+    try std.testing.expectEqualSlices(
+        u8,
+        &tree_hash,
+        &c.tree_hash,
+    );
 
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        c.parents.len,
+    );
+
+    try std.testing.expectEqualStrings(
+        "Bruce Wayne",
+        c.author.name,
+    );
+
+    try std.testing.expectEqualStrings(
+        "bruce@wayne.corp",
+        c.author.email,
+    );
+
+    try std.testing.expectEqual(
+        @as(i64, 1_700_000_000_000),
+        c.timestamp_ms,
+    );
+
+    try std.testing.expectEqual(
+        Intent.feature,
+        c.intent,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        c.labels.len,
+    );
+
+    try std.testing.expectEqualStrings(
+        "core",
+        c.labels[0],
+    );
+
+    try std.testing.expectEqualStrings(
+        "storage",
+        c.labels[1],
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        c.stats.files_changed,
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 10),
+        c.stats.additions,
+    );
+
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        c.stats.deletions,
+    );
+
+    try std.testing.expectEqualStrings(
+        "Initial commit",
+        c.title,
+    );
+
+    try std.testing.expectEqualStrings(
+        "Create the initial repository structure.",
+        c.body,
+    );
+
+    try std.testing.expectEqualSlices(
+        u8,
+        &commit_hash,
+        &c.hash,
+    );
+}
 test "commit with parents" {
     const alloc = std.testing.allocator;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var objects_dir = try tmp.dir.makeOpenPath("objects", .{});
     defer objects_dir.close();
-    var store = Store{ .dir = objects_dir, .alloc = alloc };
 
-    const tree_hash = try store.put(.tree, &[_]u8{0} ** 4);
+    var store = Store{
+        .dir = objects_dir,
+        .alloc = alloc,
+    };
 
-    // First commit
+    const tree_hash = try store.put(
+        .tree,
+        &[_]u8{0} ** 4,
+    );
+
+    // Root commit
     const parent_hash = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{},
-        .author = "Alan Turing <alan@nodus.dev>",
-        .message = "root",
+
+        .author_name = "Alan Turing",
+        .author_email = "alan@nodus.dev",
+
         .timestamp_ms = 1_000,
-        .branch = "main",
+
+        .intent = .feature,
+        .labels = &.{},
+
+        .stats = .{
+            .files_changed = 0,
+            .additions = 0,
+            .deletions = 0,
+        },
+
+        .title = "root",
+        .body = "",
     });
 
-    // Child commit referencing parent
+    // Child commit
     const child_hash = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{parent_hash},
-        .author = "Alan Turing <alan@nodus.dev>",
-        .message = "second",
+
+        .author_name = "Alan Turing",
+        .author_email = "alan@nodus.dev",
+
         .timestamp_ms = 2_000,
-        .branch = "main",
+
+        .intent = .feature,
+        .labels = &.{},
+
+        .stats = .{
+            .files_changed = 0,
+            .additions = 0,
+            .deletions = 0,
+        },
+
+        .title = "second",
+        .body = "",
     });
 
-    var c = try read(alloc, &store, child_hash);
+    var c = try read(
+        alloc,
+        &store,
+        child_hash,
+    );
     defer c.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), c.parents.len);
-    try std.testing.expectEqualSlices(u8, &parent_hash, &c.parents[0]);
-    try std.testing.expectEqualStrings("second", c.message);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        c.parents.len,
+    );
+
+    try std.testing.expectEqualSlices(
+        u8,
+        &parent_hash,
+        &c.parents[0],
+    );
+
+    try std.testing.expectEqualStrings(
+        "second",
+        c.title,
+    );
+
+    try std.testing.expectEqualStrings(
+        "Alan Turing",
+        c.author.name,
+    );
+
+    try std.testing.expectEqualStrings(
+        "alan@nodus.dev",
+        c.author.email,
+    );
 }
 
 test "commit is deterministic for same inputs" {
     const alloc = std.testing.allocator;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var objects_dir = try tmp.dir.makeOpenPath("objects", .{});
     defer objects_dir.close();
-    var store = Store{ .dir = objects_dir, .alloc = alloc };
 
-    const tree_hash = try store.put(.tree, &[_]u8{0} ** 4);
+    var store = Store{
+        .dir = objects_dir,
+        .alloc = alloc,
+    };
+
+    const tree_hash = try store.put(
+        .tree,
+        &[_]u8{0} ** 4,
+    );
 
     const h1 = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{},
-        .author = "test",
-        .message = "msg",
+
+        .author_name = "Test User",
+        .author_email = "test@nodus.dev",
+
         .timestamp_ms = 42,
-        .branch = "main",
+
+        .intent = .feature,
+
+        .labels = &.{
+            "core",
+            "storage",
+        },
+
+        .stats = .{
+            .files_changed = 1,
+            .additions = 5,
+            .deletions = 0,
+        },
+
+        .title = "msg",
+        .body = "deterministic commit",
     });
+
     const h2 = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{},
-        .author = "test",
-        .message = "msg",
+
+        .author_name = "Test User",
+        .author_email = "test@nodus.dev",
+
         .timestamp_ms = 42,
-        .branch = "main",
+
+        .intent = .feature,
+
+        .labels = &.{
+            "core",
+            "storage",
+        },
+
+        .stats = .{
+            .files_changed = 1,
+            .additions = 5,
+            .deletions = 0,
+        },
+
+        .title = "msg",
+        .body = "deterministic commit",
     });
 
-    try std.testing.expectEqualSlices(u8, &h1, &h2);
+    try std.testing.expectEqualSlices(
+        u8,
+        &h1,
+        &h2,
+    );
 }
 
 test "wrong object type returns error" {
@@ -382,57 +771,110 @@ test "resolveHead returns null when HEAD missing" {
 
 test "writeHeadRef and updateRef and resolveHead round-trip" {
     const alloc = std.testing.allocator;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var objects_dir = try tmp.dir.makeOpenPath("objects", .{});
     defer objects_dir.close();
-    var store = Store{ .dir = objects_dir, .alloc = alloc };
 
-    const tree_hash = try store.put(.tree, &[_]u8{0} ** 4);
+    var store = Store{
+        .dir = objects_dir,
+        .alloc = alloc,
+    };
+
+    const tree_hash = try store.put(
+        .tree,
+        &[_]u8{0} ** 4,
+    );
+
     const commit_hash = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{},
-        .author = "dev",
-        .message = "init",
+
+        .author_name = "dev",
+        .author_email = "dev@nodus.local",
+
         .timestamp_ms = 1,
-        .branch = "main",
+
+        .intent = .chore,
+        .labels = &.{},
+
+        .stats = .{},
+
+        .title = "init",
+        .body = "",
     });
 
     try writeHeadRef(tmp.dir, "main");
     try updateRef(alloc, tmp.dir, "main", commit_hash);
 
-    const resolved = try resolveHead(alloc, tmp.dir);
-    try std.testing.expect(resolved != null);
-    try std.testing.expectEqualSlices(u8, &commit_hash, &resolved.?);
+    const resolved = try resolveHead(
+        alloc,
+        tmp.dir,
+    );
 
-    const branch = try headBranch(alloc, tmp.dir);
+    try std.testing.expect(resolved != null);
+
+    try std.testing.expectEqualSlices(
+        u8,
+        &commit_hash,
+        &resolved.?,
+    );
+
+    const branch = try headBranch(
+        alloc,
+        tmp.dir,
+    );
     defer if (branch) |b| alloc.free(b);
+
     try std.testing.expect(branch != null);
-    try std.testing.expectEqualStrings("main", branch.?);
+
+    try std.testing.expectEqualStrings(
+        "main",
+        branch.?,
+    );
 }
 
 test "buildAndWrite creates tree then commit" {
     const alloc = std.testing.allocator;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Set up minimal store + index
-    var objects_dir = try tmp.dir.makeOpenPath(".nodus/objects", .{});
+    var objects_dir = try tmp.dir.makeOpenPath(
+        ".nodus/objects",
+        .{},
+    );
     defer objects_dir.close();
-    var store = Store{ .dir = objects_dir, .alloc = alloc };
 
-    // Put a blob so the index entry is valid
-    const blob_hash = try store.put(.blob, "hello nodus");
+    var store = Store{
+        .dir = objects_dir,
+        .alloc = alloc,
+    };
 
-    // Index.deinit closes its .dir handle, so we must not close nodus_dir ourselves.
-    const nodus_dir = try tmp.dir.openDir(".nodus", .{});
+    const blob_hash = try store.put(
+        .blob,
+        "hello nodus",
+    );
 
-    var idx = index_mod.Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
+    const nodus_dir = try tmp.dir.openDir(
+        ".nodus",
+        .{},
+    );
+
+    var idx = index_mod.Index{
+        .alloc = alloc,
+        .dir = nodus_dir,
+        .entries = .empty,
+    };
     defer idx.deinit();
 
     try idx.entries.append(alloc, .{
-        .path = try alloc.dupe(u8, "hello.txt"),
+        .path = try alloc.dupe(
+            u8,
+            "hello.txt",
+        ),
         .blob_hash = blob_hash,
         .size = 11,
         .mode = 0o100644,
@@ -443,21 +885,67 @@ test "buildAndWrite creates tree then commit" {
         alloc,
         &store,
         &idx,
-        &.{},
-        "Test Author <test@nodus.dev>",
-        "add hello.txt",
-        "main",
-    );
+        .{
+            .tree_hash = undefined, // overwritten internally
 
-    var c = try read(alloc, &store, commit_hash);
+            .parents = &.{},
+
+            .author_name = "Test Author",
+            .author_email = "test@nodus.dev",
+
+            .timestamp_ms = 0,
+
+            .intent = .feature,
+
+            .labels = &.{
+                "core",
+                "storage",
+            },
+
+            .stats = .{
+                .files_changed = 1,
+                .additions = 11,
+                .deletions = 0,
+            },
+
+            .title = "add hello.txt",
+            .body = "",
+        },
+    );
+    var c = try read(
+        alloc,
+        &store,
+        commit_hash,
+    );
     defer c.deinit(alloc);
 
-    try std.testing.expectEqualStrings("add hello.txt", c.message);
-    try std.testing.expectEqualStrings("main", c.branch);
-    try std.testing.expectEqual(@as(usize, 0), c.parents.len);
+    try std.testing.expectEqualStrings(
+        "add hello.txt",
+        c.title,
+    );
 
-    // Verify the tree object was created in the store
-    const tree_obj = try store.get(c.tree_hash);
+    try std.testing.expectEqualStrings(
+        "Test Author",
+        c.author.name,
+    );
+
+    try std.testing.expectEqualStrings(
+        "test@nodus.dev",
+        c.author.email,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        c.parents.len,
+    );
+
+    const tree_obj = try store.get(
+        c.tree_hash,
+    );
     defer alloc.free(tree_obj.payload);
-    try std.testing.expectEqual(object.ObjectType.tree, tree_obj.obj_type);
+
+    try std.testing.expectEqual(
+        object.ObjectType.tree,
+        tree_obj.obj_type,
+    );
 }
