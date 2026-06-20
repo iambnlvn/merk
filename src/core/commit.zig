@@ -302,17 +302,20 @@ pub fn read(
     const label_count = try reader.takeInt(u16, .little);
 
     const labels = try alloc.alloc([]u8, label_count);
+
+    // Track exactly how many labels have been successfully duplicated
+    var labels_allocated: usize = 0;
     errdefer {
-        for (labels) |label| {
+        // Only free what was allocated
+        for (labels[0..labels_allocated]) |label| {
             alloc.free(label);
         }
         alloc.free(labels);
     }
 
-    for (labels) |*label| {
+    while (labels_allocated < label_count) : (labels_allocated += 1) {
         const len = try reader.takeInt(u16, .little);
-
-        label.* = try alloc.dupe(
+        labels[labels_allocated] = try alloc.dupe(
             u8,
             try reader.take(len),
         );
