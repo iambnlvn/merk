@@ -31,12 +31,6 @@ pub const Intent = enum {
     chore,
 };
 
-pub const CommitStats = struct {
-    files_changed: u32 = 0,
-    additions: u32 = 0,
-    deletions: u32 = 0,
-};
-
 pub const CommitInfo = struct {
     /// Root tree snapshot.
     tree_hash: Hash,
@@ -58,8 +52,6 @@ pub const CommitInfo = struct {
 
     title: []const u8,
     body: []const u8 = "",
-
-    stats: CommitStats = .{},
 };
 
 pub const Commit = struct {
@@ -78,8 +70,6 @@ pub const Commit = struct {
 
     /// Owned by caller.
     labels: [][]u8,
-
-    stats: CommitStats,
 
     /// Short summary.
     title: []u8,
@@ -186,24 +176,6 @@ pub fn write(
         );
         try w.writeAll(label);
     }
-
-    try w.writeInt(
-        u32,
-        info.stats.files_changed,
-        .little,
-    );
-
-    try w.writeInt(
-        u32,
-        info.stats.additions,
-        .little,
-    );
-
-    try w.writeInt(
-        u32,
-        info.stats.deletions,
-        .little,
-    );
 
     try w.writeInt(
         u16,
@@ -321,12 +293,6 @@ pub fn read(
         );
     }
 
-    const stats = CommitStats{
-        .files_changed = try reader.takeInt(u32, .little),
-        .additions = try reader.takeInt(u32, .little),
-        .deletions = try reader.takeInt(u32, .little),
-    };
-
     const title_len = try reader.takeInt(u16, .little);
 
     const title = try alloc.dupe(
@@ -357,7 +323,6 @@ pub fn read(
 
         .intent = intent,
         .labels = labels,
-        .stats = stats,
 
         .title = title,
         .body = body,
@@ -478,12 +443,6 @@ test "commit write and read round-trip" {
             "storage",
         },
 
-        .stats = .{
-            .files_changed = 1,
-            .additions = 10,
-            .deletions = 2,
-        },
-
         .title = "Initial commit",
         .body = "Create the initial repository structure.",
     });
@@ -541,21 +500,6 @@ test "commit write and read round-trip" {
         c.labels[1],
     );
 
-    try std.testing.expectEqual(
-        @as(u32, 1),
-        c.stats.files_changed,
-    );
-
-    try std.testing.expectEqual(
-        @as(u32, 10),
-        c.stats.additions,
-    );
-
-    try std.testing.expectEqual(
-        @as(u32, 2),
-        c.stats.deletions,
-    );
-
     try std.testing.expectEqualStrings(
         "Initial commit",
         c.title,
@@ -604,12 +548,6 @@ test "commit with parents" {
         .intent = .feature,
         .labels = &.{},
 
-        .stats = .{
-            .files_changed = 0,
-            .additions = 0,
-            .deletions = 0,
-        },
-
         .title = "root",
         .body = "",
     });
@@ -626,12 +564,6 @@ test "commit with parents" {
 
         .intent = .feature,
         .labels = &.{},
-
-        .stats = .{
-            .files_changed = 0,
-            .additions = 0,
-            .deletions = 0,
-        },
 
         .title = "second",
         .body = "",
@@ -706,12 +638,6 @@ test "commit is deterministic for same inputs" {
             "storage",
         },
 
-        .stats = .{
-            .files_changed = 1,
-            .additions = 5,
-            .deletions = 0,
-        },
-
         .title = "msg",
         .body = "deterministic commit",
     });
@@ -730,12 +656,6 @@ test "commit is deterministic for same inputs" {
         .labels = &.{
             "core",
             "storage",
-        },
-
-        .stats = .{
-            .files_changed = 1,
-            .additions = 5,
-            .deletions = 0,
         },
 
         .title = "msg",
@@ -802,8 +722,6 @@ test "writeHeadRef and updateRef and resolveHead round-trip" {
 
         .intent = .chore,
         .labels = &.{},
-
-        .stats = .{},
 
         .title = "init",
         .body = "",
@@ -903,12 +821,6 @@ test "buildAndWrite creates tree then commit" {
             .labels = &.{
                 "core",
                 "storage",
-            },
-
-            .stats = .{
-                .files_changed = 1,
-                .additions = 11,
-                .deletions = 0,
             },
 
             .title = "add hello.txt",
