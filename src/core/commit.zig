@@ -11,16 +11,215 @@ pub const COMMIT_MAGIC = 0x4E_4F_44_55;
 
 pub const MAX_PARENTS: u8 = 255;
 
+// pub const Identity = struct {
+//     name: []u8,
+//     email: []u8,
+
+//     pub fn deinit(self: *Identity, alloc: std.mem.Allocator) void {
+//         alloc.free(self.name);
+//         alloc.free(self.email);
+//     }
+// };
+
+pub const IdentityError = error{
+    EmptyName,
+    EmptyEmail,
+
+    NameTooLong,
+    EmailTooLong,
+
+    NameContainsIllegalCharacters,
+    EmailContainsIllegalCharacters,
+
+    MissingEmailAtSign,
+    InvalidEmailBounds,
+};
+
+pub const IdentityInfo = struct {
+    name: []const u8,
+    email: []const u8,
+
+    pub fn validate(self: IdentityInfo) IdentityError!void {
+        const trimmed_name =
+            std.mem.trim(u8, self.name, " \t\r\n");
+
+        const trimmed_email =
+            std.mem.trim(u8, self.email, " \t\r\n");
+
+        if (trimmed_name.len == 0)
+            return error.EmptyName;
+
+        if (trimmed_email.len == 0)
+            return error.EmptyEmail;
+
+        if (trimmed_name.len > std.math.maxInt(u16))
+            return error.NameTooLong;
+
+        if (trimmed_email.len > std.math.maxInt(u16))
+            return error.EmailTooLong;
+
+        // Prevent header/object injection.
+        const illegal_name_chars = &[_]u8{
+            '\n',
+            '\r',
+            '<',
+            '>',
+            '\x00',
+        };
+
+        if (std.mem.indexOfAny(
+            u8,
+            trimmed_name,
+            illegal_name_chars,
+        ) != null) {
+            return error.NameContainsIllegalCharacters;
+        }
+
+        // Emails must not contain whitespace,
+        // control chars, or angle brackets.
+        const illegal_email_chars = &[_]u8{
+            ' ',
+            '\t',
+            '\n',
+            '\r',
+            '<',
+            '>',
+            '\x00',
+        };
+
+        if (std.mem.indexOfAny(
+            u8,
+            trimmed_email,
+            illegal_email_chars,
+        ) != null) {
+            return error.EmailContainsIllegalCharacters;
+        }
+
+        const at_idx =
+            std.mem.indexOfScalar(
+                u8,
+                trimmed_email,
+                '@',
+            ) orelse return error.MissingEmailAtSign;
+
+        if (at_idx == 0 or at_idx == trimmed_email.len - 1)
+            return error.InvalidEmailBounds;
+
+        if (std.mem.indexOfScalar(
+            u8,
+            trimmed_email[at_idx + 1 ..],
+            '@',
+        ) != null) {
+            return error.EmailContainsIllegalCharacters;
+        }
+    }
+
+    pub fn serialize(
+        self: IdentityInfo,
+        writer: anytype,
+    ) !void {
+        try self.validate();
+
+        const trimmed_name =
+            std.mem.trim(u8, self.name, " \t\r\n");
+
+        const trimmed_email =
+            std.mem.trim(u8, self.email, " \t\r\n");
+
+        try writer.writeInt(
+            u16,
+            @intCast(trimmed_name.len),
+            .little,
+        );
+        try writer.writeAll(trimmed_name);
+
+        try writer.writeInt(
+            u16,
+            @intCast(trimmed_email.len),
+            .little,
+        );
+        try writer.writeAll(trimmed_email);
+    }
+};
+
+/// The allocated, owned identity variant stored inside a deserialized Commit object.
 pub const Identity = struct {
     name: []u8,
     email: []u8,
 
-    pub fn deinit(self: *Identity, alloc: std.mem.Allocator) void {
+    pub fn initDupe(
+        alloc: std.mem.Allocator,
+        info: IdentityInfo,
+    ) !Identity {
+        try info.validate();
+
+        const trimmed_name =
+            std.mem.trim(u8, info.name, " \t\r\n");
+
+        const trimmed_email =
+            std.mem.trim(u8, info.email, " \t\r\n");
+
+        const name = try alloc.dupe(
+            u8,
+            trimmed_name,
+        );
+        errdefer alloc.free(name);
+
+        const email = try alloc.dupe(
+            u8,
+            trimmed_email,
+        );
+        errdefer alloc.free(email);
+
+        return .{
+            .name = name,
+            .email = email,
+        };
+    }
+
+    pub fn deserialize(
+        alloc: std.mem.Allocator,
+        reader: anytype,
+    ) !Identity {
+        const name_len = try reader.takeInt(u16, .little);
+
+        const name = try alloc.dupe(
+            u8,
+            try reader.take(name_len),
+        );
+        errdefer alloc.free(name);
+
+        const email_len = try reader.takeInt(u16, .little);
+
+        const email = try alloc.dupe(
+            u8,
+            try reader.take(email_len),
+        );
+        errdefer alloc.free(email);
+
+        const info = IdentityInfo{
+            .name = name,
+            .email = email,
+        };
+
+        try info.validate();
+
+        return .{
+            .name = name,
+            .email = email,
+        };
+    }
+
+    pub fn deinit(
+        self: *Identity,
+        alloc: std.mem.Allocator,
+    ) void {
         alloc.free(self.name);
         alloc.free(self.email);
+
+        self.* = undefined;
     }
 };
-
 pub const Intent = enum {
     feature,
     bugfix,
@@ -58,8 +257,7 @@ pub const CommitInfo = struct {
     /// Empty slice for initial commit.
     parents: []const Hash,
 
-    author_name: []const u8,
-    author_email: []const u8,
+    author: IdentityInfo,
 
     /// Pass 0 to use current wall clock.
     timestamp_ms: i64,
@@ -117,19 +315,9 @@ pub fn write(
     if (info.parents.len > MAX_PARENTS)
         return error.TooManyParents;
 
-    if (info.author_name.len > std.math.maxInt(u16))
-        return error.FieldTooLong;
-
-    if (info.author_email.len > std.math.maxInt(u16))
-        return error.FieldTooLong;
+    try info.author.validate();
 
     try info.message.validate();
-
-    if (info.message.title.len > std.math.maxInt(u16))
-        return error.FieldTooLong;
-
-    if (info.message.body.len > std.math.maxInt(u32))
-        return error.FieldTooLong;
 
     if (info.labels.len > std.math.maxInt(u16))
         return error.FieldTooLong;
@@ -159,19 +347,7 @@ pub fn write(
         try w.writeAll(&parent);
     }
 
-    try w.writeInt(
-        u16,
-        @intCast(info.author_name.len),
-        .little,
-    );
-    try w.writeAll(info.author_name);
-
-    try w.writeInt(
-        u16,
-        @intCast(info.author_email.len),
-        .little,
-    );
-    try w.writeAll(info.author_email);
+    try info.author.serialize(w);
 
     try w.writeInt(i64, ts, .little);
     try w.writeByte(@intFromEnum(info.intent));
@@ -266,51 +442,60 @@ pub fn read(
         @memcpy(parent, try reader.take(32));
     }
 
-    const name_len = try reader.takeInt(u16, .little);
-    const author_name = try alloc.dupe(
-        u8,
-        try reader.take(name_len),
+    var author = try Identity.deserialize(
+        alloc,
+        &reader,
     );
-    errdefer alloc.free(author_name);
+    errdefer author.deinit(alloc);
 
-    const email_len = try reader.takeInt(u16, .little);
-    const author_email = try alloc.dupe(
-        u8,
-        try reader.take(email_len),
+    const timestamp_ms = try reader.takeInt(
+        i64,
+        .little,
     );
-    errdefer alloc.free(author_email);
-
-    const timestamp_ms = try reader.takeInt(i64, .little);
 
     const intent_raw = try reader.takeByte();
+
     const intent: Intent = std.meta.intToEnum(
         Intent,
         intent_raw,
     ) catch return error.CorruptCommit;
 
-    const label_count = try reader.takeInt(u16, .little);
+    const label_count = try reader.takeInt(
+        u16,
+        .little,
+    );
 
-    const labels = try alloc.alloc([]u8, label_count);
+    const labels = try alloc.alloc(
+        []u8,
+        label_count,
+    );
 
-    // Track exactly how many labels have been successfully duplicated
-    var labels_allocated: usize = 0;
+    var labels_initialized: usize = 0;
+
     errdefer {
-        // Only free what was allocated
-        for (labels[0..labels_allocated]) |label| {
+        for (labels[0..labels_initialized]) |label| {
             alloc.free(label);
         }
+
         alloc.free(labels);
     }
 
-    while (labels_allocated < label_count) : (labels_allocated += 1) {
-        const len = try reader.takeInt(u16, .little);
-        labels[labels_allocated] = try alloc.dupe(
+    while (labels_initialized < label_count) : (labels_initialized += 1) {
+        const len = try reader.takeInt(
+            u16,
+            .little,
+        );
+
+        labels[labels_initialized] = try alloc.dupe(
             u8,
             try reader.take(len),
         );
     }
 
-    const title_len = try reader.takeInt(u16, .little);
+    const title_len = try reader.takeInt(
+        u16,
+        .little,
+    );
 
     const title = try alloc.dupe(
         u8,
@@ -318,7 +503,10 @@ pub fn read(
     );
     errdefer alloc.free(title);
 
-    const body_len = try reader.takeInt(u32, .little);
+    const body_len = try reader.takeInt(
+        u32,
+        .little,
+    );
 
     const body = try alloc.dupe(
         u8,
@@ -326,19 +514,19 @@ pub fn read(
     );
     errdefer alloc.free(body);
 
-    return .{
+    var commit = Commit{
         .hash = commit_hash,
+
         .tree_hash = tree_hash,
+
         .parents = parents,
 
-        .author = .{
-            .name = author_name,
-            .email = author_email,
-        },
+        .author = author,
 
         .timestamp_ms = timestamp_ms,
 
         .intent = intent,
+
         .labels = labels,
 
         .message = .{
@@ -346,6 +534,10 @@ pub fn read(
             .body = body,
         },
     };
+
+    errdefer commit.deinit(alloc);
+
+    return commit;
 }
 /// Resolve HEAD to a commit hash, or null for an empty repo.
 /// HEAD file format: "refs/heads/<branch>" or a bare 64-char hex hash
@@ -449,8 +641,10 @@ test "commit write and read round-trip" {
     const commit_hash = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{},
-        .author_name = "Bruce Wayne",
-        .author_email = "bruce@wayne.corp",
+        .author = .{
+            .name = "Bruce Wayne",
+            .email = "bruce@wayne.corp",
+        },
         .timestamp_ms = 1_700_000_000_000,
         .intent = .feature,
         .labels = &.{
@@ -555,8 +749,10 @@ test "commit with parents" {
     const parent_hash = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{},
-        .author_name = "Alan Turing",
-        .author_email = "alan@nodus.dev",
+        .author = .{
+            .name = "Alan Turing",
+            .email = "alan@nodus.dev",
+        },
         .timestamp_ms = 1_000,
         .intent = .feature,
         .labels = &.{},
@@ -570,8 +766,10 @@ test "commit with parents" {
     const child_hash = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{parent_hash},
-        .author_name = "Alan Turing",
-        .author_email = "alan@nodus.dev",
+        .author = .{
+            .name = "Alan Turing",
+            .email = "alan@nodus.dev",
+        },
         .timestamp_ms = 2_000,
         .intent = .feature,
         .labels = &.{},
@@ -634,7 +832,10 @@ test "commit is deterministic for same inputs" {
         &[_]u8{0} ** 4,
     );
 
-    const h1 = try write(alloc, &store, .{ .tree_hash = tree_hash, .parents = &.{}, .author_name = "Test User", .author_email = "test@nodus.dev", .timestamp_ms = 42, .intent = .feature, .labels = &.{
+    const h1 = try write(alloc, &store, .{ .tree_hash = tree_hash, .parents = &.{}, .author = .{
+        .name = "Test User",
+        .email = "test@nodus.dev",
+    }, .timestamp_ms = 42, .intent = .feature, .labels = &.{
         "core",
         "storage",
     }, .message = .{
@@ -645,8 +846,10 @@ test "commit is deterministic for same inputs" {
     const h2 = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{},
-        .author_name = "Test User",
-        .author_email = "test@nodus.dev",
+        .author = .{
+            .name = "Test User",
+            .email = "test@nodus.dev",
+        },
         .timestamp_ms = 42,
         .intent = .feature,
         .labels = &.{
@@ -711,8 +914,10 @@ test "writeHeadRef and updateRef and resolveHead round-trip" {
     const commit_hash = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{},
-        .author_name = "dev",
-        .author_email = "dev@nodus.local",
+        .author = .{
+            .name = "dev",
+            .email = "dev@nodus.local",
+        },
         .timestamp_ms = 1,
         .intent = .chore,
         .labels = &.{},
@@ -806,8 +1011,10 @@ test "buildAndWrite creates tree then commit" {
 
             .parents = &.{},
 
-            .author_name = "Test Author",
-            .author_email = "test@nodus.dev",
+            .author = .{
+                .name = "Test Author",
+                .email = "test@nodus.dev",
+            },
 
             .timestamp_ms = 0,
 
