@@ -31,6 +31,26 @@ pub const Intent = enum {
     chore,
 };
 
+pub const MessageInfo = struct {
+    title: []const u8,
+    body: []const u8 = "",
+
+    pub fn validate(self: MessageInfo) !void {
+        if (self.title.len == 0) return error.EmptyCommitMessage;
+    }
+};
+
+pub const Message = struct {
+    title: []u8,
+    body: []u8,
+
+    pub fn deinit(self: *Message, alloc: std.mem.Allocator) void {
+        alloc.free(self.title);
+        alloc.free(self.body);
+        self.* = undefined;
+    }
+};
+
 pub const CommitInfo = struct {
     /// Root tree snapshot.
     tree_hash: Hash,
@@ -50,8 +70,7 @@ pub const CommitInfo = struct {
     /// ["cli", "diff", ""]
     labels: []const []const u8 = &.{},
 
-    title: []const u8,
-    body: []const u8 = "",
+    message: MessageInfo,
 };
 
 pub const Commit = struct {
@@ -71,11 +90,7 @@ pub const Commit = struct {
     /// Owned by caller.
     labels: [][]u8,
 
-    /// Short summary.
-    title: []u8,
-
-    /// Long description.
-    body: []u8,
+    message: Message,
 
     pub fn deinit(self: *Commit, alloc: std.mem.Allocator) void {
         alloc.free(self.parents);
@@ -87,8 +102,7 @@ pub const Commit = struct {
         }
         alloc.free(self.labels);
 
-        alloc.free(self.title);
-        alloc.free(self.body);
+        self.message.deinit(alloc);
     }
 };
 /// Write a commit object to the store and return its hash
@@ -109,10 +123,12 @@ pub fn write(
     if (info.author_email.len > std.math.maxInt(u16))
         return error.FieldTooLong;
 
-    if (info.title.len > std.math.maxInt(u16))
+    try info.message.validate();
+
+    if (info.message.title.len > std.math.maxInt(u16))
         return error.FieldTooLong;
 
-    if (info.body.len > std.math.maxInt(u32))
+    if (info.message.body.len > std.math.maxInt(u32))
         return error.FieldTooLong;
 
     if (info.labels.len > std.math.maxInt(u16))
@@ -128,8 +144,7 @@ pub fn write(
     else
         std.time.milliTimestamp();
 
-    var buf: std.Io.Writer.Allocating =
-        std.Io.Writer.Allocating.init(alloc);
+    var buf = std.Io.Writer.Allocating.init(alloc);
     defer buf.deinit();
 
     const w = &buf.writer;
@@ -159,7 +174,6 @@ pub fn write(
     try w.writeAll(info.author_email);
 
     try w.writeInt(i64, ts, .little);
-
     try w.writeByte(@intFromEnum(info.intent));
 
     try w.writeInt(
@@ -179,19 +193,22 @@ pub fn write(
 
     try w.writeInt(
         u16,
-        @intCast(info.title.len),
+        @intCast(info.message.title.len),
         .little,
     );
-    try w.writeAll(info.title);
+    try w.writeAll(info.message.title);
 
     try w.writeInt(
         u32,
-        @intCast(info.body.len),
+        @intCast(info.message.body.len),
         .little,
     );
-    try w.writeAll(info.body);
+    try w.writeAll(info.message.body);
 
-    return store.put(.commit, buf.written());
+    return store.put(
+        .commit,
+        buf.written(),
+    );
 }
 
 /// High-level helper: build the root tree from the index, then write the
@@ -324,8 +341,10 @@ pub fn read(
         .intent = intent,
         .labels = labels,
 
-        .title = title,
-        .body = body,
+        .message = .{
+            .title = title,
+            .body = body,
+        },
     };
 }
 /// Resolve HEAD to a commit hash, or null for an empty repo.
@@ -430,21 +449,18 @@ test "commit write and read round-trip" {
     const commit_hash = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{},
-
         .author_name = "Bruce Wayne",
         .author_email = "bruce@wayne.corp",
-
         .timestamp_ms = 1_700_000_000_000,
-
         .intent = .feature,
-
         .labels = &.{
             "core",
             "storage",
         },
-
-        .title = "Initial commit",
-        .body = "Create the initial repository structure.",
+        .message = .{
+            .title = "Initial commit",
+            .body = "Create the initial repository structure.",
+        },
     });
 
     var c = try read(
@@ -502,12 +518,12 @@ test "commit write and read round-trip" {
 
     try std.testing.expectEqualStrings(
         "Initial commit",
-        c.title,
+        c.message.title,
     );
 
     try std.testing.expectEqualStrings(
         "Create the initial repository structure.",
-        c.body,
+        c.message.body,
     );
 
     try std.testing.expectEqualSlices(
@@ -539,34 +555,30 @@ test "commit with parents" {
     const parent_hash = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{},
-
         .author_name = "Alan Turing",
         .author_email = "alan@nodus.dev",
-
         .timestamp_ms = 1_000,
-
         .intent = .feature,
         .labels = &.{},
-
-        .title = "root",
-        .body = "",
+        .message = .{
+            .title = "root",
+            .body = "",
+        },
     });
 
     // Child commit
     const child_hash = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{parent_hash},
-
         .author_name = "Alan Turing",
         .author_email = "alan@nodus.dev",
-
         .timestamp_ms = 2_000,
-
         .intent = .feature,
         .labels = &.{},
-
-        .title = "second",
-        .body = "",
+        .message = .{
+            .title = "second",
+            .body = "",
+        },
     });
 
     var c = try read(
@@ -589,7 +601,7 @@ test "commit with parents" {
 
     try std.testing.expectEqualStrings(
         "second",
-        c.title,
+        c.message.title,
     );
 
     try std.testing.expectEqualStrings(
@@ -622,44 +634,29 @@ test "commit is deterministic for same inputs" {
         &[_]u8{0} ** 4,
     );
 
-    const h1 = try write(alloc, &store, .{
-        .tree_hash = tree_hash,
-        .parents = &.{},
-
-        .author_name = "Test User",
-        .author_email = "test@nodus.dev",
-
-        .timestamp_ms = 42,
-
-        .intent = .feature,
-
-        .labels = &.{
-            "core",
-            "storage",
-        },
-
+    const h1 = try write(alloc, &store, .{ .tree_hash = tree_hash, .parents = &.{}, .author_name = "Test User", .author_email = "test@nodus.dev", .timestamp_ms = 42, .intent = .feature, .labels = &.{
+        "core",
+        "storage",
+    }, .message = .{
         .title = "msg",
         .body = "deterministic commit",
-    });
+    } });
 
     const h2 = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{},
-
         .author_name = "Test User",
         .author_email = "test@nodus.dev",
-
         .timestamp_ms = 42,
-
         .intent = .feature,
-
         .labels = &.{
             "core",
             "storage",
         },
-
-        .title = "msg",
-        .body = "deterministic commit",
+        .message = .{
+            .title = "msg",
+            .body = "deterministic commit",
+        },
     });
 
     try std.testing.expectEqualSlices(
@@ -714,17 +711,15 @@ test "writeHeadRef and updateRef and resolveHead round-trip" {
     const commit_hash = try write(alloc, &store, .{
         .tree_hash = tree_hash,
         .parents = &.{},
-
         .author_name = "dev",
         .author_email = "dev@nodus.local",
-
         .timestamp_ms = 1,
-
         .intent = .chore,
         .labels = &.{},
-
-        .title = "init",
-        .body = "",
+        .message = .{
+            .title = "init",
+            .body = "",
+        },
     });
 
     try writeHeadRef(tmp.dir, "main");
@@ -823,8 +818,10 @@ test "buildAndWrite creates tree then commit" {
                 "storage",
             },
 
-            .title = "add hello.txt",
-            .body = "",
+            .message = .{
+                .title = "add hello.txt",
+                .body = "",
+            },
         },
     );
     var c = try read(
@@ -836,7 +833,7 @@ test "buildAndWrite creates tree then commit" {
 
     try std.testing.expectEqualStrings(
         "add hello.txt",
-        c.title,
+        c.message.title,
     );
 
     try std.testing.expectEqualStrings(
