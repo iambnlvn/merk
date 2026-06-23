@@ -529,14 +529,15 @@ pub fn read(
 
         .labels = labels,
 
-        .message = .{
-            .title = title,
-            .body = body,
-        },
+        .message = undefined,
     };
 
     errdefer commit.deinit(alloc);
 
+    commit.message = .{
+        .title = title,
+        .body = body,
+    };
     return commit;
 }
 /// Resolve HEAD to a commit hash, or null for an empty repo.
