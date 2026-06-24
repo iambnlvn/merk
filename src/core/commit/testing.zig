@@ -18,4 +18,11 @@ pub const MockReader = struct {
         self.pos += len;
         return slice;
     }
+
+    pub fn takeByte(self: *@This()) !u8 {
+        if (self.pos >= self.buffer.len) return error.EndOfStream;
+        const byte = self.buffer[self.pos];
+        self.pos += 1;
+        return byte;
+    }
 };
