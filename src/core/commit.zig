@@ -10,6 +10,11 @@ const Store = object.Store;
 const identity = @import("./commit/identity.zig");
 const IdentityInfo = identity.IdentityInfo;
 const Identity = identity.Identity;
+
+const message = @import("./commit/message.zig");
+const Message = message.Message;
+const MessageInfo = message.MessageInfo;
+
 pub const COMMIT_MAGIC = 0x4E_4F_44_55;
 
 pub const MAX_PARENTS: u8 = 255;
@@ -22,26 +27,6 @@ pub const Intent = enum {
     @"test",
     release,
     chore,
-};
-
-pub const MessageInfo = struct {
-    title: []const u8,
-    body: []const u8 = "",
-
-    pub fn validate(self: MessageInfo) !void {
-        if (self.title.len == 0) return error.EmptyCommitMessage;
-    }
-};
-
-pub const Message = struct {
-    title: []u8,
-    body: []u8,
-
-    pub fn deinit(self: *Message, alloc: std.mem.Allocator) void {
-        alloc.free(self.title);
-        alloc.free(self.body);
-        self.* = undefined;
-    }
 };
 
 pub const CommitInfo = struct {
