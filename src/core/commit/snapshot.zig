@@ -8,6 +8,8 @@ pub const SnapshotError = error{
     TooManyParents,
 };
 
+pub const MAX_PARENTS: u8 = 255;
+
 pub const SnapshotInfo = struct {
     /// Root tree object describing repository state.
     tree: Hash,
@@ -19,7 +21,7 @@ pub const SnapshotInfo = struct {
     parents: []const Hash,
 
     pub fn validate(self: SnapshotInfo) SnapshotError!void {
-        if (self.parents.len > 255)
+        if (self.parents.len > MAX_PARENTS)
             return error.TooManyParents;
     }
 
