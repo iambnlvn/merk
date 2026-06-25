@@ -19,10 +19,9 @@ const snapshot = @import("./commit/snapshot.zig");
 const Snapshot = snapshot.Snapshot;
 const snapshotInfo = snapshot.SnapshotInfo;
 
-const commitMetadata = @import("./commit/metadata.zig");
+pub const commitMetadata = @import("./commit/metadata.zig");
 const CommitMetadata = commitMetadata.CommitMetadata;
 const CommitMetadataInfo = commitMetadata.CommitMetadataInfo;
-
 const refs = @import("./refs.zig");
 pub const COMMIT_MAGIC = 0x4E_4F_44_55;
 
