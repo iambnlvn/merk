@@ -39,31 +39,6 @@ pub const CommitMetadataInfo = struct {
                 return error.LabelTooLong;
         }
     }
-};
-
-pub const CommitMetadata = struct {
-    /// Creation timestamp.
-    timestamp_ms: i64,
-
-    /// Semantic classification.
-    intent: Intent,
-
-    /// Owned labels.
-    labels: [][]u8,
-
-    pub fn deinit(
-        self: *CommitMetadata,
-        alloc: std.mem.Allocator,
-    ) void {
-        for (self.labels) |label| {
-            alloc.free(label);
-        }
-
-        alloc.free(self.labels);
-
-        self.* = undefined;
-    }
-
     pub fn serialize(
         self: CommitMetadataInfo,
         writer: anytype,
@@ -165,6 +140,30 @@ pub const CommitMetadata = struct {
     }
 };
 
+pub const CommitMetadata = struct {
+    /// Creation timestamp.
+    timestamp_ms: i64,
+
+    /// Semantic classification.
+    intent: Intent,
+
+    /// Owned labels.
+    labels: [][]u8,
+
+    pub fn deinit(
+        self: *CommitMetadata,
+        alloc: std.mem.Allocator,
+    ) void {
+        for (self.labels) |label| {
+            alloc.free(label);
+        }
+
+        alloc.free(self.labels);
+
+        self.* = undefined;
+    }
+};
+
 test "CommitMetadataInfo validation - label boundaries" {
     const allocator = std.testing.allocator;
 
@@ -204,7 +203,7 @@ test "CommitMetadataInfo serialization layout" {
     defer payload.deinit(allocator);
 
     // Call serialize as defined in CommitMetadata namespace using 0.15 allocator-aware writer
-    try CommitMetadata.serialize(info, payload.writer(allocator));
+    try CommitMetadataInfo.serialize(info, payload.writer(allocator));
 
     // Expected binary breakdown:
     // [8 Bytes: Timestamp i64 LE]       -> \x00\x30\xed\xf6\x9e\x01\x00\x00
@@ -237,7 +236,7 @@ test "CommitMetadata deserialization - successful lifecycle" {
 
     var mock_reader = MockReader{ .buffer = payload.items };
 
-    var metadata = try CommitMetadata.deserialize(allocator, &mock_reader);
+    var metadata = try CommitMetadataInfo.deserialize(allocator, &mock_reader);
     defer metadata.deinit(allocator);
 
     // Validate memory allocations and property reconstruction
@@ -260,5 +259,5 @@ test "CommitMetadata deserialization - corrupt enum safety check" {
     var mock_reader = MockReader{ .buffer = payload.items };
 
     // Should break gracefully inside catch block and return error.CorruptCommit
-    try std.testing.expectError(error.CorruptCommit, CommitMetadata.deserialize(allocator, &mock_reader));
+    try std.testing.expectError(error.CorruptCommit, CommitMetadataInfo.deserialize(allocator, &mock_reader));
 }
