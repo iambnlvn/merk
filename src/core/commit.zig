@@ -7,12 +7,12 @@ const tree = @import("tree.zig");
 const Hash = hash_mod.Hash;
 const Store = object.Store;
 
-const identity = @import("./commit/identity.zig");
+pub const identity = @import("./commit/identity.zig");
 const CommitIdentityInfo = identity.CommitIdentityInfo;
 const CommitIdentity = identity.CommitIdentity;
 const TimestampedIdentityInfo = identity.TimestampedIdentityInfo;
 
-const message = @import("./commit/message.zig");
+pub const message = @import("./commit/message.zig");
 const Message = message.Message;
 const MessageInfo = message.MessageInfo;
 
