@@ -33,21 +33,20 @@ pub const FlagMap = struct {
         return self.buf[0..self.len];
     }
 
+    /// Appends a new flag value. Supports multi-value flags by allowing
+    /// duplicate keys up to the map capacity.
     pub fn set(self: *FlagMap, key: []const u8, value: []const u8) !void {
-        // Overwrite if already set (last-wins, like most CLIs).
-        for (self.slice()) |*e| {
-            if (std.mem.eql(u8, e.key, key)) {
-                e.value = value;
-                return;
-            }
-        }
         if (self.len >= capacity) return Error.Overflow;
         self.buf[self.len] = .{ .key = key, .value = value };
         self.len += 1;
     }
 
+    /// Gets the *last* instance of a flag (retaining standard last-wins behavior for non-multi-value scenarios).
     pub fn get(self: *const FlagMap, key: []const u8) ?[]const u8 {
-        for (self.constSlice()) |e| {
+        var i = self.len;
+        while (i > 0) {
+            i -= 1;
+            const e = self.buf[i];
             if (std.mem.eql(u8, e.key, key)) return e.value;
         }
         return null;
@@ -63,6 +62,30 @@ pub const FlagMap = struct {
 
     pub fn boolean(self: *const FlagMap, key: []const u8) bool {
         return self.has(key);
+    }
+
+    /// MultiValueIterator provides a zero-allocation way to iterate through
+    /// multiple instances of a flag (e.g., `--trailer`).
+    pub const MultiValueIterator = struct {
+        map: *const FlagMap,
+        key: []const u8,
+        index: usize = 0,
+
+        pub fn next(self: *MultiValueIterator) ?[]const u8 {
+            while (self.index < self.map.len) {
+                const entry = self.map.buf[self.index];
+                self.index += 1;
+                if (std.mem.eql(u8, entry.key, self.key)) {
+                    return entry.value;
+                }
+            }
+            return null;
+        }
+    };
+
+    /// Returns an iterator to fetch all values bound to a specific flag key.
+    pub fn getMulti(self: *const FlagMap, key: []const u8) MultiValueIterator {
+        return .{ .map = self, .key = key };
     }
 };
 
@@ -150,14 +173,11 @@ pub const Command = struct {
     }
 
     pub fn printHelpToStderr(self: Command) void {
-        // Allocate an explicit buffer on the stack for the stderr stream
         var stderr_buf: [4096]u8 = undefined;
         var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
         const w = &stderr_writer.interface;
 
-        // Pass the interface pointer to the help printer
         self.printHelp(w) catch {};
-
         w.flush() catch {};
     }
 
