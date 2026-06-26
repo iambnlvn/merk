@@ -5,8 +5,7 @@ const cli = @import("../cli/command.zig");
 const Command = cli.Command;
 const Flag = cli.Flag;
 const Invocation = cli.Invocation;
-
-const repo_root = ".";
+const Context = cli.Context;
 
 /// CLI-only: whether to emit ANSI color codes. The core renderers are
 /// colorless; if/when color support is added to rendering, it should take
@@ -101,7 +100,7 @@ fn applyProfile(p: Profile, config: *diff.RenderConfig) void {
     }
 }
 
-pub fn run(inv: *Invocation) !void {
+pub fn run(ctx: Context, inv: *Invocation) !void {
     var config = diff.RenderConfig{};
     var color_mode: ColorMode = .auto;
 
@@ -180,10 +179,10 @@ pub fn run(inv: *Invocation) !void {
 
     const paths = inv.positional.items;
 
-    var store = try nodus.object.Store.init(inv.alloc, repo_root);
+    var store = try nodus.object.Store.init(inv.alloc, ctx.repo_root);
     defer store.deinit();
 
-    var index = try nodus.index.Index.init(inv.alloc, repo_root);
+    var index = try nodus.index.Index.init(inv.alloc, ctx.repo_root);
     defer index.deinit();
     try index.load();
 
@@ -199,7 +198,7 @@ pub fn run(inv: *Invocation) !void {
     }
 
     for (index.entries.items) |entry| {
-        const state = try index.stateOf(repo_root, entry);
+        const state = try index.stateOf(ctx.repo_root, entry);
         if (state == .clean) continue;
 
         const obj = try store.get(entry.blob_hash);

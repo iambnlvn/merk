@@ -4,6 +4,7 @@ const nodus = @import("nodus");
 const registry = @import("cli/registry.zig");
 const usage = @import("cli/usage.zig");
 const cli = @import("cli/command.zig");
+const Context = @import("cli/context.zig").Context;
 
 pub fn main() void {
     var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
@@ -58,5 +59,7 @@ fn run(alloc: std.mem.Allocator) anyerror!void {
     var inv = try cmd.parseArgs(alloc, &args);
     defer inv.deinit();
 
-    try cmd.run(&inv);
+    const ctx = Context{ .alloc = alloc, .repo_root = "." };
+
+    try cmd.run(ctx, &inv);
 }

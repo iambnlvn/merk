@@ -1,4 +1,5 @@
 const std = @import("std");
+pub const Context = @import("context.zig").Context;
 
 pub const FlagKind = enum { boolean, value };
 
@@ -84,7 +85,7 @@ pub const Command = struct {
     description: []const u8,
     usage: []const u8 = "",
     flags: []const Flag = &.{},
-    run: *const fn (inv: *Invocation) anyerror!void,
+    run: *const fn (ctx: Context, inv: *Invocation) anyerror!void,
 
     pub fn printHelp(self: Command, writer: anytype) !void {
         try writer.print("usage: nodus {s}", .{self.name});

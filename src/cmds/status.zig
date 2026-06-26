@@ -4,11 +4,10 @@ const nodus = @import("nodus");
 const cli = @import("../cli/command.zig");
 const Command = cli.Command;
 const Invocation = cli.Invocation;
+const Context = cli.Context;
 
-const repo_root = ".";
-
-pub fn run(inv: *Invocation) !void {
-    var index = try nodus.index.Index.init(inv.alloc, repo_root);
+pub fn run(ctx: Context, inv: *Invocation) !void {
+    var index = try nodus.index.Index.init(inv.alloc, ctx.repo_root);
     defer index.deinit();
 
     try index.load();
@@ -19,7 +18,7 @@ pub fn run(inv: *Invocation) !void {
     }
 
     for (index.entries.items) |entry| {
-        const state = try index.stateOf(repo_root, entry);
+        const state = try index.stateOf(ctx.repo_root, entry);
         const short = nodus.hash.shortHex(entry.blob_hash);
 
         std.debug.print(

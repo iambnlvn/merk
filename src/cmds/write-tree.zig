@@ -5,13 +5,13 @@ const cli = @import("../cli/command.zig");
 const Command = cli.Command;
 const Invocation = cli.Invocation;
 
-const repo_root = ".";
+const Context = cli.Context;
 
-pub fn run(inv: *Invocation) !void {
-    var store = try nodus.object.Store.init(inv.alloc, repo_root);
+pub fn run(ctx: Context, inv: *Invocation) !void {
+    var store = try nodus.object.Store.init(inv.alloc, ctx.repo_root);
     defer store.deinit();
 
-    var index = try nodus.index.Index.init(inv.alloc, repo_root);
+    var index = try nodus.index.Index.init(inv.alloc, ctx.repo_root);
     defer index.deinit();
     try index.load();
 
