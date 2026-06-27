@@ -129,16 +129,12 @@ pub fn writeHeadRef(
 /// Write HEAD directly to a commit hash
 /// (detached HEAD state).
 pub fn writeDetachedHead(
+    alloc: std.mem.Allocator,
     nodus_dir: std.fs.Dir,
     hash: Hash,
 ) !void {
-    var hex_buf: [64]u8 = undefined;
-
-    const hex =
-        hash_mod.toHex(
-            &hash,
-            &hex_buf,
-        );
+    const hex = try hash_mod.toHex(alloc, hash);
+    defer alloc.free(hex);
 
     try writeFile(
         nodus_dir,
@@ -152,12 +148,12 @@ pub fn writeDetachedHead(
 ///     refs/heads/<branch>
 ///
 pub fn updateBranch(
+    alloc: std.mem.Allocator,
     nodus_dir: std.fs.Dir,
     branch: []const u8,
     hash: Hash,
 ) !void {
     var path_buf: [256]u8 = undefined;
-    var hex_buf: [64]u8 = undefined;
 
     const path =
         try std.fmt.bufPrint(
@@ -166,11 +162,8 @@ pub fn updateBranch(
             .{branch},
         );
 
-    const hex =
-        hash_mod.toHex(
-            &hash,
-            &hex_buf,
-        );
+    const hex = try hash_mod.toHex(alloc, hash);
+    defer alloc.free(hex);
 
     try writeFile(
         nodus_dir,
@@ -291,70 +284,70 @@ test "resolveHead - missing HEAD file handles gracefully" {
     try std.testing.expectEqual(@as(?Hash, null), result);
 }
 
-// test "writeDetachedHead and resolveHead detached lifecycle" {
-//     const allocator = std.testing.allocator;
-//     var tmp = std.testing.tmpDir(.{});
-//     defer tmp.cleanup();
+test "writeDetachedHead and resolveHead detached lifecycle" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-//     var mock_hash: Hash = undefined;
-//     @memset(std.mem.asBytes(&mock_hash), 0xAA);
+    var mock_hash: Hash = undefined;
+    @memset(std.mem.asBytes(&mock_hash), 0xAA);
 
-//     // 1. Write the detached head state
-//     try writeDetachedHead(tmp.dir, mock_hash);
+    // Write the detached head state
+    try writeDetachedHead(allocator, tmp.dir, mock_hash);
 
-//     // 2. headBranch should return null when detached
-//     const branch = try headBranch(allocator, tmp.dir);
-//     try std.testing.expectEqual(@as(?[]u8, null), branch);
+    // headBranch should return null when detached
+    const branch = try headBranch(allocator, tmp.dir);
+    try std.testing.expectEqual(@as(?[]u8, null), branch);
 
-//     // 3. Resolve HEAD directly back to the mock hash
-//     const resolved = try resolveHead(allocator, tmp.dir);
-//     try std.testing.expect(resolved != null);
-//     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mock_hash), std.mem.asBytes(&resolved.?));
-// }
+    // Resolve HEAD directly back to the mock hash
+    const resolved = try resolveHead(allocator, tmp.dir);
+    try std.testing.expect(resolved != null);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mock_hash), std.mem.asBytes(&resolved.?));
+}
 
 test "resolveHead - symbolic ref pointing to a non-existent branch" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // 1. Point HEAD symbolically to a branch that has no file yet
+    // Point HEAD symbolically to a branch that has no file yet
     try writeHeadRef(tmp.dir, "main");
 
-    // 2. headBranch should still parse the name "main" successfully
+    // headBranch should still parse the name "main" successfully
     const branch = try headBranch(allocator, tmp.dir);
     try std.testing.expect(branch != null);
     defer allocator.free(branch.?);
     try std.testing.expectEqualStrings("main", branch.?);
 
-    // 3. resolveHead should return null gracefully because refs/heads/main doesn't exist
+    // resolveHead should return null gracefully because refs/heads/main doesn't exist
     const resolved = try resolveHead(allocator, tmp.dir);
     try std.testing.expectEqual(@as(?Hash, null), resolved);
 }
 
-// test "Symbolic branch ref full lifecycle forwarding" {
-//     const allocator = std.testing.allocator;
-//     var tmp = std.testing.tmpDir(.{});
-//     defer tmp.cleanup();
+test "Symbolic branch ref full lifecycle forwarding" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-//     var mock_hash: Hash = undefined;
-//     @memset(std.mem.asBytes(&mock_hash), 0xBB);
+    var mock_hash: Hash = undefined;
+    @memset(std.mem.asBytes(&mock_hash), 0xBB);
 
-//     // 1. Link HEAD to a development branch
-//     try writeHeadRef(tmp.dir, "develop");
+    //  Link HEAD to a development branch
+    try writeHeadRef(tmp.dir, "develop");
 
-//     // 2. Commit a hash onto the branch target
-//     try updateBranch(tmp.dir, "develop", mock_hash);
+    //  Commit a hash onto the branch target
+    try updateBranch(allocator, tmp.dir, "develop", mock_hash);
 
-//     // 3. Confirm reading the branch directly works
-//     const read_hash = try readBranch(allocator, tmp.dir, "develop");
-//     try std.testing.expect(read_hash != null);
-//     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mock_hash), std.mem.asBytes(&read_hash.?));
+    //  Confirm reading the branch directly works
+    const read_hash = try readBranch(allocator, tmp.dir, "develop");
+    try std.testing.expect(read_hash != null);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mock_hash), std.mem.asBytes(&read_hash.?));
 
-//     // 4. Confirm resolveHead correctly follows the symbolic link to find the hash
-//     const resolved = try resolveHead(allocator, tmp.dir);
-//     try std.testing.expect(resolved != null);
-//     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mock_hash), std.mem.asBytes(&resolved.?));
-// }
+    // Confirm resolveHead correctly follows the symbolic link to find the hash
+    const resolved = try resolveHead(allocator, tmp.dir);
+    try std.testing.expect(resolved != null);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mock_hash), std.mem.asBytes(&resolved.?));
+}
 
 test "updateRef and deep directories layout verification" {
     const allocator = std.testing.allocator;
@@ -372,32 +365,32 @@ test "updateRef and deep directories layout verification" {
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mock_hash), std.mem.asBytes(&read_hash.?));
 }
 
-// test "Whitespace and newline parsing robustness" {
-//     const allocator = std.testing.allocator;
-//     var tmp = std.testing.tmpDir(.{});
-//     defer tmp.cleanup();
+test "Whitespace and newline parsing robustness" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-//     var mock_hash: Hash = undefined;
-//     @memset(std.mem.asBytes(&mock_hash), 0xDD);
+    var mock_hash: Hash = undefined;
+    @memset(std.mem.asBytes(&mock_hash), 0xDD);
 
-//     // 1. Manually inject annoying whitespace padding into the symbolic HEAD layout
-//     try writeFile(tmp.dir, "HEAD", "  ref: refs/heads/feature-xyz   \n\r");
+    // Manually inject annoying whitespace padding into the symbolic HEAD layout
+    try writeFile(tmp.dir, "HEAD", "  ref: refs/heads/feature-xyz   \n\r");
 
-//     // 2. Manually write the hash with aggressive padding, tabs, and line breaks
-//     var hex_buf: [64]u8 = undefined;
-//     const hex = hash_mod.toHex(&mock_hash, &hex_buf);
+    //  Manually write the hash with aggressive padding, tabs, and line breaks
+    const hex = try hash_mod.toHex(allocator, mock_hash);
+    defer allocator.free(hex);
 
-//     var dirty_hex_buf: [128]u8 = undefined;
-//     const dirty_hex = try std.fmt.bufPrint(&dirty_hex_buf, "\t\n  {s} \r\n", .{hex});
-//     try writeFile(tmp.dir, "refs/heads/feature-xyz", dirty_hex);
+    var dirty_hex_buf: [128]u8 = undefined;
+    const dirty_hex = try std.fmt.bufPrint(&dirty_hex_buf, "\t\n  {s} \r\n", .{hex});
+    try writeFile(tmp.dir, "refs/heads/feature-xyz", dirty_hex);
 
-//     // 3. Assert your trim functions perfectly sanitize the input boundaries
-//     const resolved = try resolveHead(allocator, tmp.dir);
-//     try std.testing.expect(resolved != null);
-//     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mock_hash), std.mem.asBytes(&resolved.?));
+    // Assert your trim functions perfectly sanitize the input boundaries
+    const resolved = try resolveHead(allocator, tmp.dir);
+    try std.testing.expect(resolved != null);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mock_hash), std.mem.asBytes(&resolved.?));
 
-//     const branch = try headBranch(allocator, tmp.dir);
-//     try std.testing.expect(branch != null);
-//     defer allocator.free(branch.?);
-//     try std.testing.expectEqualStrings("feature-xyz", branch.?);
-// }
+    const branch = try headBranch(allocator, tmp.dir);
+    try std.testing.expect(branch != null);
+    defer allocator.free(branch.?);
+    try std.testing.expectEqualStrings("feature-xyz", branch.?);
+}
