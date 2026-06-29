@@ -6,6 +6,104 @@ const object = @import("object.zig");
 const Hash = hash_mod.Hash;
 const Store = object.Store;
 
+//
+// Mirrors writeNode's wire format exactly (see writeTreeEntry below):
+//   [4]  child_count (u32 little-endian)
+//   per child:
+//     [1]   kind        (EntryKind)
+//     [2]   name_len    (u16 little-endian)
+//     [n]   name bytes
+//     [32]  hash
+//     [8]   mode        (u64 little-endian)
+//     [8]   size        (u64 little-endian)
+
+pub const FlatEntry = struct {
+    path: []u8,
+    hash: Hash,
+    mode: u64,
+    size: u64,
+};
+
+/// Recursively read the tree at `root_hash` and flatten it into a sorted,
+/// caller-owned slice of (path, blob_hash) entries, file entries only,
+/// directories are walked but not themselves emitted. Paths use `/`
+/// separators regardless of platform, matching index_mod.Entry.path.
+pub fn readToFlatEntries(
+    alloc: std.mem.Allocator,
+    store: *const Store,
+    root_hash: Hash,
+) ![]FlatEntry {
+    var out: std.ArrayList(FlatEntry) = .empty;
+    errdefer {
+        for (out.items) |e| alloc.free(e.path);
+        out.deinit(alloc);
+    }
+
+    try walkTree(alloc, store, root_hash, "", &out);
+
+    const slice = try out.toOwnedSlice(alloc);
+    std.mem.sort(FlatEntry, slice, {}, struct {
+        fn lt(_: void, a: FlatEntry, b: FlatEntry) bool {
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lt);
+    return slice;
+}
+
+pub fn freeFlatEntries(alloc: std.mem.Allocator, entries: []FlatEntry) void {
+    for (entries) |e| alloc.free(e.path);
+    alloc.free(entries);
+}
+
+fn walkTree(
+    alloc: std.mem.Allocator,
+    store: *const Store,
+    tree_hash: Hash,
+    prefix: []const u8,
+    out: *std.ArrayList(FlatEntry),
+) !void {
+    const obj = try store.get(tree_hash);
+    defer alloc.free(obj.payload);
+    if (obj.obj_type != .tree) return error.NotATree;
+
+    var reader = std.Io.Reader.fixed(obj.payload);
+    const child_count = try reader.takeInt(u32, .little);
+
+    for (0..child_count) |_| {
+        const kind_byte = try reader.takeByte();
+        const kind: EntryKind = @enumFromInt(kind_byte);
+
+        const name_len = try reader.takeInt(u16, .little);
+        const name = try reader.take(name_len);
+
+        var hash: Hash = undefined;
+        @memcpy(&hash, try reader.take(hash.len));
+
+        const mode = try reader.takeInt(u64, .little);
+        const size = try reader.takeInt(u64, .little);
+
+        const child_path = if (prefix.len == 0)
+            try alloc.dupe(u8, name)
+        else
+            try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, name });
+
+        switch (kind) {
+            .blob => {
+                try out.append(alloc, .{
+                    .path = child_path,
+                    .hash = hash,
+                    .mode = mode,
+                    .size = size,
+                });
+            },
+            .tree => {
+                defer alloc.free(child_path);
+                try walkTree(alloc, store, hash, child_path, out);
+            },
+        }
+    }
+}
+
 pub const EntryKind = enum(u8) {
     blob = 1,
     tree = 2,
@@ -290,4 +388,123 @@ test "writeFromIndex is deterministic regardless of index order" {
     const first_hash = try writeFromIndex(alloc, &store, &first);
     const second_hash = try writeFromIndex(alloc, &store, &second);
     try std.testing.expectEqualSlices(u8, &first_hash, &second_hash);
+}
+
+test "readToFlatEntries round-trips writeFromIndex" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var objects_dir = try tmp_dir.dir.makeOpenPath("objects", .{});
+    defer objects_dir.close();
+    var store = Store{ .dir = objects_dir, .alloc = alloc };
+
+    const main_hash = try store.put(.blob, "main");
+    const lib_hash = try store.put(.blob, "lib");
+
+    var entries: [2]index_mod.Entry = .{
+        .{ .path = try alloc.dupe(u8, "src/main.zig"), .blob_hash = main_hash, .size = 4, .mode = 0o100644, .mtime = 1 },
+        .{ .path = try alloc.dupe(u8, "src/lib.zig"), .blob_hash = lib_hash, .size = 3, .mode = 0o100644, .mtime = 2 },
+    };
+    defer {
+        alloc.free(entries[0].path);
+        alloc.free(entries[1].path);
+    }
+
+    const root_hash = try writeFromIndex(alloc, &store, &entries);
+
+    const flat = try readToFlatEntries(alloc, &store, root_hash);
+    defer freeFlatEntries(alloc, flat);
+
+    try std.testing.expectEqual(@as(usize, 2), flat.len);
+    // Sorted by path: "src/lib.zig" < "src/main.zig"
+    try std.testing.expectEqualStrings("src/lib.zig", flat[0].path);
+    try std.testing.expectEqualSlices(u8, &lib_hash, &flat[0].hash);
+    try std.testing.expectEqualStrings("src/main.zig", flat[1].path);
+    try std.testing.expectEqualSlices(u8, &main_hash, &flat[1].hash);
+}
+
+test "writeFromIndex rejects duplicate file and directory collisions" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var objects_dir = try tmp_dir.dir.makeOpenPath("objects", .{});
+    defer objects_dir.close();
+    var store = Store{ .dir = objects_dir, .alloc = alloc };
+
+    const blob_hash = try store.put(.blob, "content");
+
+    var first: [2]index_mod.Entry = .{
+        .{ .path = try alloc.dupe(u8, "src"), .blob_hash = blob_hash, .size = 7, .mode = 0o100644, .mtime = 1 },
+        .{ .path = try alloc.dupe(u8, "src/main.zig"), .blob_hash = blob_hash, .size = 7, .mode = 0o100644, .mtime = 2 },
+    };
+    defer {
+        alloc.free(first[0].path);
+        alloc.free(first[1].path);
+    }
+
+    try std.testing.expectError(error.DuplicateTreeEntry, writeFromIndex(alloc, &store, &first));
+}
+
+test "writeFromIndex rejects invalid index paths" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var objects_dir = try tmp_dir.dir.makeOpenPath("objects", .{});
+    defer objects_dir.close();
+    var store = Store{ .dir = objects_dir, .alloc = alloc };
+
+    var entries: [1]index_mod.Entry = .{
+        .{ .path = try alloc.dupe(u8, "src/../main.zig"), .blob_hash = try store.put(.blob, "x"), .size = 1, .mode = 0o100644, .mtime = 1 },
+    };
+    defer alloc.free(entries[0].path);
+
+    try std.testing.expectError(error.InvalidPath, writeFromIndex(alloc, &store, &entries));
+}
+
+test "readToFlatEntries rejects non-tree objects" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var objects_dir = try tmp_dir.dir.makeOpenPath("objects", .{});
+    defer objects_dir.close();
+    var store = Store{ .dir = objects_dir, .alloc = alloc };
+
+    const blob_hash = try store.put(.blob, "hello world");
+    try std.testing.expectError(error.NotATree, readToFlatEntries(alloc, &store, blob_hash));
+}
+
+test "writeFromIndex updates duplicate index entries to latest metadata" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var objects_dir = try tmp_dir.dir.makeOpenPath("objects", .{});
+    defer objects_dir.close();
+    var store = Store{ .dir = objects_dir, .alloc = alloc };
+
+    const first_hash = try store.put(.blob, "first");
+    const second_hash = try store.put(.blob, "second");
+
+    var entries: [2]index_mod.Entry = .{
+        .{ .path = try alloc.dupe(u8, "a.txt"), .blob_hash = first_hash, .size = 5, .mode = 0o100644, .mtime = 1 },
+        .{ .path = try alloc.dupe(u8, "a.txt"), .blob_hash = second_hash, .size = 6, .mode = 0o100755, .mtime = 2 },
+    };
+    defer {
+        alloc.free(entries[0].path);
+        alloc.free(entries[1].path);
+    }
+
+    const root_hash = try writeFromIndex(alloc, &store, &entries);
+    const flat = try readToFlatEntries(alloc, &store, root_hash);
+    defer freeFlatEntries(alloc, flat);
+
+    try std.testing.expectEqual(@as(usize, 1), flat.len);
+    try std.testing.expectEqualStrings("a.txt", flat[0].path);
+    try std.testing.expectEqualSlices(u8, &second_hash, &flat[0].hash);
+    try std.testing.expectEqual(@as(u64, 6), flat[0].size);
+    try std.testing.expectEqual(@as(u64, 0o100755), flat[0].mode);
 }
