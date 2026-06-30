@@ -505,7 +505,6 @@ test "distinct branches with distinct hashes do not clobber each other" {
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&hash_c), std.mem.asBytes(&rc.?));
 }
 
-//TODO:this is currently leaking
 test "writeHeadRef followed by writeDetachedHead correctly overwrites symbolic state" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -515,13 +514,18 @@ test "writeHeadRef followed by writeDetachedHead correctly overwrites symbolic s
     @memset(std.mem.asBytes(&mock_hash), 0x12);
 
     try writeHeadRef(tmp.dir, "main");
-    try std.testing.expect((try headBranch(allocator, tmp.dir)) != null);
-    if (try headBranch(allocator, tmp.dir)) |b| allocator.free(b);
+
+    const branch = try headBranch(allocator, tmp.dir);
+    try std.testing.expect(branch != null);
+    if (branch) |b| allocator.free(b);
 
     // Detach HEAD directly onto a commit — must fully replace the
     // symbolic "ref: refs/heads/main" contents, not append/merge with it.
     try writeDetachedHead(allocator, tmp.dir, mock_hash);
-    try std.testing.expectEqual(@as(?[]u8, null), try headBranch(allocator, tmp.dir));
+
+    const branch_detached = try headBranch(allocator, tmp.dir);
+    defer if (branch_detached) |b| allocator.free(b);
+    try std.testing.expectEqual(@as(?[]u8, null), branch_detached);
 
     const resolved = try resolveHead(allocator, tmp.dir);
     try std.testing.expect(resolved != null);

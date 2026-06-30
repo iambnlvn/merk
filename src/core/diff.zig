@@ -27,6 +27,101 @@ pub const Op = enum(u8) {
     del = 2,
 };
 
+const object_mod = @import("object.zig");
+const tree_mod = @import("tree.zig");
+const hash_mod = @import("hash.zig");
+const commit_mod = @import("commit.zig");
+
+/// Diff the tree of `new_commit` against the tree of `old_commit`
+/// Pass `null` for `old_commit` to diff against an empty tree, e.g. for
+/// the root commit, where there is no parent to compare against
+pub fn diffCommits(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    old_commit: ?hash_mod.Hash,
+    new_commit: hash_mod.Hash,
+    algo: Algorithm,
+) !CommitDiff {
+    var new_c = try commit_mod.read(alloc, store, new_commit);
+    defer new_c.deinit(alloc);
+
+    var old_tree: ?hash_mod.Hash = null;
+    var old_c: ?commit_mod.Commit = null;
+    defer if (old_c) |*c| c.deinit(alloc);
+
+    if (old_commit) |oc| {
+        old_c = try commit_mod.read(alloc, store, oc);
+        old_tree = old_c.?.snapshot.tree;
+    }
+
+    return diffTreeHashes(alloc, store, old_tree, new_c.snapshot.tree, algo);
+}
+
+/// Diff `new_commit` against its first parent. If `new_commit` has no
+/// parents (a root commit), diffs against an empty tree
+pub fn diffCommitAgainstParent(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    new_commit: hash_mod.Hash,
+    algo: Algorithm,
+) !CommitDiff {
+    var new_c = try commit_mod.read(alloc, store, new_commit);
+    defer new_c.deinit(alloc);
+
+    const old_tree: ?hash_mod.Hash = if (new_c.snapshot.parents.len > 0) blk: {
+        var parent_c = try commit_mod.read(alloc, store, new_c.snapshot.parents[0]);
+        defer parent_c.deinit(alloc);
+        break :blk parent_c.snapshot.tree;
+    } else null;
+
+    return diffTreeHashes(alloc, store, old_tree, new_c.snapshot.tree, algo);
+}
+
+/// Diff two trees directly. `old_tree == null` means "empty tree" (nothing
+/// on the old side — every file in `new_tree` shows up as added)
+pub fn diffTreeHashes(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    old_tree: ?hash_mod.Hash,
+    new_tree: hash_mod.Hash,
+    algo: Algorithm,
+) !CommitDiff {
+    const old_flat: []tree_mod.FlatEntry = if (old_tree) |t|
+        try tree_mod.readToFlatEntries(alloc, store, t)
+    else
+        &[_]tree_mod.FlatEntry{};
+    defer if (old_tree != null) tree_mod.freeFlatEntries(alloc, old_flat);
+
+    const new_flat = try tree_mod.readToFlatEntries(alloc, store, new_tree);
+    defer tree_mod.freeFlatEntries(alloc, new_flat);
+
+    var blobs: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (blobs.items) |b| alloc.free(b);
+        blobs.deinit(alloc);
+    }
+
+    const old_snaps = try alloc.alloc(FileSnapshot, old_flat.len);
+    defer alloc.free(old_snaps);
+    for (old_flat, 0..) |e, i| {
+        const obj = try store.get(e.hash);
+        try blobs.append(alloc, obj.payload);
+        old_snaps[i] = .{ .path = e.path, .content = obj.payload };
+    }
+
+    const new_snaps = try alloc.alloc(FileSnapshot, new_flat.len);
+    defer alloc.free(new_snaps);
+    for (new_flat, 0..) |e, i| {
+        const obj = try store.get(e.hash);
+        try blobs.append(alloc, obj.payload);
+        new_snaps[i] = .{ .path = e.path, .content = obj.payload };
+    }
+
+    var cd = try diffCommitWith(alloc, old_snaps, new_snaps, algo);
+    cd.blobs = try blobs.toOwnedSlice(alloc);
+    return cd;
+}
+
 pub const LineDelta = struct {
     op: Op,
     /// Line content, NOT including the trailing newline
@@ -68,13 +163,18 @@ pub const CommitDiff = struct {
     line_diff_hash: [32]u8,
     /// Hash of the serialized word diff (stored as a blob)
     word_diff_hash: [32]u8,
+    /// Backing blob buffers that FileDiff.line_deltas[].content slices
+    /// point into. Owned by the CommitDiff for its whole lifetime —
+    /// freeing these before deinit() dangles every content slice.
+    blobs: [][]u8 = &.{},
 
     pub fn deinit(self: *CommitDiff, alloc: std.mem.Allocator) void {
         for (self.files) |*f| f.deinit(alloc);
         alloc.free(self.files);
+        for (self.blobs) |b| alloc.free(b);
+        alloc.free(self.blobs);
     }
 };
-
 /// A (path, content) snapshot of a single file
 pub const FileSnapshot = struct {
     path: []const u8,
@@ -819,13 +919,13 @@ fn diffWords(alloc: std.mem.Allocator, line_deltas: []const LineDelta) ![]WordDe
 }
 
 pub fn renderCommit(writer: anytype, cd: *const CommitDiff, config: RenderConfig, alloc: std.mem.Allocator) !void {
-    var filtered = std.ArrayList(*const FileDiff).init(alloc);
+    var filtered: std.ArrayList(*const FileDiff) = .empty;
     defer filtered.deinit(alloc);
 
     for (cd.files) |*fd| {
         const status = fileStatus(fd);
         if (!config.filter.allows(status)) continue;
-        try filtered.append(fd);
+        try filtered.append(alloc, fd);
     }
 
     if (config.group_by == .dirs) {
