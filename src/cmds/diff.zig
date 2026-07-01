@@ -165,12 +165,46 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         };
         applyProfile(p, &config);
     }
+    // --rev is repeatable, like --trailer on `commit`: 0, 1, or 2 occurrences.
+    //   0 revs: working tree vs index (default, below)
+    //   1 rev:  that commit vs its first parent
+    //   2 revs: first rev vs second rev, in the order given
+    //   Note: comma-separated hashes in a single --rev value are also supported
+    //   Supports both full (64-char) and short (8+ char) hex hash prefixes
+    var rev_strs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer rev_strs.deinit(inv.alloc);
 
-    if (inv.flags.boolean("staged")) {
+    var rev_it = inv.flags.getMulti("rev");
+    while (rev_it.next()) |raw| {
+        // Support both single hashes and comma-separated hashes
+        var parts = std.mem.splitScalar(u8, raw, ',');
+        while (parts.next()) |part| {
+            const trimmed = std.mem.trim(u8, part, " \t");
+            if (trimmed.len == 0) continue;
+
+            nodus.hash.parseHexPrefix(trimmed) catch {
+                std.debug.print("error: invalid --rev '{s}' (expected 8-64 hex chars)\n", .{trimmed});
+                return error.InvalidRev;
+            };
+            try rev_strs.append(inv.alloc, trimmed);
+        }
+    }
+    if (rev_strs.items.len > 2) {
+        std.debug.print("error: --rev can be given at most twice (comparing two trees)\n", .{});
+        return error.TooManyRevs;
+    }
+
+    const staged = inv.flags.boolean("staged");
+    if (staged and rev_strs.items.len > 0) {
+        std.debug.print("error: --staged and --rev are mutually exclusive\n", .{});
+        return error.ConflictingDiffMode;
+    }
+    if (staged) {
         std.debug.print("error: --staged is not yet implemented\n", .{});
         return error.NotImplemented;
     }
-    // --working is the default behaviour (and currently the only one); accepted as a no-op
+    // --working is the default behaviour (and currently the only one with no
+    // --rev given); accepted as a no-op
 
     // Resolved here, in the CLI layer, since "is stdout a tty" is a CLI
     // concern the core renderers don't need to know about.
@@ -182,6 +216,78 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     var store = try nodus.object.Store.init(inv.alloc, ctx.repo_root);
     defer store.deinit();
 
+    // Resolve rev strings (full or short hashes) to actual Hash objects
+    var revs: std.ArrayListUnmanaged(nodus.hash.Hash) = .empty;
+    defer revs.deinit(inv.alloc);
+
+    for (rev_strs.items) |rev_str| {
+        const h = nodus.hash.fromHex(rev_str) catch {
+            // Not a full hash: resolve the short hash prefix against the object store
+            const resolved = store.resolveHashPrefix(rev_str) catch |e| {
+                switch (e) {
+                    error.Ambiguous => std.debug.print("error: ambiguous --rev '{s}' (matches multiple objects)\n", .{rev_str}),
+                    error.NotFound => std.debug.print("error: --rev '{s}' not found\n", .{rev_str}),
+                    else => std.debug.print("error: invalid --rev '{s}'\n", .{rev_str}),
+                }
+                return error.InvalidRev;
+            };
+            try revs.append(inv.alloc, resolved);
+            continue;
+        };
+        try revs.append(inv.alloc, h);
+    }
+
+    var stdout_buf: [8192]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    const writer = &stdout_writer.interface;
+
+    if (revs.items.len > 0) {
+        var cd: diff.CommitDiff = if (revs.items.len == 1)
+            try diff.diffCommitAgainstParent(inv.alloc, &store, revs.items[0], config.algorithm)
+        else
+            try diff.diffCommits(inv.alloc, &store, revs.items[0], revs.items[1], config.algorithm);
+        defer cd.deinit(inv.alloc);
+
+        var visible: std.ArrayListUnmanaged(*const diff.FileDiff) = .empty;
+        defer visible.deinit(inv.alloc);
+
+        for (cd.files) |*fd| {
+            if (!config.filter.allows(diff.fileStatus(fd))) continue;
+
+            if (paths.len > 0) {
+                const included = for (paths) |p| {
+                    if (std.mem.startsWith(u8, fd.path, p)) break true;
+                } else false;
+                if (!included) continue;
+            }
+
+            try visible.append(inv.alloc, fd);
+        }
+
+        if (visible.items.len == 0) return;
+
+        if (config.group_by == .dirs) {
+            const groups = try diff.groupByDirectory(inv.alloc, visible.items);
+            defer {
+                for (groups) |g| inv.alloc.free(g.files);
+                inv.alloc.free(groups);
+            }
+            for (groups) |g| {
+                try writer.print("{s}/\n", .{g.dir});
+                for (g.files) |fd|
+                    try writer.print("  {s}\n", .{std.fs.path.basename(fd.path)});
+                try writer.writeByte('\n');
+            }
+        } else {
+            for (visible.items) |fd|
+                try diff.renderFileDiff(writer, fd, config);
+        }
+
+        try writer.flush();
+        return;
+    }
+
+    // No --rev given: existing working-tree-vs-index behavior, unchanged
     var index = try nodus.index.Index.init(inv.alloc, ctx.repo_root);
     defer index.deinit();
     try index.load();
@@ -241,10 +347,6 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
     if (visible.items.len == 0) return;
 
-    var stdout_buf: [8192]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const writer = &stdout_writer.interface;
-
     if (config.group_by == .dirs) {
         const groups = try diff.groupByDirectory(inv.alloc, visible.items);
         defer {
@@ -267,7 +369,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
 pub const command = Command{
     .name = "diff",
-    .description = "Show changes between the index and working tree.",
+    .description = "Show changes between the index and working tree, or between commits with --rev.",
     .usage = "[options] [<path>...]",
     .flags = &[_]Flag{
         .{ .short = 'f', .long = "format", .kind = .value, .value_name = "fmt", .help = "unified, side-by-side, blocks, ops, summary" },
@@ -275,6 +377,7 @@ pub const command = Command{
         .{ .short = 'c', .long = "context", .kind = .value, .value_name = "n", .help = "context lines (number, minimal, normal, full)" },
         .{ .short = 'g', .long = "group", .kind = .value, .value_name = "mode", .help = "none, files, dirs" },
         .{ .long = "algo", .kind = .value, .value_name = "name", .help = "myers, patience, histogram (default: histogram)" },
+        .{ .long = "rev", .kind = .value, .value_name = "hash", .help = "commit hash to compare; repeat for two commits (default: working tree vs index)" },
         .{ .long = "word", .kind = .boolean, .help = "enable inline word highlighting" },
         .{ .long = "only-added", .kind = .boolean, .help = "show only added files" },
         .{ .long = "only-deleted", .kind = .boolean, .help = "show only deleted files" },
@@ -284,7 +387,7 @@ pub const command = Command{
         .{ .long = "no-color", .kind = .boolean, .help = "disable color" },
         .{ .long = "color", .kind = .value, .value_name = "when", .help = "auto, always, never" },
         .{ .long = "profile", .kind = .value, .value_name = "name", .help = "review, ci, debug" },
-        .{ .long = "staged", .kind = .boolean, .help = "diff staged changes (not yet implemented)" },
+        .{ .long = "staged", .kind = .boolean, .help = "diff staged changes (not yet implemented; mutually exclusive with --rev)" },
         .{ .long = "working", .kind = .boolean, .help = "diff working tree changes (default)" },
     },
     .run = run,

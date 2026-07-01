@@ -128,7 +128,7 @@ pub const Store = struct {
         defer alloc.free(objects_path);
 
         try cwd.makePath(objects_path);
-        const dir = try cwd.openDir(objects_path, .{});
+        const dir = try cwd.openDir(objects_path, .{ .iterate = true });
 
         return .{ .dir = dir, .alloc = alloc };
     }
@@ -266,6 +266,45 @@ pub const Store = struct {
         const path = self.objectPath(&path_buf, obj_hash);
         self.dir.access(path, .{}) catch return false;
         return true;
+    }
+
+    pub fn resolveHashPrefix(self: *Store, prefix: []const u8) !Hash {
+        // Validate prefix format first
+        try hash_mod.parseHexPrefix(prefix);
+
+        const first_dir = prefix[0..2];
+        var first_dir_handle = self.dir.openDir(first_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return error.NotFound,
+            else => return err,
+        };
+        defer first_dir_handle.close();
+
+        const second_dir_prefix = if (prefix.len >= 4) prefix[2..4] else "";
+        var matches: std.ArrayListUnmanaged(Hash) = .empty;
+        defer matches.deinit(self.alloc);
+
+        var sub_iter = first_dir_handle.iterate();
+        while (try sub_iter.next()) |subentry| {
+            if (subentry.kind != .directory) continue;
+            if (second_dir_prefix.len != 0 and !std.mem.startsWith(u8, subentry.name, second_dir_prefix)) continue;
+
+            var second_dir_handle = first_dir_handle.openDir(subentry.name, .{ .iterate = true }) catch continue;
+            defer second_dir_handle.close();
+
+            var file_iter = second_dir_handle.iterate();
+            while (try file_iter.next()) |file_entry| {
+                if (file_entry.kind != .file) continue;
+                if (!std.mem.startsWith(u8, file_entry.name, prefix)) continue;
+                if (file_entry.name.len != 64) continue;
+
+                const obj_hash = hash_mod.fromHex(file_entry.name) catch continue;
+                try matches.append(self.alloc, obj_hash);
+                if (matches.items.len > 1) return error.Ambiguous;
+            }
+        }
+
+        if (matches.items.len == 0) return error.NotFound;
+        return matches.items[0];
     }
 
     fn objectPath(_: *const Store, buf: *[object_rel_path_len]u8, obj_hash: Hash) []const u8 {
