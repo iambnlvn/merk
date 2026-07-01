@@ -68,6 +68,20 @@ pub fn fromHex(s: []const u8) !Hash {
     return out;
 }
 
+/// Parse and validate a hex string (8-64 chars) without full decoding.
+/// Used for prefix matching. Returns the parsed prefix or error if invalid hex.
+pub fn parseHexPrefix(s: []const u8) !void {
+    if (s.len < 8 or s.len > 64) return error.InvalidHexLength;
+
+    // Validate that all characters are valid hex (0-9, a-f, A-F)
+    for (s) |c| {
+        const is_digit = c >= '0' and c <= '9';
+        const is_lower_hex = c >= 'a' and c <= 'f';
+        const is_upper_hex = c >= 'A' and c <= 'F';
+        if (!(is_digit or is_lower_hex or is_upper_hex)) return error.InvalidCharacter;
+    }
+}
+
 /// First 8 hex chars — useful for display / directory sharding
 pub fn shortHex(h: Hash) [8]u8 {
     return std.fmt.bytesToHex(h[0..4].*, .lower);
