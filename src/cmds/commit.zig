@@ -292,7 +292,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         return error.NothingToCommit;
     }
 
-    var nodus_dir = try std.fs.cwd().openDir(ctx.repo_root, .{});
+    var nodus_dir = try std.fs.cwd().openDir(".nodus", .{});
     defer nodus_dir.close();
 
     const maybe_head = try refs.resolveHead(inv.alloc, nodus_dir);
