@@ -292,19 +292,35 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         return error.NothingToCommit;
     }
 
-    var nodus_dir = try std.fs.cwd().openDir(".nodus", .{});
+    var nodus_dir = try std.fs.cwd().openDir(ctx.repo_root, .{});
     defer nodus_dir.close();
 
     const maybe_head = try refs.resolveHead(inv.alloc, nodus_dir);
     const parents: []const nodus.hash.Hash = if (maybe_head) |h| &.{h} else &.{};
 
-    const commit_hash = try commit_mod.buildAndWrite(
+    // Build the tree up front so we can detect a no-op commit (staged tree
+    // identical to HEAD's tree) before writing a commit object at all
+    const tree_hash = try nodus.tree.writeFromIndex(inv.alloc, &store, index.entries.items);
+
+    if (maybe_head) |head_hash| {
+        var parent_c = try commit_mod.read(inv.alloc, &store, head_hash);
+        defer parent_c.deinit(inv.alloc);
+
+        if (std.mem.eql(u8, &parent_c.snapshot.tree, &tree_hash)) {
+            std.debug.print(
+                "error: nothing to commit — staged tree is identical to HEAD (stage changes with `nodus add` first)\n",
+                .{},
+            );
+            return error.NothingToCommit;
+        }
+    }
+
+    const commit_hash = try commit_mod.write(
         inv.alloc,
         &store,
-        &index,
         .{
             .snapshot = .{
-                .tree = undefined, // overwritten by buildAndWrite
+                .tree = tree_hash,
                 .parents = parents,
             },
             .identity = .{
@@ -316,7 +332,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
                 .committer = committer,
             },
             .metadata = .{
-                .timestamp_ms = 0, // auto wall-clock
+                .timestamp_ms = 0,
                 .intent = intent,
                 .labels = label_list.items,
             },
@@ -327,13 +343,13 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
             },
         },
     );
-
-    const branch = try refs.headBranch(inv.alloc, nodus_dir) orelse
-        try inv.alloc.dupe(u8, "main");
+    const branch = try refs.headBranch(inv.alloc, nodus_dir) orelse blk: {
+        try refs.writeHeadRef(nodus_dir, "main");
+        break :blk try inv.alloc.dupe(u8, "main");
+    };
     defer inv.alloc.free(branch);
 
     try refs.updateRef(inv.alloc, nodus_dir, branch, commit_hash);
-
     const short = nodus.hash.shortHex(commit_hash);
 
     std.debug.print("✓ Commit created\n\n", .{});
