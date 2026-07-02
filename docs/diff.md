@@ -58,8 +58,8 @@ nodus diff --algo patience
 | _(no args)_       | Compare working tree against the index                  | **Stable**                                                                                                                   |
 | `--working`       | Explicitly compare working tree against index (default) | **Stable**                                                                                                                   |
 | `--staged`        | Compare the index against HEAD (staged changes)         | **Not implemented** — flag is accepted by the parser but the command errors out (`error.NotImplemented`) rather than running |
-| `<ref>`           | Compare `<ref>` against the working tree                | **Planned**                                                                                                                  |
-| `<ref-a> <ref-b>` | Compare two refs/commits                                | **Planned**                                                                                                                  |
+| `--rev <hash>`    | Compare a commit by full or short hash prefix           | **Stable** — supports 64-char or 8+ char abbreviations mapped through the local object store |
+| `--rev <hash-a> --rev <hash-b>` | Compare two commits in order                      | **Stable** — both commits can be resolved from full or short prefixes | 
 
 ```bash
 nodus diff                    # working vs index
