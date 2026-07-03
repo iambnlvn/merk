@@ -1,8 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Hash = [32]u8;
-//I dont know if this is possible in zig, Looking it up later...
-// const Hash = if (builtin.is_test) [32]u8 else @import("../hash.zig").Hash;
+
 const MockReader = @import("testing.zig").MockReader;
 pub const SnapshotError = error{
     TooManyParents,
@@ -11,7 +10,9 @@ pub const SnapshotError = error{
 pub const MAX_PARENTS: u8 = 255;
 
 pub const SnapshotInfo = struct {
-    /// Root tree object describing repository state.
+    /// Snapshot root describing repo state
+    /// New commits store a Merkle index root here;
+    /// NOTE: legacy commits may store a tree object hash
     tree: Hash,
 
     /// Parent commit hashes.
@@ -28,7 +29,7 @@ pub const SnapshotInfo = struct {
     pub fn serialize(self: SnapshotInfo, writer: anytype) !void {
         try self.validate();
 
-        // Write the 32-byte root tree hash
+        // Write the 32-byte snapshot root hash
         try writer.writeAll(&self.tree);
 
         // Write the parent count as a single byte
@@ -42,7 +43,8 @@ pub const SnapshotInfo = struct {
 };
 
 pub const Snapshot = struct {
-    /// Root tree object describing repository state.
+    /// Snapshot root describing repo state.
+    /// New commits store a Merkle index root
     tree: Hash,
 
     /// Owned parent commit hashes.
@@ -61,7 +63,7 @@ pub const Snapshot = struct {
     }
 
     pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !Snapshot {
-        // Recover the 32-byte tree hash from the stream
+        // Recover the 32-byte snapshot root hash from the stream
         const tree_bytes = try reader.take(32);
         var tree: Hash = undefined;
         @memcpy(&tree, tree_bytes);

@@ -2,7 +2,6 @@ const std = @import("std");
 const hash_mod = @import("hash.zig");
 const object = @import("object.zig");
 const index_mod = @import("index.zig");
-const tree = @import("tree.zig");
 
 const Hash = hash_mod.Hash;
 const Store = object.Store;
@@ -88,18 +87,20 @@ pub fn write(
     return store.put(.commit, buf.written());
 }
 
-/// High-level helper: build the root tree from the index, then write the
-/// commit.  Returns the commit hash.
+/// High-level helper: write a commit whose snapshot is the persisted index root.
+/// Callers must save the index first so `index.index_root` names durable pages.
 pub fn buildAndWrite(
     alloc: std.mem.Allocator,
     store: *const Store,
     index: *const index_mod.Index,
     info: CommitInfo,
 ) !Hash {
-    const tree_hash = try tree.writeFromIndex(alloc, store, index.entries.items);
+    if (std.mem.eql(u8, &index.index_root, &hash_mod.ZERO_HASH) and index.entries.items.len != 0) {
+        return error.UnsavedIndexRoot;
+    }
 
     var commit_info = info;
-    commit_info.snapshot.tree = tree_hash;
+    commit_info.snapshot.tree = index.index_root;
 
     return write(alloc, store, commit_info);
 }
