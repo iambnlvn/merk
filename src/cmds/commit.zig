@@ -298,15 +298,14 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     const maybe_head = try refs.resolveHead(inv.alloc, nodus_dir);
     const parents: []const nodus.hash.Hash = if (maybe_head) |h| &.{h} else &.{};
 
-    // Build the tree up front so we can detect a no-op commit (staged tree
-    // identical to HEAD's tree) before writing a commit object at all
-    const tree_hash = try nodus.tree.writeFromIndex(inv.alloc, &store, index.entries.items);
+    try index.save();
+    const index_root = index.index_root;
 
     if (maybe_head) |head_hash| {
         var parent_c = try commit_mod.read(inv.alloc, &store, head_hash);
         defer parent_c.deinit(inv.alloc);
 
-        if (std.mem.eql(u8, &parent_c.snapshot.tree, &tree_hash)) {
+        if (std.mem.eql(u8, &parent_c.snapshot.tree, &index_root)) {
             std.debug.print(
                 "error: nothing to commit — staged tree is identical to HEAD (stage changes with `nodus add` first)\n",
                 .{},
@@ -320,7 +319,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         &store,
         .{
             .snapshot = .{
-                .tree = tree_hash,
+                .tree = index_root,
                 .parents = parents,
             },
             .identity = .{
