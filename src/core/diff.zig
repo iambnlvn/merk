@@ -31,6 +31,7 @@ const object_mod = @import("object.zig");
 const tree_mod = @import("tree.zig");
 const hash_mod = @import("hash.zig");
 const commit_mod = @import("commit.zig");
+const index_mod = @import("index.zig");
 
 /// Diff the tree of `new_commit` against the tree of `old_commit`
 /// Pass `null` for `old_commit` to diff against an empty tree, e.g. for
@@ -57,6 +58,31 @@ pub fn diffCommits(
     return diffTreeHashes(alloc, store, old_tree, new_c.snapshot.tree, algo);
 }
 
+/// Diff commits whose snapshots point at index roots. If either root is not
+/// present in the index page store, falls back to the legacy tree-object diff.
+pub fn diffCommitsFromIndexRoots(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    page_store: *const index_mod.PageStore,
+    old_commit: ?hash_mod.Hash,
+    new_commit: hash_mod.Hash,
+    algo: Algorithm,
+) !CommitDiff {
+    var new_c = try commit_mod.read(alloc, store, new_commit);
+    defer new_c.deinit(alloc);
+
+    var old_root: ?hash_mod.Hash = null;
+    var old_c: ?commit_mod.Commit = null;
+    defer if (old_c) |*c| c.deinit(alloc);
+
+    if (old_commit) |oc| {
+        old_c = try commit_mod.read(alloc, store, oc);
+        old_root = old_c.?.snapshot.tree;
+    }
+
+    return diffSnapshotRoots(alloc, store, page_store, old_root, new_c.snapshot.tree, algo);
+}
+
 /// Diff `new_commit` against its first parent. If `new_commit` has no
 /// parents (a root commit), diffs against an empty tree
 pub fn diffCommitAgainstParent(
@@ -75,6 +101,27 @@ pub fn diffCommitAgainstParent(
     } else null;
 
     return diffTreeHashes(alloc, store, old_tree, new_c.snapshot.tree, algo);
+}
+
+/// Diff `new_commit` against its first parent using index-root Merkle pruning.
+/// Falls back to legacy tree-object diff when comparing old commits.
+pub fn diffCommitAgainstParentFromIndexRoot(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    page_store: *const index_mod.PageStore,
+    new_commit: hash_mod.Hash,
+    algo: Algorithm,
+) !CommitDiff {
+    var new_c = try commit_mod.read(alloc, store, new_commit);
+    defer new_c.deinit(alloc);
+
+    const old_root: ?hash_mod.Hash = if (new_c.snapshot.parents.len > 0) blk: {
+        var parent_c = try commit_mod.read(alloc, store, new_c.snapshot.parents[0]);
+        defer parent_c.deinit(alloc);
+        break :blk parent_c.snapshot.tree;
+    } else null;
+
+    return diffSnapshotRoots(alloc, store, page_store, old_root, new_c.snapshot.tree, algo);
 }
 
 /// Diff two trees directly. `old_tree == null` means "empty tree" (nothing
@@ -120,6 +167,81 @@ pub fn diffTreeHashes(
     var cd = try diffCommitWith(alloc, old_snaps, new_snaps, algo);
     cd.blobs = try blobs.toOwnedSlice(alloc);
     return cd;
+}
+
+/// Diff two persisted index roots. Equal page hashes prune whole subtrees
+/// without reading entries or blobs under that subtree.
+pub fn diffIndexRoots(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    page_store: *const index_mod.PageStore,
+    old_root: ?hash_mod.Hash,
+    new_root: hash_mod.Hash,
+    algo: Algorithm,
+) !CommitDiff {
+    var file_diffs: std.ArrayList(FileDiff) = .empty;
+    var blobs: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (file_diffs.items) |*f| f.deinit(alloc);
+        file_diffs.deinit(alloc);
+        for (blobs.items) |b| alloc.free(b);
+        blobs.deinit(alloc);
+    }
+
+    const normalized_old = if (old_root) |root| root else hash_mod.ZERO_HASH;
+    try diffIndexRecursive(
+        alloc,
+        store,
+        page_store,
+        maybeNonZero(normalized_old),
+        maybeNonZero(new_root),
+        algo,
+        &file_diffs,
+        &blobs,
+    );
+
+    const files = try file_diffs.toOwnedSlice(alloc);
+    errdefer {
+        for (files) |*f| f.deinit(alloc);
+        alloc.free(files);
+    }
+
+    return .{
+        .files = files,
+        .line_diff_hash = .{0} ** 32,
+        .word_diff_hash = .{0} ** 32,
+        .blobs = try blobs.toOwnedSlice(alloc),
+    };
+}
+
+fn diffSnapshotRoots(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    page_store: *const index_mod.PageStore,
+    old_root: ?hash_mod.Hash,
+    new_root: hash_mod.Hash,
+    algo: Algorithm,
+) !CommitDiff {
+    const old_is_index = if (old_root) |root| rootLooksLikeIndexRoot(page_store, root) else true;
+    const new_is_index = rootLooksLikeIndexRoot(page_store, new_root);
+
+    if (old_is_index and new_is_index) {
+        return diffIndexRoots(alloc, store, page_store, old_root, new_root, algo);
+    }
+    if (!old_is_index and !new_is_index) {
+        return diffTreeHashes(alloc, store, old_root, new_root, algo);
+    }
+
+    return diffMixedSnapshotRoots(
+        alloc,
+        store,
+        page_store,
+        old_root,
+        old_is_index,
+        new_root,
+        new_is_index,
+        algo,
+    );
 }
 
 pub const LineDelta = struct {
@@ -380,6 +502,381 @@ pub fn diffCommitWith(
         .line_diff_hash = .{0} ** 32,
         .word_diff_hash = .{0} ** 32,
     };
+}
+
+fn maybeNonZero(hash: hash_mod.Hash) ?hash_mod.Hash {
+    if (std.mem.eql(u8, &hash, &hash_mod.ZERO_HASH)) return null;
+    return hash;
+}
+
+fn rootLooksLikeIndexRoot(page_store: *const index_mod.PageStore, root: hash_mod.Hash) bool {
+    if (std.mem.eql(u8, &root, &hash_mod.ZERO_HASH)) return true;
+    _ = page_store.getBytes(root) catch return false;
+    return true;
+}
+
+fn diffMixedSnapshotRoots(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    page_store: *const index_mod.PageStore,
+    old_root: ?hash_mod.Hash,
+    old_is_index: bool,
+    new_root: hash_mod.Hash,
+    new_is_index: bool,
+    algo: Algorithm,
+) !CommitDiff {
+    var blobs: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (blobs.items) |blob| alloc.free(blob);
+        blobs.deinit(alloc);
+    }
+
+    var old_index_entries: std.ArrayList(index_mod.LeafEntry) = .empty;
+    defer freeLeafEntries(alloc, &old_index_entries);
+    var new_index_entries: std.ArrayList(index_mod.LeafEntry) = .empty;
+    defer freeLeafEntries(alloc, &new_index_entries);
+
+    var old_flat: ?[]tree_mod.FlatEntry = null;
+    defer if (old_flat) |entries| tree_mod.freeFlatEntries(alloc, entries);
+    var new_flat: ?[]tree_mod.FlatEntry = null;
+    defer if (new_flat) |entries| tree_mod.freeFlatEntries(alloc, entries);
+
+    const old_files = try rootToFileSnapshots(
+        alloc,
+        store,
+        page_store,
+        old_root,
+        old_is_index,
+        &old_index_entries,
+        &old_flat,
+        &blobs,
+    );
+    defer alloc.free(old_files);
+
+    const new_files = try rootToFileSnapshots(
+        alloc,
+        store,
+        page_store,
+        new_root,
+        new_is_index,
+        &new_index_entries,
+        &new_flat,
+        &blobs,
+    );
+    defer alloc.free(new_files);
+
+    var cd = try diffCommitWith(alloc, old_files, new_files, algo);
+    cd.blobs = try blobs.toOwnedSlice(alloc);
+    return cd;
+}
+
+fn rootToFileSnapshots(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    page_store: *const index_mod.PageStore,
+    root: ?hash_mod.Hash,
+    is_index: bool,
+    index_entries: *std.ArrayList(index_mod.LeafEntry),
+    flat_entries: *?[]tree_mod.FlatEntry,
+    blobs: *std.ArrayList([]u8),
+) ![]FileSnapshot {
+    const actual_root = if (root) |value| value else return alloc.alloc(FileSnapshot, 0);
+    if (std.mem.eql(u8, &actual_root, &hash_mod.ZERO_HASH)) return alloc.alloc(FileSnapshot, 0);
+
+    if (is_index) {
+        try collectSubtreeEntries(alloc, page_store, actual_root, index_entries);
+        std.mem.sort(index_mod.LeafEntry, index_entries.items, {}, leafEntryLessThan);
+
+        const files = try alloc.alloc(FileSnapshot, index_entries.items.len);
+        for (index_entries.items, 0..) |entry, i| {
+            const obj = try store.get(entry.blob_hash);
+            try blobs.append(alloc, obj.payload);
+            files[i] = .{ .path = entry.path, .content = obj.payload };
+        }
+        return files;
+    }
+
+    const flat = try tree_mod.readToFlatEntries(alloc, store, actual_root);
+    flat_entries.* = flat;
+
+    const files = try alloc.alloc(FileSnapshot, flat.len);
+    for (flat, 0..) |entry, i| {
+        const obj = try store.get(entry.hash);
+        try blobs.append(alloc, obj.payload);
+        files[i] = .{ .path = entry.path, .content = obj.payload };
+    }
+    return files;
+}
+
+fn diffIndexRecursive(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    page_store: *const index_mod.PageStore,
+    old_hash: ?hash_mod.Hash,
+    new_hash: ?hash_mod.Hash,
+    algo: Algorithm,
+    out: *std.ArrayList(FileDiff),
+    blobs: *std.ArrayList([]u8),
+) anyerror!void {
+    if (old_hash != null and new_hash != null and std.mem.eql(u8, &old_hash.?, &new_hash.?)) return;
+
+    if (old_hash == null and new_hash == null) return;
+    if (old_hash == null) {
+        try appendAddedSubtree(alloc, store, page_store, new_hash.?, algo, out, blobs);
+        return;
+    }
+    if (new_hash == null) {
+        try appendDeletedSubtree(alloc, store, page_store, old_hash.?, algo, out, blobs);
+        return;
+    }
+
+    var old_page = try page_store.get(old_hash.?);
+    defer old_page.deinit(alloc);
+    var new_page = try page_store.get(new_hash.?);
+    defer new_page.deinit(alloc);
+
+    switch (old_page) {
+        .leaf => |old_entries| switch (new_page) {
+            .leaf => |new_entries| try diffLeafEntries(alloc, store, old_entries.items, new_entries.items, algo, out, blobs),
+            .internal => try diffCollectedSubtrees(alloc, store, page_store, old_hash.?, new_hash.?, algo, out, blobs),
+        },
+        .internal => |old_children| switch (new_page) {
+            .leaf => try diffCollectedSubtrees(alloc, store, page_store, old_hash.?, new_hash.?, algo, out, blobs),
+            .internal => |new_children| try diffInternalChildren(
+                alloc,
+                store,
+                page_store,
+                old_children.items,
+                new_children.items,
+                algo,
+                out,
+                blobs,
+            ),
+        },
+    }
+}
+
+fn diffInternalChildren(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    page_store: *const index_mod.PageStore,
+    old_children: []const index_mod.ChildRef,
+    new_children: []const index_mod.ChildRef,
+    algo: Algorithm,
+    out: *std.ArrayList(FileDiff),
+    blobs: *std.ArrayList([]u8),
+) !void {
+    var old_i: usize = 0;
+    var new_i: usize = 0;
+    while (old_i < old_children.len or new_i < new_children.len) {
+        const cmp: std.math.Order = blk: {
+            if (old_i >= old_children.len) break :blk .gt;
+            if (new_i >= new_children.len) break :blk .lt;
+            break :blk comparePathKey(old_children[old_i].separator, new_children[new_i].separator);
+        };
+
+        if (cmp == .eq) {
+            try diffIndexRecursive(
+                alloc,
+                store,
+                page_store,
+                old_children[old_i].page_hash,
+                new_children[new_i].page_hash,
+                algo,
+                out,
+                blobs,
+            );
+            old_i += 1;
+            new_i += 1;
+        } else if (cmp == .lt) {
+            try appendDeletedSubtree(alloc, store, page_store, old_children[old_i].page_hash, algo, out, blobs);
+            old_i += 1;
+        } else {
+            try appendAddedSubtree(alloc, store, page_store, new_children[new_i].page_hash, algo, out, blobs);
+            new_i += 1;
+        }
+    }
+}
+
+fn diffCollectedSubtrees(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    page_store: *const index_mod.PageStore,
+    old_hash: hash_mod.Hash,
+    new_hash: hash_mod.Hash,
+    algo: Algorithm,
+    out: *std.ArrayList(FileDiff),
+    blobs: *std.ArrayList([]u8),
+) !void {
+    var old_entries: std.ArrayList(index_mod.LeafEntry) = .empty;
+    defer freeLeafEntries(alloc, &old_entries);
+    var new_entries: std.ArrayList(index_mod.LeafEntry) = .empty;
+    defer freeLeafEntries(alloc, &new_entries);
+
+    try collectSubtreeEntries(alloc, page_store, old_hash, &old_entries);
+    try collectSubtreeEntries(alloc, page_store, new_hash, &new_entries);
+    std.mem.sort(index_mod.LeafEntry, old_entries.items, {}, leafEntryLessThan);
+    std.mem.sort(index_mod.LeafEntry, new_entries.items, {}, leafEntryLessThan);
+
+    try diffLeafEntries(alloc, store, old_entries.items, new_entries.items, algo, out, blobs);
+}
+
+fn appendAddedSubtree(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    page_store: *const index_mod.PageStore,
+    page_hash: hash_mod.Hash,
+    algo: Algorithm,
+    out: *std.ArrayList(FileDiff),
+    blobs: *std.ArrayList([]u8),
+) !void {
+    var entries: std.ArrayList(index_mod.LeafEntry) = .empty;
+    defer freeLeafEntries(alloc, &entries);
+    try collectSubtreeEntries(alloc, page_store, page_hash, &entries);
+    std.mem.sort(index_mod.LeafEntry, entries.items, {}, leafEntryLessThan);
+
+    for (entries.items) |entry| {
+        try appendFileDiffFromHashes(alloc, store, entry.path, null, entry.blob_hash, algo, out, blobs);
+    }
+}
+
+fn appendDeletedSubtree(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    page_store: *const index_mod.PageStore,
+    page_hash: hash_mod.Hash,
+    algo: Algorithm,
+    out: *std.ArrayList(FileDiff),
+    blobs: *std.ArrayList([]u8),
+) !void {
+    var entries: std.ArrayList(index_mod.LeafEntry) = .empty;
+    defer freeLeafEntries(alloc, &entries);
+    try collectSubtreeEntries(alloc, page_store, page_hash, &entries);
+    std.mem.sort(index_mod.LeafEntry, entries.items, {}, leafEntryLessThan);
+
+    for (entries.items) |entry| {
+        try appendFileDiffFromHashes(alloc, store, entry.path, entry.blob_hash, null, algo, out, blobs);
+    }
+}
+
+fn collectSubtreeEntries(
+    alloc: std.mem.Allocator,
+    page_store: *const index_mod.PageStore,
+    page_hash: hash_mod.Hash,
+    out: *std.ArrayList(index_mod.LeafEntry),
+) anyerror!void {
+    var page = try page_store.get(page_hash);
+    defer page.deinit(alloc);
+
+    switch (page) {
+        .leaf => |entries| {
+            for (entries.items) |entry| {
+                try out.append(alloc, .{
+                    .key = entry.key,
+                    .path = try alloc.dupe(u8, entry.path),
+                    .blob_hash = entry.blob_hash,
+                    .size = entry.size,
+                    .mode = entry.mode,
+                    .mtime = entry.mtime,
+                });
+            }
+        },
+        .internal => |children| {
+            for (children.items) |child| {
+                try collectSubtreeEntries(alloc, page_store, child.page_hash, out);
+            }
+        },
+    }
+}
+
+fn diffLeafEntries(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    old_entries: []const index_mod.LeafEntry,
+    new_entries: []const index_mod.LeafEntry,
+    algo: Algorithm,
+    out: *std.ArrayList(FileDiff),
+    blobs: *std.ArrayList([]u8),
+) !void {
+    var old_i: usize = 0;
+    var new_i: usize = 0;
+    while (old_i < old_entries.len or new_i < new_entries.len) {
+        const cmp: std.math.Order = blk: {
+            if (old_i >= old_entries.len) break :blk .gt;
+            if (new_i >= new_entries.len) break :blk .lt;
+            break :blk compareLeafEntry(old_entries[old_i], new_entries[new_i]);
+        };
+
+        if (cmp == .eq) {
+            if (!std.mem.eql(u8, &old_entries[old_i].blob_hash, &new_entries[new_i].blob_hash)) {
+                try appendFileDiffFromHashes(
+                    alloc,
+                    store,
+                    new_entries[new_i].path,
+                    old_entries[old_i].blob_hash,
+                    new_entries[new_i].blob_hash,
+                    algo,
+                    out,
+                    blobs,
+                );
+            }
+            old_i += 1;
+            new_i += 1;
+        } else if (cmp == .lt) {
+            try appendFileDiffFromHashes(alloc, store, old_entries[old_i].path, old_entries[old_i].blob_hash, null, algo, out, blobs);
+            old_i += 1;
+        } else {
+            try appendFileDiffFromHashes(alloc, store, new_entries[new_i].path, null, new_entries[new_i].blob_hash, algo, out, blobs);
+            new_i += 1;
+        }
+    }
+}
+
+fn appendFileDiffFromHashes(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    path: []const u8,
+    old_hash: ?hash_mod.Hash,
+    new_hash: ?hash_mod.Hash,
+    algo: Algorithm,
+    out: *std.ArrayList(FileDiff),
+    blobs: *std.ArrayList([]u8),
+) !void {
+    const old_src = if (old_hash) |hash| blk: {
+        const obj = try store.get(hash);
+        try blobs.append(alloc, obj.payload);
+        break :blk obj.payload;
+    } else "";
+
+    const new_src = if (new_hash) |hash| blk: {
+        const obj = try store.get(hash);
+        try blobs.append(alloc, obj.payload);
+        break :blk obj.payload;
+    } else "";
+
+    if (std.mem.eql(u8, old_src, new_src)) return;
+    try out.append(alloc, try diffFileWith(alloc, path, old_src, new_src, algo));
+}
+
+fn freeLeafEntries(alloc: std.mem.Allocator, entries: *std.ArrayList(index_mod.LeafEntry)) void {
+    for (entries.items) |*entry| alloc.free(entry.path);
+    entries.deinit(alloc);
+}
+
+fn leafEntryLessThan(_: void, lhs: index_mod.LeafEntry, rhs: index_mod.LeafEntry) bool {
+    return compareLeafEntry(lhs, rhs) == .lt;
+}
+
+fn compareLeafEntry(lhs: index_mod.LeafEntry, rhs: index_mod.LeafEntry) std.math.Order {
+    const key_order = comparePathKey(lhs.key, rhs.key);
+    if (key_order != .eq) return key_order;
+    return std.mem.order(u8, lhs.path, rhs.path);
+}
+
+fn comparePathKey(lhs: index_mod.PathKey, rhs: index_mod.PathKey) std.math.Order {
+    if (lhs < rhs) return .lt;
+    if (lhs > rhs) return .gt;
+    return .eq;
 }
 
 fn runLineDiff(
@@ -1510,6 +2007,93 @@ test "summarize aggregates across files" {
     try std.testing.expectEqual(@as(u32, 2), s.files_changed);
     try std.testing.expectEqual(@as(u32, 2), s.lines_added);
     try std.testing.expectEqual(@as(u32, 1), s.lines_removed);
+}
+
+test "diffIndexRoots reports modified files from Merkle pages" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var objects_dir = try tmp_dir.dir.makeOpenPath(".nodus/objects", .{});
+    defer objects_dir.close();
+    var store = object_mod.Store{ .dir = objects_dir, .alloc = alloc };
+
+    const old_blob = try store.put(.blob, "old\n");
+    const new_blob = try store.put(.blob, "new\n");
+
+    const nodus_dir = try tmp_dir.dir.openDir(".nodus", .{});
+    var index = index_mod.Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
+    defer index.deinit();
+
+    try index.entries.append(alloc, .{
+        .path = try alloc.dupe(u8, "src/main.zig"),
+        .blob_hash = old_blob,
+        .size = 4,
+        .mode = 0o100644,
+        .mtime = 1,
+    });
+    try index.save();
+    const old_root = index.index_root;
+
+    index.entries.items[0].blob_hash = new_blob;
+    index.entries.items[0].mtime = 2;
+    try index.save();
+    const new_root = index.index_root;
+
+    var page_store = index_mod.PageStore{ .alloc = alloc, .dir = index.dir };
+    var cd = try diffIndexRoots(alloc, &store, &page_store, old_root, new_root, .histogram);
+    defer cd.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), cd.files.len);
+    try std.testing.expectEqualStrings("src/main.zig", cd.files[0].path);
+    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_added);
+    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_removed);
+}
+
+test "diffSnapshotRoots compares legacy tree root to Merkle index root" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var objects_dir = try tmp_dir.dir.makeOpenPath(".nodus/objects", .{});
+    defer objects_dir.close();
+    var store = object_mod.Store{ .dir = objects_dir, .alloc = alloc };
+
+    const old_blob = try store.put(.blob, "old\n");
+    const new_blob = try store.put(.blob, "new\n");
+
+    const old_entries = [_]index_mod.Entry{
+        .{
+            .path = @constCast("src/main.zig"),
+            .blob_hash = old_blob,
+            .size = 4,
+            .mode = 0o100644,
+            .mtime = 1,
+        },
+    };
+    const legacy_tree_root = try tree_mod.writeFromIndex(alloc, &store, &old_entries);
+
+    const nodus_dir = try tmp_dir.dir.openDir(".nodus", .{});
+    var index = index_mod.Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
+    defer index.deinit();
+
+    try index.entries.append(alloc, .{
+        .path = try alloc.dupe(u8, "src/main.zig"),
+        .blob_hash = new_blob,
+        .size = 4,
+        .mode = 0o100644,
+        .mtime = 2,
+    });
+    try index.save();
+
+    var page_store = index_mod.PageStore{ .alloc = alloc, .dir = index.dir };
+    var cd = try diffSnapshotRoots(alloc, &store, &page_store, legacy_tree_root, index.index_root, .histogram);
+    defer cd.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), cd.files.len);
+    try std.testing.expectEqualStrings("src/main.zig", cd.files[0].path);
+    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_added);
+    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_removed);
 }
 
 test "ChangeFilter parse comma list" {
