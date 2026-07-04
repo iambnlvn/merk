@@ -8,6 +8,7 @@ const diff = @import("../cmds/diff.zig");
 const writeTree = @import("../cmds/write-tree.zig");
 const commit = @import("../cmds/commit.zig");
 const show = @import("../cmds/show.zig");
+const log = @import("../cmds/log.zig");
 /// To add a new command, import its module and add its `.command` constant
 pub const commands: []const Command = &[_]Command{
     init.command,
@@ -17,6 +18,7 @@ pub const commands: []const Command = &[_]Command{
     writeTree.command,
     commit.command,
     show.command,
+    log.command,
 };
 
 /// Returns a pointer into the `commands` slice
