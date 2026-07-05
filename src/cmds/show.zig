@@ -14,6 +14,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
     var nodus_dir = try std.fs.cwd().openDir(".nodus", .{});
     defer nodus_dir.close();
+    var page_store = nodus.index.PageStore{ .alloc = inv.alloc, .dir = nodus_dir };
 
     var cd: diff.CommitDiff = switch (inv.positional.items.len) {
         0 => blk: {
@@ -21,16 +22,16 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
                 std.debug.print("error: no commits yet\n", .{});
                 return error.NoCommits;
             };
-            break :blk try diff.diffCommitAgainstParent(inv.alloc, &store, head, .histogram);
+            break :blk try diff.diffCommitAgainstParentFromIndexRoot(inv.alloc, &store, &page_store, head, .histogram);
         },
         1 => blk: {
             const target = try nodus.hash.fromHex(inv.positional.items[0]);
-            break :blk try diff.diffCommitAgainstParent(inv.alloc, &store, target, .histogram);
+            break :blk try diff.diffCommitAgainstParentFromIndexRoot(inv.alloc, &store, &page_store, target, .histogram);
         },
         else => blk: {
             const old_hash = try nodus.hash.fromHex(inv.positional.items[0]);
             const new_hash = try nodus.hash.fromHex(inv.positional.items[1]);
-            break :blk try diff.diffCommits(inv.alloc, &store, old_hash, new_hash, .histogram);
+            break :blk try diff.diffCommitsFromIndexRoots(inv.alloc, &store, &page_store, old_hash, new_hash, .histogram);
         },
     };
     defer cd.deinit(inv.alloc);
