@@ -216,6 +216,10 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     var store = try nodus.object.Store.init(inv.alloc, ctx.repo_root);
     defer store.deinit();
 
+    var nodus_dir = try std.fs.cwd().openDir(".nodus", .{});
+    defer nodus_dir.close();
+    var page_store = nodus.index.PageStore{ .alloc = inv.alloc, .dir = nodus_dir };
+
     // Resolve rev strings (full or short hashes) to actual Hash objects
     var revs: std.ArrayListUnmanaged(nodus.hash.Hash) = .empty;
     defer revs.deinit(inv.alloc);
@@ -243,9 +247,9 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
     if (revs.items.len > 0) {
         var cd: diff.CommitDiff = if (revs.items.len == 1)
-            try diff.diffCommitAgainstParent(inv.alloc, &store, revs.items[0], config.algorithm)
+            try diff.diffCommitAgainstParentFromIndexRoot(inv.alloc, &store, &page_store, revs.items[0], config.algorithm)
         else
-            try diff.diffCommits(inv.alloc, &store, revs.items[0], revs.items[1], config.algorithm);
+            try diff.diffCommitsFromIndexRoots(inv.alloc, &store, &page_store, revs.items[0], revs.items[1], config.algorithm);
         defer cd.deinit(inv.alloc);
 
         var visible: std.ArrayListUnmanaged(*const diff.FileDiff) = .empty;
