@@ -8,20 +8,12 @@ const Invocation = cli.Invocation;
 const Context = cli.Context;
 
 pub fn run(ctx: Context, inv: *Invocation) !void {
-    var store = try nodus.object.Store.init(inv.alloc, ctx.repo_root);
-    defer store.deinit();
-
     var index = try nodus.index.Index.init(inv.alloc, ctx.repo_root);
     defer index.deinit();
     try index.load();
+    try index.save();
 
-    const tree_hash = try nodus.tree.writeFromIndex(
-        inv.alloc,
-        &store,
-        index.entries.items,
-    );
-
-    const hex = try nodus.hash.toHex(inv.alloc, tree_hash);
+    const hex = try nodus.hash.toHex(inv.alloc, index.index_root);
     defer inv.alloc.free(hex);
 
     std.debug.print("{s}\n", .{hex});
@@ -29,6 +21,6 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
 pub const command = Command{
     .name = "write-tree",
-    .description = "Write the current index as a tree object.",
+    .description = "Write the current index as a Merkle root.",
     .run = run,
 };
