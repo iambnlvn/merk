@@ -13,6 +13,17 @@ pub const Hash = hash_mod.Hash;
 ///
 const head_ref_prefix = "ref: refs/heads/";
 
+fn validateBranchName(branch: []const u8) !void {
+    if (branch.len == 0) return error.InvalidBranchName;
+    if (std.fs.path.isAbsolute(branch)) return error.InvalidBranchName;
+
+    var parts = std.mem.splitScalar(u8, branch, '/');
+    while (parts.next()) |part| {
+        if (part.len == 0) return error.InvalidBranchName;
+        if (std.mem.eql(u8, part, "..")) return error.InvalidBranchName;
+    }
+}
+
 fn writeFile(
     alloc: std.mem.Allocator,
     dir: std.fs.Dir,
@@ -128,6 +139,7 @@ pub fn writeHeadRef(
     nodus_dir: std.fs.Dir,
     branch: []const u8,
 ) !void {
+    try validateBranchName(branch);
     var buf: [256]u8 = undefined;
 
     const contents =
@@ -173,6 +185,7 @@ pub fn updateBranch(
     branch: []const u8,
     hash: Hash,
 ) !void {
+    try validateBranchName(branch);
     var path_buf: [256]u8 = undefined;
 
     const path =
@@ -202,6 +215,7 @@ pub fn readBranch(
     nodus_dir: std.fs.Dir,
     branch: []const u8,
 ) !?Hash {
+    try validateBranchName(branch);
     var path_buf: [256]u8 = undefined;
 
     const path =
@@ -284,6 +298,7 @@ pub fn updateRef(
     branch: []const u8,
     commit_hash: Hash,
 ) !void {
+    try validateBranchName(branch);
     const hex = try hash_mod.toHex(alloc, commit_hash);
     defer alloc.free(hex);
 
