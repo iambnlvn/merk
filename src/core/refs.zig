@@ -14,25 +14,42 @@ pub const Hash = hash_mod.Hash;
 const head_ref_prefix = "ref: refs/heads/";
 
 fn writeFile(
+    alloc: std.mem.Allocator,
     dir: std.fs.Dir,
     path: []const u8,
     contents: []const u8,
 ) !void {
     const parent = std.fs.path.dirname(path);
+    if (parent) |parent_path| try dir.makePath(parent_path);
 
-    if (parent) |parent_path| {
-        try dir.makePath(parent_path);
+    var rand_buf: [8]u8 = undefined;
+    std.crypto.random.bytes(&rand_buf);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp.{x}", .{ path, rand_buf });
+    defer alloc.free(tmp_path);
+
+    const file = try dir.createFile(tmp_path, .{ .truncate = true });
+    var file_closed = false;
+    defer if (!file_closed) file.close();
+    errdefer {
+        if (!file_closed) {
+            file.close();
+            file_closed = true;
+        }
+        dir.deleteFile(tmp_path) catch {};
     }
 
-    var file = try dir.createFile(
-        path,
-        .{
-            .truncate = true,
-        },
-    );
-    defer file.close();
-
     try file.writeAll(contents);
+    try file.sync();
+    file.close();
+    file_closed = true;
+
+    dir.rename(tmp_path, path) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            try dir.deleteFile(path);
+            try dir.rename(tmp_path, path);
+        },
+        else => return err,
+    };
 }
 
 /// Resolve HEAD to a commit hash.
@@ -107,6 +124,7 @@ pub fn resolveHead(
 ///     ref: refs/heads/main
 ///
 pub fn writeHeadRef(
+    alloc: std.mem.Allocator,
     nodus_dir: std.fs.Dir,
     branch: []const u8,
 ) !void {
@@ -120,6 +138,7 @@ pub fn writeHeadRef(
         );
 
     try writeFile(
+        alloc,
         nodus_dir,
         "HEAD",
         contents,
@@ -137,6 +156,7 @@ pub fn writeDetachedHead(
     defer alloc.free(hex);
 
     try writeFile(
+        alloc,
         nodus_dir,
         "HEAD",
         hex,
@@ -166,6 +186,7 @@ pub fn updateBranch(
     defer alloc.free(hex);
 
     try writeFile(
+        alloc,
         nodus_dir,
         path,
         hex,
@@ -272,7 +293,7 @@ pub fn updateRef(
     const ref_path = try std.fmt.allocPrint(alloc, "refs/heads/{s}", .{branch});
     defer alloc.free(ref_path);
 
-    try writeFile(nodus_dir, ref_path, hex);
+    try writeFile(alloc, nodus_dir, ref_path, hex);
 }
 
 test "resolveHead - detached HEAD with malformed hex propagates an error" {
@@ -282,7 +303,7 @@ test "resolveHead - detached HEAD with malformed hex propagates an error" {
 
     // Not valid hex at all, should error, not silently return null.
     // (null is reserved for "ref/file legitimately absent", not "corrupt data")
-    try writeFile(tmp.dir, "HEAD", "not-a-valid-hash");
+    try writeFile(allocator, tmp.dir, "HEAD", "not-a-valid-hash");
 
     if (resolveHead(allocator, tmp.dir)) |_| {
         return error.TestExpectedError;
@@ -296,7 +317,7 @@ test "resolveHead - empty HEAD file is treated as corrupt, not missing" {
 
     // File exists but is zero-length after trimming,falls through to the
     // detached-HEAD branch and attempts to parse "" as hex
-    try writeFile(tmp.dir, "HEAD", "");
+    try writeFile(allocator, tmp.dir, "HEAD", "");
 
     if (resolveHead(allocator, tmp.dir)) |_| {
         return error.TestExpectedError;
@@ -308,8 +329,8 @@ test "resolveHead - symbolic ref with malformed hex in target file errors" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeHeadRef(tmp.dir, "main");
-    try writeFile(tmp.dir, "refs/heads/main", "zzz-not-hex-zzz");
+    try writeHeadRef(allocator, tmp.dir, "main");
+    try writeFile(allocator, tmp.dir, "refs/heads/main", "zzz-not-hex-zzz");
 
     // Distinguish "branch ref missing" (null) from "branch ref present but
     // corrupt" (error) — resolveHead must not conflate the two
@@ -325,7 +346,7 @@ test "headBranch - symbolic ref with empty branch name" {
 
     // Pathological but syntactically valid per head_ref_prefix stripping:
     // "ref: refs/heads/" with nothing after it.
-    try writeFile(tmp.dir, "HEAD", head_ref_prefix);
+    try writeFile(allocator, tmp.dir, "HEAD", head_ref_prefix);
 
     const branch = try headBranch(allocator, tmp.dir);
     try std.testing.expect(branch != null);
@@ -403,7 +424,7 @@ test "switching HEAD from detached to symbolic changes headBranch result" {
     try std.testing.expectEqual(@as(?[]u8, null), try headBranch(allocator, tmp.dir));
 
     // "checkout main" — re-attach HEAD to a branch
-    try writeHeadRef(tmp.dir, "main");
+    try writeHeadRef(allocator, tmp.dir, "main");
     const branch = try headBranch(allocator, tmp.dir);
     try std.testing.expect(branch != null);
     defer allocator.free(branch.?);
@@ -420,10 +441,10 @@ test "switching branches via writeHeadRef changes what resolveHead follows" {
     var hash_dev: Hash = undefined;
     @memset(std.mem.asBytes(&hash_dev), 0x77);
 
-    try writeHeadRef(tmp.dir, "main");
+    try writeHeadRef(allocator, tmp.dir, "main");
     try updateRef(allocator, tmp.dir, "main", hash_main);
 
-    try writeHeadRef(tmp.dir, "develop");
+    try writeHeadRef(allocator, tmp.dir, "develop");
     try updateRef(allocator, tmp.dir, "develop", hash_dev);
 
     // HEAD is now on "develop" — resolveHead must follow the 'current'
@@ -434,7 +455,7 @@ test "switching branches via writeHeadRef changes what resolveHead follows" {
     try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&hash_main), std.mem.asBytes(&resolved.?)));
 
     // Switch back,  main's hash must still be intact and independently reachable
-    try writeHeadRef(tmp.dir, "main");
+    try writeHeadRef(allocator, tmp.dir, "main");
     const resolved_main = try resolveHead(allocator, tmp.dir);
     try std.testing.expect(resolved_main != null);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&hash_main), std.mem.asBytes(&resolved_main.?));
@@ -457,7 +478,7 @@ test "updateRef handles deeply nested branch names with multiple path segments" 
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mock_hash), std.mem.asBytes(&read_hash.?));
 
     // And it must be resolvable via the symbolic-HEAD path too.
-    try writeHeadRef(tmp.dir, "release/2026/q3-hardening");
+    try writeHeadRef(allocator, tmp.dir, "release/2026/q3-hardening");
     const resolved = try resolveHead(allocator, tmp.dir);
     try std.testing.expect(resolved != null);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mock_hash), std.mem.asBytes(&resolved.?));
@@ -513,7 +534,7 @@ test "writeHeadRef followed by writeDetachedHead correctly overwrites symbolic s
     var mock_hash: Hash = undefined;
     @memset(std.mem.asBytes(&mock_hash), 0x12);
 
-    try writeHeadRef(tmp.dir, "main");
+    try writeHeadRef(allocator, tmp.dir, "main");
 
     const branch = try headBranch(allocator, tmp.dir);
     try std.testing.expect(branch != null);
