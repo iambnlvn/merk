@@ -1,102 +1,52 @@
 const std = @import("std");
-const builtin = @import("builtin");
+const wire = @import("wire.zig");
+const MockReader = @import("testing.zig").MockReader;
 const Hash = [32]u8;
 
-const MockReader = @import("testing.zig").MockReader;
-pub const SnapshotError = error{
-    TooManyParents,
-};
-
+pub const SnapshotError = error{TooManyParents};
 pub const MAX_PARENTS: u8 = 255;
 
 pub const SnapshotInfo = struct {
-    /// Snapshot root describing repo state
-    /// New commits store a Merkle index root here;
-    /// NOTE: legacy commits may store a tree object hash
     tree: Hash,
-
-    /// Parent commit hashes.
-    ///
-    /// Empty slice indicates an initial commit.
-    /// Additional parents represent merge ancestry.
     parents: []const Hash,
 
     pub fn validate(self: SnapshotInfo) SnapshotError!void {
-        if (self.parents.len > MAX_PARENTS)
-            return error.TooManyParents;
+        if (self.parents.len > MAX_PARENTS) return error.TooManyParents;
     }
 
     pub fn serialize(self: SnapshotInfo, writer: anytype) !void {
         try self.validate();
-
-        // Write the 32-byte snapshot root hash
         try writer.writeAll(&self.tree);
-
-        // Write the parent count as a single byte
-        try writer.writeByte(@intCast(self.parents.len));
-
-        // Write each 32-byte parent hash consecutively
-        for (self.parents) |parent| {
-            try writer.writeAll(&parent);
-        }
+        try wire.writeCount(u8, writer, self.parents.len);
+        for (self.parents) |parent| try writer.writeAll(&parent);
     }
 };
 
 pub const Snapshot = struct {
-    /// Snapshot root describing repo state.
-    /// New commits store a Merkle index root
     tree: Hash,
-
-    /// Owned parent commit hashes.
     parents: []Hash,
 
     pub fn initDupe(alloc: std.mem.Allocator, info: SnapshotInfo) !Snapshot {
         try info.validate();
-
         const parents = try alloc.dupe(Hash, info.parents);
-        errdefer alloc.free(parents);
-
-        return .{
-            .tree = info.tree,
-            .parents = parents,
-        };
+        return .{ .tree = info.tree, .parents = parents };
     }
 
     pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !Snapshot {
-        // Recover the 32-byte snapshot root hash from the stream
         const tree_bytes = try reader.take(32);
         var tree: Hash = undefined;
         @memcpy(&tree, tree_bytes);
 
-        // Fetch parent size prefix (1 byte)
-        const parents_len = try reader.takeInt(u8, .little);
-
-        // Allocate block for array entries
+        const parents_len = try wire.readCount(u8, reader);
         const parents = try alloc.alloc(Hash, parents_len);
         errdefer alloc.free(parents);
+        for (parents) |*parent| @memcpy(parent, try reader.take(32));
 
-        // Populate parent entries out of the reader stream
-        for (parents) |*parent| {
-            const parent_bytes = try reader.take(32);
-            @memcpy(parent, parent_bytes);
-        }
-
-        const info = SnapshotInfo{
-            .tree = tree,
-            .parents = parents,
-        };
-        try info.validate();
-
-        return .{
-            .tree = tree,
-            .parents = parents,
-        };
+        try (SnapshotInfo{ .tree = tree, .parents = parents }).validate();
+        return .{ .tree = tree, .parents = parents };
     }
 
-    pub fn deinit(
-        self: *Snapshot,
-        alloc: std.mem.Allocator,
-    ) void {
+    pub fn deinit(self: *Snapshot, alloc: std.mem.Allocator) void {
         alloc.free(self.parents);
         self.* = undefined;
     }
@@ -197,4 +147,98 @@ test "Snapshot deserialization from mock input buffer stream" {
     try std.testing.expectEqualSlices(u8, &tree_hash, &snapshot.tree);
     try std.testing.expectEqual(@as(usize, 1), snapshot.parents.len);
     try std.testing.expectEqualSlices(u8, &parent_hash, &snapshot.parents[0]);
+}
+
+test "SnapshotInfo validation exactly at max bound" {
+    const dummy_hash: Hash = [_]u8{0} ** 32;
+
+    // Boundary edge: exactly 255 parents should succeed
+    const max_parents = try std.testing.allocator.alloc(Hash, MAX_PARENTS);
+    defer std.testing.allocator.free(max_parents);
+    @memset(max_parents, dummy_hash);
+
+    const boundary_info = SnapshotInfo{
+        .tree = dummy_hash,
+        .parents = max_parents,
+    };
+    try boundary_info.validate();
+}
+
+test "SnapshotInfo serialization failure on invalid size" {
+    const dummy_hash: Hash = [_]u8{0} ** 32;
+    const alloc = std.testing.allocator;
+
+    const broken_parents = try alloc.alloc(Hash, 256);
+    defer alloc.free(broken_parents);
+    @memset(broken_parents, dummy_hash);
+
+    const invalid_info = SnapshotInfo{
+        .tree = dummy_hash,
+        .parents = broken_parents,
+    };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    // Ensure serialization blocks execution and forwards the precise validation error
+    try std.testing.expectError(error.TooManyParents, invalid_info.serialize(buf.writer(alloc)));
+}
+
+test "Snapshot deserialization error on unexpected EOF/Truncation" {
+    const allocator = std.testing.allocator;
+    const tree_hash: Hash = [_]u8{0xAA} ** 32;
+
+    var truncated_payload: std.ArrayList(u8) = .empty;
+    defer truncated_payload.deinit(allocator);
+
+    var mock_reader = MockReader{ .buffer = truncated_payload.items };
+    try std.testing.expectError(error.EndOfStream, Snapshot.deserialize(allocator, &mock_reader));
+
+    try truncated_payload.appendSlice(allocator, tree_hash[0..16]);
+    mock_reader = MockReader{ .buffer = truncated_payload.items };
+    try std.testing.expectError(error.EndOfStream, Snapshot.deserialize(allocator, &mock_reader));
+
+    truncated_payload.clearRetainingCapacity();
+    try truncated_payload.appendSlice(allocator, &tree_hash);
+    try truncated_payload.append(allocator, 2); // Claims 2 parents follow, but we supply none
+    mock_reader = MockReader{ .buffer = truncated_payload.items };
+    try std.testing.expectError(error.EndOfStream, Snapshot.deserialize(allocator, &mock_reader));
+}
+
+test "Snapshot deserialization validation of upstream constraints" {
+    const allocator = std.testing.allocator;
+    const dummy_hash: Hash = [_]u8{0} ** 32;
+
+    var invalid_wire_payload: std.ArrayList(u8) = .empty;
+    defer invalid_wire_payload.deinit(allocator);
+
+    try invalid_wire_payload.appendSlice(allocator, &dummy_hash);
+
+    try invalid_wire_payload.append(allocator, 255);
+    for (0..255) |_| {
+        try invalid_wire_payload.appendSlice(allocator, &dummy_hash);
+    }
+
+    var mock_reader = MockReader{ .buffer = invalid_wire_payload.items };
+    var snapshot = try Snapshot.deserialize(allocator, &mock_reader);
+    defer snapshot.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 255), snapshot.parents.len);
+}
+
+test "Snapshot initialization errors do not leak memory" {
+    const dummy_hash: Hash = [_]u8{0} ** 32;
+    const alloc = std.testing.allocator;
+
+    const invalid_parents = try alloc.alloc(Hash, 256);
+    defer alloc.free(invalid_parents);
+    @memset(invalid_parents, dummy_hash);
+
+    const bad_info = SnapshotInfo{
+        .tree = dummy_hash,
+        .parents = invalid_parents,
+    };
+
+    // initDupe should bail early with TooManyParents error before allocating internal slice copies
+    try std.testing.expectError(error.TooManyParents, Snapshot.initDupe(alloc, bad_info));
 }
