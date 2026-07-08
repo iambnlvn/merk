@@ -8,33 +8,47 @@ const Store = object.Store;
 pub const MAGIC: u32 = 0x4E_4F_44_55;
 pub const VERSION: u8 = 1;
 
+/// Fixed page size for all index pages. Must be large enough to hold at least
+/// one entry plus headers.
 pub const PAGE_SIZE: usize = 4096;
+
 pub const LEAF_PAGE: u8 = 0x01;
 pub const INTERNAL_PAGE: u8 = 0x02;
+
+/// Derived key used for B-tree ordering and content-defined chunking.
 pub const PathKey = u64;
 
-const page_rel_path_len = 11 + 1 + 2 + 1 + 2 + 1 + 64;
-const page_dir_path_len = 11 + 1 + 2 + 1 + 2;
-const leaf_header_len = 8;
-const internal_header_len = 8;
-const child_ref_len = 40;
-const min_leaf_entry_len = 8 + 2 + 32 + 8 + 8 + 16;
+// Layout constants for page paths (hex-encoded BLAKE3 hashes).
+const PAGE_REL_PATH_LEN: usize = 11 + 1 + 2 + 1 + 2 + 1 + 64;
+const PAGE_DIR_PATH_LEN: usize = 11 + 1 + 2 + 1 + 2;
 
-// Content-defined chunking thresholds. After appending an entry/child we
-// probabilistically cut the current page if the low bits of its
-// content-derived key are all zero (in addition to the hard PAGE_SIZE
-// cap, which still applies as a fallback). This is what makes page
-// boundaries a function of *content* rather than *position*.
-const leaf_boundary_mask: u64 = 0x1F; // avg ~32 entries/leaf
-const internal_boundary_mask: u64 = 0xF; // avg ~16 children/internal page
+// Header and element sizes.
+const LEAF_HEADER_LEN: usize = 8;
+const INTERNAL_HEADER_LEN: usize = 8;
+const CHILD_REF_LEN: usize = 40;
+const MIN_LEAF_ENTRY_LEN: usize = 8 + 2 + 32 + 8 + 8 + 16;
 
-const DiffError = error{
+/// Content-defined chunking threshold for leaf pages.
+/// When the low bits of an entry's key are all zero, the page is cut here.
+/// Expected average: ~32 entries per leaf page.
+const LEAF_BOUNDARY_MASK: u64 = 0x1F;
+
+/// Content-defined chunking threshold for internal pages.
+/// Expected average: ~16 children per internal page.
+const INTERNAL_BOUNDARY_MASK: u64 = 0xF;
+
+pub const DiffError = error{
     OutOfMemory,
     NotFound,
     HashMismatch,
     CorruptIndexPage,
-} || std.fs.File.ReadError || std.Io.Reader.Error;
+    CorruptIndex,
+    EndOfStream,
+    ReadFailed,
+} || std.fs.File.OpenError || std.fs.File.ReadError;
 
+/// Represents a tracked file in the repository.
+/// The `path` slice is owned by this struct and must be freed with `deinit`.
 pub const Entry = struct {
     path: []u8,
     blob_hash: Hash,
@@ -47,7 +61,9 @@ pub const Entry = struct {
     }
 };
 
-pub const LeafEntry = struct {
+/// Serialized form of an entry as stored in a leaf page.
+/// The `path` slice is owned and must be freed when the containing `Page` is deinitialized.
+const LeafEntry = struct {
     key: PathKey,
     path: []u8,
     blob_hash: Hash,
@@ -67,11 +83,17 @@ pub const LeafEntry = struct {
     }
 };
 
-pub const ChildRef = struct {
+/// Reference to a child page from an internal node.
+const ChildRef = struct {
+    /// The minimum key contained in the child subtree.
     separator: PathKey,
+    /// Content hash of the child page.
     page_hash: Hash,
 };
 
+/// In-memory representation of a parsed page.
+/// Memory is managed by the allocator passed to `parsePage` and must be freed
+/// with `Page.deinit`.
 pub const Page = union(enum) {
     leaf: std.ArrayList(LeafEntry),
     internal: std.ArrayList(ChildRef),
@@ -87,17 +109,45 @@ pub const Page = union(enum) {
     }
 };
 
+/// Worktree status of an indexed entry relative to the filesystem.
 pub const WorktreeState = enum {
     clean,
     modified,
     deleted,
 };
 
+pub const ChangeKind = enum {
+    added,
+    removed,
+    modified,
+};
+
+/// Describes a single change between two index states.
+/// The `path` slice is owned and must be freed with `EntryChange.deinit`.
+pub const EntryChange = struct {
+    kind: ChangeKind,
+    path: []u8,
+    old_blob_hash: ?Hash = null,
+    new_blob_hash: ?Hash = null,
+    old_size: ?u64 = null,
+    new_size: ?u64 = null,
+    old_mode: ?u64 = null,
+    new_mode: ?u64 = null,
+
+    pub fn deinit(self: *EntryChange, alloc: std.mem.Allocator) void {
+        alloc.free(self.path);
+    }
+};
+
+/// Release all memory associated with a slice of changes.
+pub fn freeChanges(alloc: std.mem.Allocator, changes: []EntryChange) void {
+    for (changes) |*c| c.deinit(alloc);
+    alloc.free(changes);
+}
+
 /// Fold the first 8 bytes of a BLAKE3 digest into a big-endian u64.
-/// Used both for path keys (ordering entries) and for content-defined
-/// chunk-boundary decisions (ordering pages), since a hash's bits are
-/// already uniformly distributed.
-fn foldHashPrefix(h: Hash) u64 {
+/// Used for both path keys (B-tree ordering) and content-defined chunking.
+pub fn foldHashPrefix(h: Hash) u64 {
     var key: u64 = 0;
     for (h[0..8]) |byte| {
         key = (key << 8) | byte;
@@ -105,10 +155,12 @@ fn foldHashPrefix(h: Hash) u64 {
     return key;
 }
 
+/// Compute the B-tree key for a given path.
 pub fn pathKey(path: []const u8) PathKey {
     return foldHashPrefix(hash_mod.blake3(path));
 }
 
+/// Test whether a key represents a content-defined chunk boundary.
 fn isChunkBoundary(key: u64, mask: u64) bool {
     return (key & mask) == 0;
 }
@@ -117,34 +169,42 @@ fn hashEq(a: Hash, b: Hash) bool {
     return std.mem.eql(u8, &a, &b);
 }
 
+/// Manages persistent storage of fixed-size index pages.
+/// Pages are stored in a sharded directory tree based on their hash.
 pub const PageStore = struct {
     alloc: std.mem.Allocator,
     dir: std.fs.Dir,
 
+    /// Ensure the pages directory exists.
     pub fn ensure(self: *const PageStore) !void {
         try self.dir.makePath("index/pages");
+        try self.dir.makePath(".tmp");
     }
 
+    /// Write a page to the store if it doesn't already exist.
+    /// Returns the content hash (which is also the key).
     pub fn put(self: *const PageStore, page_bytes: *const [PAGE_SIZE]u8) !Hash {
         try self.ensure();
 
         const page_hash = hash_mod.blake3(page_bytes);
-        var path_buf: [page_rel_path_len]u8 = undefined;
-        const path = pagePath(&path_buf, page_hash);
+        var path_buf: [PAGE_REL_PATH_LEN]u8 = undefined;
+        const path = pageRelPath(&path_buf, page_hash);
 
-        if (self.dir.access(path, .{})) |_| return page_hash else |err| switch (err) {
+        // Fast path: page already exists.
+        if (self.dir.access(path, .{})) |_| {
+            return page_hash;
+        } else |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         }
 
-        try self.dir.makePath(".tmp");
-
+        // Write to a temporary file and rename for atomicity.
         var rand_buf: [8]u8 = undefined;
         std.crypto.random.bytes(&rand_buf);
         const tmp_path = try std.fmt.allocPrint(self.alloc, ".tmp/{x}.idx", .{rand_buf});
         defer self.alloc.free(tmp_path);
 
-        const file = try self.dir.createFile(tmp_path, .{});
+        var file = try self.dir.createFile(tmp_path, .{});
         var file_closed = false;
         defer if (!file_closed) file.close();
         errdefer {
@@ -160,7 +220,8 @@ pub const PageStore = struct {
         file.close();
         file_closed = true;
 
-        var dir_buf: [page_dir_path_len]u8 = undefined;
+        // Rename into place, creating parent directories if necessary.
+        var dir_buf: [PAGE_DIR_PATH_LEN]u8 = undefined;
         const dir_path = pageDirPath(&dir_buf, page_hash);
         self.dir.rename(tmp_path, path) catch |err| switch (err) {
             error.FileNotFound => {
@@ -176,9 +237,10 @@ pub const PageStore = struct {
         return page_hash;
     }
 
+    /// Read a page from the store and verify its hash.
     pub fn getBytes(self: *const PageStore, page_hash: Hash) ![PAGE_SIZE]u8 {
-        var path_buf: [page_rel_path_len]u8 = undefined;
-        const path = pagePath(&path_buf, page_hash);
+        var path_buf: [PAGE_REL_PATH_LEN]u8 = undefined;
+        const path = pageRelPath(&path_buf, page_hash);
 
         const file = self.dir.openFile(path, .{}) catch |err| switch (err) {
             error.FileNotFound => return error.NotFound,
@@ -196,21 +258,28 @@ pub const PageStore = struct {
         return bytes;
     }
 
+    /// Parse a page from disk into an in-memory representation.
     pub fn get(self: *const PageStore, page_hash: Hash) !Page {
         const bytes = try self.getBytes(page_hash);
         return parsePage(self.alloc, &bytes);
     }
 };
 
+/// The primary in-memory index of tracked files.
+///
+/// Maintains:
+/// - `entries`: A sorted list of all tracked entries (by path).
+/// - `path_index`: A hash map for O(1) path lookups.
+/// - `index_root`: The BLAKE3 hash of the root page of the serialized B-tree.
 pub const Index = struct {
     alloc: std.mem.Allocator,
     dir: std.fs.Dir,
     entries: std.ArrayList(Entry),
-    /// path -> index into `entries`. Kept in sync by upsert()/rebuildPathIndex()
-    /// so lookup() never depends on `entries` being sorted by path.
+    /// path -> index into `entries`. Updated by `upsert()` and `rebuildPathIndex()`.
     path_index: std.StringHashMapUnmanaged(usize) = .empty,
     index_root: Hash = hash_mod.ZERO_HASH,
 
+    /// Open an index in `repo_root/.nodus`, creating the directory if needed.
     pub fn init(alloc: std.mem.Allocator, repo_root: []const u8) !Index {
         return initInDir(alloc, std.fs.cwd(), repo_root);
     }
@@ -240,13 +309,15 @@ pub const Index = struct {
         self.dir.close();
     }
 
+    /// Load the index from disk. If no index exists, starts empty.
     pub fn load(self: *Index) !void {
         clearEntries(self);
         self.index_root = hash_mod.ZERO_HASH;
 
         const root = readIndexRoot(self.dir) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => {
-                std.mem.sort(Entry, self.entries.items, {}, entryLessThan);
+                // No existing index. Ensure in-memory state is consistent.
+                std.mem.sort(Entry, self.entries.items, {}, entryPathLessThan);
                 try self.rebuildPathIndex();
                 return;
             },
@@ -258,27 +329,33 @@ pub const Index = struct {
 
         var store = PageStore{ .alloc = self.alloc, .dir = self.dir };
         try self.collectPageEntries(&store, root);
-        std.mem.sort(Entry, self.entries.items, {}, entryLessThan);
+        std.mem.sort(Entry, self.entries.items, {}, entryPathLessThan);
         try self.rebuildPathIndex();
     }
 
+    /// Persist the current entries to disk as a Merkle B-tree.
     pub fn save(self: *Index) !void {
-        std.mem.sort(Entry, self.entries.items, {}, entryLessThan);
+        // Ensure path-sorted order for deterministic output and path_index consistency.
+        std.mem.sort(Entry, self.entries.items, {}, entryPathLessThan);
         try self.rebuildPathIndex();
 
+        // Remove old root metadata and write new tree.
         self.dir.deleteFile("index") catch {};
         try self.dir.makePath("index/pages");
 
         const root = try self.writeTree();
-        try self.writeIndexRoot(root);
+        try writeIndexRoot(self.dir, root);
         self.index_root = root;
     }
 
+    /// Look up an entry by its repository-relative path.
     pub fn lookup(self: *const Index, path: []const u8) ?Entry {
         const idx = self.path_index.get(path) orelse return null;
         return self.entries.items[idx];
     }
 
+    /// Add or update a file in the index, reading from `repo_root/path`.
+    /// The blob content is stored via `store`.
     pub fn addFile(self: *Index, store: *const Store, repo_root: []const u8, path: []const u8) !Hash {
         const cwd = std.fs.cwd();
         const full_path = try std.fs.path.join(self.alloc, &.{ repo_root, path });
@@ -286,7 +363,14 @@ pub const Index = struct {
         return self.addFileFromDir(store, cwd, full_path, path);
     }
 
-    pub fn addFileFromDir(self: *Index, store: *const Store, dir: std.fs.Dir, fs_path: []const u8, index_path: []const u8) !Hash {
+    /// Add or update a file, reading from an explicit directory handle.
+    pub fn addFileFromDir(
+        self: *Index,
+        store: *const Store,
+        dir: std.fs.Dir,
+        fs_path: []const u8,
+        index_path: []const u8,
+    ) !Hash {
         try validatePath(index_path);
 
         const file = try dir.openFile(fs_path, .{});
@@ -310,6 +394,7 @@ pub const Index = struct {
         return blob_hash;
     }
 
+    /// Determine whether a tracked entry matches the current worktree file.
     pub fn stateOf(self: *const Index, repo_root: []const u8, entry: Entry) !WorktreeState {
         const cwd = std.fs.cwd();
         const full_path = try std.fs.path.join(self.alloc, &.{ repo_root, entry.path });
@@ -317,6 +402,9 @@ pub const Index = struct {
         return self.stateOfInDir(cwd, full_path, entry);
     }
 
+    /// Determine worktree state using an explicit directory handle.
+    /// NOTE: Uses exact mtime comparison; some filesystems may not preserve
+    /// nanosecond precision reliably.
     pub fn stateOfInDir(_: *const Index, dir: std.fs.Dir, fs_path: []const u8, entry: Entry) !WorktreeState {
         const stat = dir.statFile(fs_path) catch |err| switch (err) {
             error.FileNotFound => return .deleted,
@@ -330,11 +418,9 @@ pub const Index = struct {
         return .clean;
     }
 
-    /// Compute the set of entry-level changes between `other_root` and this
-    /// index's current on-disk root. Subtrees whose page hash matches on
-    /// both sides are skipped without ever being read from disk. Caller
-    /// owns the returned slice — free it with `freeChanges`.
-    pub fn diffAgainst(self: *const Index, other_root: Hash) ![]EntryChange {
+    /// Compute entry-level changes between `other_root` and the current index root.
+    /// Caller owns the returned slice; free with `freeChanges`.
+    pub fn diffAgainst(self: *const Index, other_root: Hash) DiffError![]EntryChange {
         return diffRoots(self.alloc, self.dir, other_root, self.index_root);
     }
 
@@ -346,6 +432,7 @@ pub const Index = struct {
         }
     }
 
+    /// Serialize the current entries into a content-defined Merkle B-tree.
     fn writeTree(self: *Index) !Hash {
         if (self.entries.items.len == 0) return hash_mod.ZERO_HASH;
 
@@ -353,33 +440,37 @@ pub const Index = struct {
         var level: std.ArrayList(ChildRef) = .empty;
         defer level.deinit(self.alloc);
 
+        // Sort entries by B-tree key for page construction.
         const sorted_entries = try self.alloc.alloc(Entry, self.entries.items.len);
         defer self.alloc.free(sorted_entries);
         @memcpy(sorted_entries, self.entries.items);
-        std.mem.sort(Entry, sorted_entries, {}, entryKeyLessThan);
+        std.mem.sort(Entry, sorted_entries, {}, entryBtreeLessThan);
 
+        // Build leaf pages.
         var offset: usize = 0;
         while (offset < sorted_entries.len) {
             var page: [PAGE_SIZE]u8 = [_]u8{0} ** PAGE_SIZE;
             page[0] = LEAF_PAGE;
 
-            var writer = std.Io.Writer.fixed(page[leaf_header_len..]);
+            var writer = std.Io.Writer.fixed(page[LEAF_HEADER_LEN..]);
             const first_key = pathKey(sorted_entries[offset].path);
             var count: u16 = 0;
 
             while (offset < sorted_entries.len) {
                 const entry = sorted_entries[offset];
                 const needed = leafEntrySize(entry);
-                if (needed > PAGE_SIZE - leaf_header_len) return error.IndexEntryTooLarge;
-                if (writer.end + needed > page.len - leaf_header_len and count > 0) break;
+                if (needed > PAGE_SIZE - LEAF_HEADER_LEN) return error.IndexEntryTooLarge;
+
+                // Hard page-size boundary: if we can't fit this entry and we've already
+                // written at least one entry, start a new page.
+                if (writer.end + needed > page.len - LEAF_HEADER_LEN and count > 0) break;
 
                 try writeLeafEntry(&writer, LeafEntry.fromEntry(entry));
                 count += 1;
                 offset += 1;
 
-                // Content-defined boundary: cut the chunk here so unrelated
-                // edits elsewhere in the keyspace don't reshuffle this page.
-                if (isChunkBoundary(pathKey(entry.path), leaf_boundary_mask)) break;
+                // Content-defined boundary: probabilistically cut here based on key.
+                if (isChunkBoundary(pathKey(entry.path), LEAF_BOUNDARY_MASK)) break;
             }
 
             std.mem.writeInt(u16, page[2..4], count, .little);
@@ -390,6 +481,7 @@ pub const Index = struct {
             });
         }
 
+        // Build internal levels until only the root remains.
         while (level.items.len > 1) {
             var next: std.ArrayList(ChildRef) = .empty;
             errdefer next.deinit(self.alloc);
@@ -399,12 +491,13 @@ pub const Index = struct {
                 var page: [PAGE_SIZE]u8 = [_]u8{0} ** PAGE_SIZE;
                 page[0] = INTERNAL_PAGE;
 
-                var writer = std.Io.Writer.fixed(page[internal_header_len..]);
+                var writer = std.Io.Writer.fixed(page[INTERNAL_HEADER_LEN..]);
                 const first_separator = level.items[child_offset].separator;
                 var child_count: u16 = 0;
 
                 while (child_offset < level.items.len) {
-                    if (writer.end + child_ref_len > page.len - internal_header_len and child_count > 0) break;
+                    // Hard boundary check.
+                    if (writer.end + CHILD_REF_LEN > page.len - INTERNAL_HEADER_LEN and child_count > 0) break;
 
                     const child = level.items[child_offset];
                     try writer.writeInt(u64, child.separator, .little);
@@ -412,7 +505,8 @@ pub const Index = struct {
                     child_count += 1;
                     child_offset += 1;
 
-                    if (isChunkBoundary(foldHashPrefix(child.page_hash), internal_boundary_mask)) break;
+                    // Content-defined boundary based on child page hash.
+                    if (isChunkBoundary(foldHashPrefix(child.page_hash), INTERNAL_BOUNDARY_MASK)) break;
                 }
 
                 std.mem.writeInt(u16, page[2..4], child_count, .little);
@@ -428,35 +522,6 @@ pub const Index = struct {
         }
 
         return level.items[0].page_hash;
-    }
-
-    fn writeIndexRoot(self: *Index, root: Hash) !void {
-        self.dir.deleteFile("index") catch {};
-        try self.dir.makePath("index");
-
-        const file = try self.dir.createFile("index/index_root.tmp", .{ .truncate = true });
-        var file_closed = false;
-        defer if (!file_closed) file.close();
-        errdefer {
-            if (!file_closed) {
-                file.close();
-                file_closed = true;
-            }
-            self.dir.deleteFile("index/index_root.tmp") catch {};
-        }
-
-        try file.writeAll(&root);
-        try file.sync();
-        file.close();
-        file_closed = true;
-
-        self.dir.rename("index/index_root.tmp", "index/index_root") catch |err| switch (err) {
-            error.PathAlreadyExists => {
-                try self.dir.deleteFile("index/index_root");
-                try self.dir.rename("index/index_root.tmp", "index/index_root");
-            },
-            else => return err,
-        };
     }
 
     fn collectPageEntries(self: *Index, store: *const PageStore, page_hash: Hash) !void {
@@ -483,15 +548,17 @@ pub const Index = struct {
         }
     }
 
+    /// Insert a new entry or replace an existing one, keeping `path_index` in sync.
     fn upsert(self: *Index, new_entry: Entry) !void {
+        // If allocation fails after we've already mutated the entry array,
+        // we must not leak the new path.
         errdefer {
             var owned = new_entry;
             owned.deinit(self.alloc);
         }
 
         if (self.path_index.get(new_entry.path)) |idx| {
-            // Reserve capacity before mutating anything, so a failed put
-            // can't leave us having freed the old path with no map entry.
+            // Replace existing entry.
             try self.path_index.ensureUnusedCapacity(self.alloc, 1);
             const entry = &self.entries.items[idx];
             _ = self.path_index.remove(entry.path);
@@ -501,6 +568,7 @@ pub const Index = struct {
             return;
         }
 
+        // Append new entry.
         try self.path_index.ensureUnusedCapacity(self.alloc, 1);
         try self.entries.append(self.alloc, new_entry);
         const idx = self.entries.items.len - 1;
@@ -508,31 +576,10 @@ pub const Index = struct {
     }
 };
 
-pub const ChangeKind = enum { added, removed, modified };
-
-pub const EntryChange = struct {
-    kind: ChangeKind,
-    path: []u8,
-    old_blob_hash: ?Hash = null,
-    new_blob_hash: ?Hash = null,
-    old_size: ?u64 = null,
-    new_size: ?u64 = null,
-    old_mode: ?u64 = null,
-    new_mode: ?u64 = null,
-
-    pub fn deinit(self: *EntryChange, alloc: std.mem.Allocator) void {
-        alloc.free(self.path);
-    }
-};
-
-pub fn freeChanges(alloc: std.mem.Allocator, changes: []EntryChange) void {
-    for (changes) |*c| c.deinit(alloc);
-    alloc.free(changes);
-}
-
-/// Diff two index-root hashes directly, without needing a loaded Index.
-/// Useful for comparing two commits' index roots.
-pub fn diffRoots(alloc: std.mem.Allocator, dir: std.fs.Dir, old_root: Hash, new_root: Hash) ![]EntryChange {
+/// Diff two index-root hashes directly, without loading a full `Index`.
+/// Useful for comparing commit index states.
+/// Caller owns the returned slice; free with `freeChanges`.
+pub fn diffRoots(alloc: std.mem.Allocator, dir: std.fs.Dir, old_root: Hash, new_root: Hash) DiffError![]EntryChange {
     var store = PageStore{ .alloc = alloc, .dir = dir };
     var changes: std.ArrayList(EntryChange) = .empty;
     errdefer {
@@ -544,15 +591,15 @@ pub fn diffRoots(alloc: std.mem.Allocator, dir: std.fs.Dir, old_root: Hash, new_
     return try changes.toOwnedSlice(alloc);
 }
 
+/// Recursively diff two subtrees.
+/// NOTE: identical page hashes short-circuit without disk access.
 fn diffNodes(
     alloc: std.mem.Allocator,
     store: *const PageStore,
     old_hash: Hash,
     new_hash: Hash,
     changes: *std.ArrayList(EntryChange),
-) anyerror!void {
-    // The core Merkle-tree win: identical subtrees are skipped without
-    // ever touching disk.
+) DiffError!void {
     if (hashEq(old_hash, new_hash)) return;
 
     const old_zero = hashEq(old_hash, hash_mod.ZERO_HASH);
@@ -586,19 +633,16 @@ fn diffNodes(
     }
 }
 
-/// Merge two sorted ChildRef arrays. Matching (separator, hash) pairs at the
-/// front and back are pruned outright. Aligned separators in the remaining
-/// middle recurse (so a hash mismatch there can still prune grandchildren).
-/// Anything left misaligned after that is flattened to entries and merged
-/// directly — always correct, just less cheap, and bounded to the region
-/// that actually differs.
+/// Diff two internal nodes by aligning matching prefixes/suffixes and recursing
+/// into the mismatched middle region.
 fn diffInternal(
     alloc: std.mem.Allocator,
     store: *const PageStore,
     old_children: []const ChildRef,
     new_children: []const ChildRef,
     changes: *std.ArrayList(EntryChange),
-) anyerror!void {
+) DiffError!void {
+    // Find matching prefix — these subtrees are identical and can be skipped.
     var old_lo: usize = 0;
     var old_hi: usize = old_children.len;
     var new_lo: usize = 0;
@@ -612,6 +656,7 @@ fn diffInternal(
         new_lo += 1;
     }
 
+    // Find matching suffix.
     while (old_hi > old_lo and new_hi > new_lo and
         old_children[old_hi - 1].separator == new_children[new_hi - 1].separator and
         hashEq(old_children[old_hi - 1].page_hash, new_children[new_hi - 1].page_hash))
@@ -620,6 +665,7 @@ fn diffInternal(
         new_hi -= 1;
     }
 
+    // Recurse into aligned separators in the middle.
     var oi = old_lo;
     var nj = new_lo;
     while (oi < old_hi and nj < new_hi and old_children[oi].separator == new_children[nj].separator) {
@@ -628,6 +674,7 @@ fn diffInternal(
         nj += 1;
     }
 
+    // Any remaining misaligned region is flattened to leaf entries and diffed directly.
     if (oi < old_hi or nj < new_hi) {
         const old_flat = try flattenChildren(alloc, store, old_children[oi..old_hi]);
         defer freeFlat(alloc, old_flat);
@@ -637,13 +684,13 @@ fn diffInternal(
     }
 }
 
-/// Merge-diff two sorted (by key, then path) LeafEntry lists.
+/// Three-way merge of two sorted leaf entry lists.
 fn diffLeafLists(
     alloc: std.mem.Allocator,
     old: []const LeafEntry,
     new: []const LeafEntry,
     changes: *std.ArrayList(EntryChange),
-) !void {
+) DiffError!void {
     var i: usize = 0;
     var j: usize = 0;
 
@@ -707,13 +754,14 @@ fn diffLeafLists(
     }
 }
 
+/// Collect all entries under a subtree into a flat change list.
 fn collectSubtree(
     alloc: std.mem.Allocator,
     store: *const PageStore,
     page_hash: Hash,
     kind: ChangeKind,
     changes: *std.ArrayList(EntryChange),
-) anyerror!void {
+) DiffError!void {
     if (hashEq(page_hash, hash_mod.ZERO_HASH)) return;
 
     var page = try store.get(page_hash);
@@ -749,7 +797,8 @@ fn collectSubtree(
     }
 }
 
-fn flattenChildren(alloc: std.mem.Allocator, store: *const PageStore, children: []const ChildRef) ![]LeafEntry {
+/// Flatten a slice of child references into a sorted leaf entry array.
+fn flattenChildren(alloc: std.mem.Allocator, store: *const PageStore, children: []const ChildRef) DiffError![]LeafEntry {
     var out: std.ArrayList(LeafEntry) = .empty;
     errdefer {
         for (out.items) |*e| alloc.free(e.path);
@@ -761,7 +810,13 @@ fn flattenChildren(alloc: std.mem.Allocator, store: *const PageStore, children: 
     return try out.toOwnedSlice(alloc);
 }
 
-fn flattenSubtree(alloc: std.mem.Allocator, store: *const PageStore, page_hash: Hash, out: *std.ArrayList(LeafEntry)) anyerror!void {
+/// Recursively append all leaf entries under a page hash to `out`.
+fn flattenSubtree(
+    alloc: std.mem.Allocator,
+    store: *const PageStore,
+    page_hash: Hash,
+    out: *std.ArrayList(LeafEntry),
+) DiffError!void {
     if (hashEq(page_hash, hash_mod.ZERO_HASH)) return;
 
     var page = try store.get(page_hash);
@@ -793,7 +848,7 @@ fn freeFlat(alloc: std.mem.Allocator, entries: []LeafEntry) void {
     alloc.free(entries);
 }
 
-fn parsePage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8) !Page {
+fn parsePage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8) DiffError!Page {
     return switch (bytes[0]) {
         LEAF_PAGE => try parseLeafPage(alloc, bytes),
         INTERNAL_PAGE => try parseInternalPage(alloc, bytes),
@@ -801,9 +856,9 @@ fn parsePage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8) !Page {
     };
 }
 
-fn parseLeafPage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8) !Page {
+fn parseLeafPage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8) DiffError!Page {
     const count = std.mem.readInt(u16, bytes[2..4], .little);
-    var reader = std.Io.Reader.fixed(bytes[leaf_header_len..]);
+    var reader = std.Io.Reader.fixed(bytes[LEAF_HEADER_LEN..]);
     var entries: std.ArrayList(LeafEntry) = .empty;
     errdefer {
         for (entries.items) |*entry| alloc.free(entry.path);
@@ -823,6 +878,7 @@ fn parseLeafPage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8) !Page {
         var blob_hash: Hash = undefined;
         @memcpy(&blob_hash, try reader.take(blob_hash.len));
 
+        // Enforce sorted order invariant.
         if (last_key) |prev| {
             if (key < prev) return error.CorruptIndexPage;
         }
@@ -841,11 +897,11 @@ fn parseLeafPage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8) !Page {
     return .{ .leaf = entries };
 }
 
-fn parseInternalPage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8) !Page {
+fn parseInternalPage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8) DiffError!Page {
     const count = std.mem.readInt(u16, bytes[2..4], .little);
     if (count == 0) return error.CorruptIndexPage;
 
-    var reader = std.Io.Reader.fixed(bytes[internal_header_len..]);
+    var reader = std.Io.Reader.fixed(bytes[INTERNAL_HEADER_LEN..]);
     var children: std.ArrayList(ChildRef) = .empty;
     errdefer children.deinit(alloc);
 
@@ -865,7 +921,21 @@ fn parseInternalPage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8) !Pag
     return .{ .internal = children };
 }
 
-fn readIndexRoot(dir: std.fs.Dir) !Hash {
+fn writeLeafEntry(writer: *std.Io.Writer, entry: LeafEntry) !void {
+    try writer.writeInt(u64, entry.key, .little);
+    try writer.writeInt(u16, @intCast(entry.path.len), .little);
+    try writer.writeAll(entry.path);
+    try writer.writeAll(&entry.blob_hash);
+    try writer.writeInt(u64, entry.size, .little);
+    try writer.writeInt(u64, entry.mode, .little);
+    try writer.writeInt(i128, entry.mtime, .little);
+}
+
+fn leafEntrySize(entry: Entry) usize {
+    return MIN_LEAF_ENTRY_LEN + entry.path.len;
+}
+
+fn readIndexRoot(dir: std.fs.Dir) DiffError!Hash {
     const file = try dir.openFile("index/index_root", .{});
     defer file.close();
 
@@ -882,21 +952,39 @@ fn readIndexRoot(dir: std.fs.Dir) !Hash {
     return root;
 }
 
-fn writeLeafEntry(writer: *std.Io.Writer, entry: LeafEntry) !void {
-    try writer.writeInt(u64, entry.key, .little);
-    try writer.writeInt(u16, @intCast(entry.path.len), .little);
-    try writer.writeAll(entry.path);
-    try writer.writeAll(&entry.blob_hash);
-    try writer.writeInt(u64, entry.size, .little);
-    try writer.writeInt(u64, entry.mode, .little);
-    try writer.writeInt(i128, entry.mtime, .little);
+fn writeIndexRoot(dir: std.fs.Dir, root: Hash) !void {
+    dir.deleteFile("index") catch {};
+    try dir.makePath("index");
+
+    const tmp_name = "index/index_root.tmp";
+    const final_name = "index/index_root";
+
+    const file = try dir.createFile(tmp_name, .{ .truncate = true });
+    var file_closed = false;
+    defer if (!file_closed) file.close();
+    errdefer {
+        if (!file_closed) {
+            file.close();
+            file_closed = true;
+        }
+        dir.deleteFile(tmp_name) catch {};
+    }
+
+    try file.writeAll(&root);
+    try file.sync();
+    file.close();
+    file_closed = true;
+
+    dir.rename(tmp_name, final_name) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            try dir.deleteFile(final_name);
+            try dir.rename(tmp_name, final_name);
+        },
+        else => return err,
+    };
 }
 
-fn leafEntrySize(entry: Entry) usize {
-    return min_leaf_entry_len + entry.path.len;
-}
-
-fn pagePath(buf: *[page_rel_path_len]u8, page_hash: Hash) []const u8 {
+fn pageRelPath(buf: *[PAGE_REL_PATH_LEN]u8, page_hash: Hash) []const u8 {
     var hex_buf: [64]u8 = undefined;
     const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{page_hash}) catch unreachable;
     return std.fmt.bufPrint(buf, "index/pages/{s}/{s}/{s}", .{
@@ -906,7 +994,7 @@ fn pagePath(buf: *[page_rel_path_len]u8, page_hash: Hash) []const u8 {
     }) catch unreachable;
 }
 
-fn pageDirPath(buf: *[page_dir_path_len]u8, page_hash: Hash) []const u8 {
+fn pageDirPath(buf: *[PAGE_DIR_PATH_LEN]u8, page_hash: Hash) []const u8 {
     var hex_buf: [64]u8 = undefined;
     const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{page_hash}) catch unreachable;
     return std.fmt.bufPrint(buf, "index/pages/{s}/{s}", .{
@@ -937,11 +1025,13 @@ fn validatePath(path: []const u8) !void {
     }
 }
 
-fn entryLessThan(_: void, lhs: Entry, rhs: Entry) bool {
+/// Sort by repository-relative path (lexicographic).
+fn entryPathLessThan(_: void, lhs: Entry, rhs: Entry) bool {
     return std.mem.lessThan(u8, lhs.path, rhs.path);
 }
 
-fn entryKeyLessThan(_: void, lhs: Entry, rhs: Entry) bool {
+/// Sort by B-tree key (hash-derived), falling back to path for stability.
+fn entryBtreeLessThan(_: void, lhs: Entry, rhs: Entry) bool {
     const lhs_key = pathKey(lhs.path);
     const rhs_key = pathKey(rhs.path);
     if (lhs_key == rhs_key) return std.mem.lessThan(u8, lhs.path, rhs.path);
