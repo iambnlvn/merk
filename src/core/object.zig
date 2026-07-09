@@ -76,12 +76,17 @@ pub fn decodeObject(alloc: std.mem.Allocator, file: std.fs.File) !Object {
     var header_reader = file.readerStreaming(&header_buf);
     const header = try decodeObjectHeader(&header_reader.interface);
 
-    const payload = try alloc.alloc(u8, header.payload_len);
-    errdefer alloc.free(payload);
+    // Read exactly what's on disk (`stored_len`), which may differ from
+    // `payload_len` once a real codec is in use, then let compression.zig
+    // decide how to turn stored bytes into the original payload.
+    const stored = try alloc.alloc(u8, header.stored_len);
+    defer alloc.free(stored);
 
-    // payload IS the reader buffer, so take() returns a slice into it
-    var payload_reader = file.readerStreaming(payload);
-    _ = try payload_reader.interface.take(header.payload_len);
+    var body_reader = file.readerStreaming(stored);
+    _ = try body_reader.interface.take(header.stored_len);
+
+    const payload = try compression.decodeAlloc(alloc, header.codec, stored, header.payload_len);
+    errdefer alloc.free(payload);
 
     var hash_buf: [32]u8 = undefined;
     var hash_reader = file.readerStreaming(&hash_buf);
