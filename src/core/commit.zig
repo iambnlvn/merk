@@ -207,7 +207,6 @@ test "commit write and read round-trip" {
     try std.testing.expectEqualStrings("reviewed-by", c.message.trailers[0].key);
     try std.testing.expectEqualStrings("alfred@wayne.corp", c.message.trailers[0].value);
 
-    // Lookup helper
     try std.testing.expectEqualStrings("#1", c.message.trailer("closes").?);
     try std.testing.expectEqual(@as(?[]const u8, null), c.message.trailer("missing"));
 }
@@ -345,14 +344,14 @@ test "commit with parents" {
 }
 
 test "resolveHead returns null when HEAD missing" {
-    const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const result = try refs.resolveHead(alloc, tmp.dir);
+    const ref_store = refs.RefStore.init(std.testing.allocator, tmp.dir);
+    const result = try ref_store.resolveHead();
     try std.testing.expectEqual(@as(?Hash, null), result);
 }
 
-test "writeHeadRef and updateRef and resolveHead round-trip" {
+test "writeHeadRef and updateBranch and resolveHead round-trip" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -368,14 +367,17 @@ test "writeHeadRef and updateRef and resolveHead round-trip" {
         .message = .{ .title = "init", .body = "" },
     });
 
-    try refs.writeHeadRef(tmp.dir, "main");
-    try refs.updateRef(alloc, tmp.dir, "main", commit_hash);
+    const ref_store = refs.RefStore.init(alloc, tmp.dir);
+    const main = try refs.BranchName.parse("main");
 
-    const resolved = try refs.resolveHead(alloc, tmp.dir);
+    try ref_store.writeHeadRef(main);
+    try ref_store.updateBranch(main, commit_hash);
+
+    const resolved = try ref_store.resolveHead();
     try std.testing.expect(resolved != null);
     try std.testing.expectEqualSlices(u8, &commit_hash, &resolved.?);
 
-    const branch = try refs.headBranch(alloc, tmp.dir);
+    const branch = try ref_store.headBranch();
     defer if (branch) |b| alloc.free(b);
     try std.testing.expect(branch != null);
     try std.testing.expectEqualStrings("main", branch.?);
