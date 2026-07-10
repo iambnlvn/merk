@@ -15,6 +15,8 @@ pub const message = @import("./commit/message.zig");
 const Message = message.Message;
 const MessageInfo = message.MessageInfo;
 
+const TrailerInfo = message.TrailerInfo;
+
 const snapshot = @import("./commit/snapshot.zig");
 const Snapshot = snapshot.Snapshot;
 const SnapshotInfo = snapshot.SnapshotInfo;
@@ -22,6 +24,7 @@ const SnapshotInfo = snapshot.SnapshotInfo;
 pub const commitMetadata = @import("./commit/metadata.zig");
 const CommitMetadata = commitMetadata.CommitMetadata;
 const CommitMetadataInfo = commitMetadata.CommitMetadataInfo;
+const Intent = commitMetadata.Intent;
 
 const refs = @import("./refs.zig");
 
@@ -29,7 +32,10 @@ pub const COMMIT_MAGIC = 0x4E_4F_44_55;
 pub const COMMIT_VERSION: u8 = 1;
 pub const MAX_PARENTS: u8 = 255;
 
-pub const CommitInfo = struct {
+/// Internal, assembled representation of a commit-to-be. Not exported:
+/// `CommitBuilder` is the only supported way to produce one, so nothing
+/// outside this file needs to know its shape.
+const CommitInfo = struct {
     snapshot: SnapshotInfo,
 
     /// Author + optional committer.  When committer is null it defaults to
@@ -39,7 +45,7 @@ pub const CommitInfo = struct {
     metadata: CommitMetadataInfo = .{},
     message: MessageInfo,
 
-    pub fn validate(self: @This()) !void {
+    fn validate(self: @This()) !void {
         try self.snapshot.validate();
         try self.identity.validate();
         try self.metadata.validate();
@@ -64,7 +70,10 @@ pub const Commit = struct {
     }
 };
 
-pub fn write(
+/// Serializes and stores a commit. Private: only `CommitBuilder` calls this,
+/// so every commit written by nodus goes through the builder's validation
+/// and default-filling, never a hand-assembled `CommitInfo`.
+fn serializeCommit(
     alloc: std.mem.Allocator,
     store: *const Store,
     info: CommitInfo,
@@ -87,9 +96,9 @@ pub fn write(
     return store.put(.commit, buf.written());
 }
 
-/// High-level helper: write a commit whose snapshot is the persisted index root.
-/// Callers must save the index first so `index.index_root` names durable pages.
-pub fn buildAndWrite(
+/// Serializes and stores a commit whose snapshot tree is a saved `Index`
+/// root. Private: reached only via `CommitBuilder.writeFromIndex`.
+fn serializeFromIndex(
     alloc: std.mem.Allocator,
     store: *const Store,
     index: *const index_mod.Index,
@@ -102,7 +111,7 @@ pub fn buildAndWrite(
     var commit_info = info;
     commit_info.snapshot.tree = index.index_root;
 
-    return write(alloc, store, commit_info);
+    return serializeCommit(alloc, store, commit_info);
 }
 
 pub fn read(
@@ -144,6 +153,184 @@ pub fn read(
     };
 }
 
+/// Builder for assembling and writing a commit. This is the only
+/// supported way to create a commit in nodus — there is no public function
+/// that takes a hand-built commit struct.
+///
+///   - Callers never hand-assemble a nested commit struct.
+///   - Required fields (author, title, intent) fail loudly at `.write()` /
+///     `.writeFromIndex()` time via `error.MissingAuthor` /
+///     `error.MissingTitle` / `error.MissingIntent`, rather than silently
+///     serializing an incomplete commit.
+///   - Sensible defaults: committer mirrors author when not set, and the
+///     commit metadata timestamp mirrors the author timestamp when not set.
+///   - The builder owns its own scratch allocations (parents/labels/trailers)
+///     so callers never juggle intermediate slices themselves. Call
+///     `.deinit()` when done, whether or not `.write()` succeeded.
+///
+/// Example:
+///
+///   var b = CommitBuilder.init(alloc, tree_hash);
+///   defer b.deinit();
+///   _ = b.author("Ada Lovelace", "ada@lab.net", now_ms);
+///   _ = b.intent(.feature);
+///   _ = b.title("Add builder API");
+///   _ = try b.trailer("closes", "#42");
+///   const commit_hash = try b.write(&store);
+pub const CommitBuilder = struct {
+    alloc: std.mem.Allocator,
+    tree: Hash,
+    parents: std.ArrayListUnmanaged(Hash) = .{},
+
+    author_info: ?TimestampedIdentityInfo = null,
+    committer_info: ?TimestampedIdentityInfo = null,
+
+    commit_intent: ?Intent = null,
+    metadata_timestamp_ms: ?i64 = null,
+    labels: std.ArrayListUnmanaged([]const u8) = .{},
+
+    title_text: ?[]const u8 = null,
+    body_text: []const u8 = "",
+    trailers: std.ArrayListUnmanaged(TrailerInfo) = .{},
+
+    pub fn init(alloc: std.mem.Allocator, tree: Hash) CommitBuilder {
+        return .{ .alloc = alloc, .tree = tree };
+    }
+
+    pub fn deinit(self: *CommitBuilder) void {
+        self.parents.deinit(self.alloc);
+        self.labels.deinit(self.alloc);
+        self.trailers.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn parent(self: *CommitBuilder, parent_hash: Hash) !*CommitBuilder {
+        try self.parents.append(self.alloc, parent_hash);
+        return self;
+    }
+
+    pub fn parentsFrom(self: *CommitBuilder, hashes: []const Hash) !*CommitBuilder {
+        try self.parents.appendSlice(self.alloc, hashes);
+        return self;
+    }
+
+    pub fn author(self: *CommitBuilder, name: []const u8, email: []const u8, timestamp_ms: i64) *CommitBuilder {
+        self.author_info = .{ .name = name, .email = email, .timestamp_ms = timestamp_ms };
+        return self;
+    }
+
+    /// Optional. When not called, the committer defaults to the author
+    /// (same person, same timestamp) — matching the existing serialize-time
+    /// behavior documented on the commit's identity.
+    pub fn committer(self: *CommitBuilder, name: []const u8, email: []const u8, timestamp_ms: i64) *CommitBuilder {
+        self.committer_info = .{
+            .name = name,
+            .email = email,
+            .timestamp_ms = timestamp_ms,
+        };
+        return self;
+    }
+
+    pub fn intent(self: *CommitBuilder, value: Intent) *CommitBuilder {
+        self.commit_intent = value;
+        return self;
+    }
+
+    /// Optional. Defaults to the author's timestamp when not set.
+    pub fn timestamp(self: *CommitBuilder, timestamp_ms: i64) *CommitBuilder {
+        self.metadata_timestamp_ms = timestamp_ms;
+        return self;
+    }
+
+    pub fn label(self: *CommitBuilder, value: []const u8) !*CommitBuilder {
+        try self.labels.append(self.alloc, value);
+        return self;
+    }
+
+    pub fn labelsFrom(self: *CommitBuilder, values: []const []const u8) !*CommitBuilder {
+        try self.labels.appendSlice(self.alloc, values);
+        return self;
+    }
+
+    pub fn title(self: *CommitBuilder, value: []const u8) *CommitBuilder {
+        self.title_text = value;
+        return self;
+    }
+
+    pub fn body(self: *CommitBuilder, value: []const u8) *CommitBuilder {
+        self.body_text = value;
+        return self;
+    }
+
+    pub fn trailer(self: *CommitBuilder, key: []const u8, value: []const u8) !*CommitBuilder {
+        try self.trailers.append(self.alloc, .{ .key = key, .value = value });
+        return self;
+    }
+
+    /// Assemble the internal commit representation. Slices point into
+    /// builder-owned storage, so the result is only valid while `self` is
+    /// alive — this is why it's private and only ever consumed inline by
+    /// `write`/`writeFromIndex` below.
+    fn build(self: *const CommitBuilder) !CommitInfo {
+        const author_info = self.author_info orelse return error.MissingAuthor;
+        const title_text = self.title_text orelse return error.MissingTitle;
+        const commit_intent = self.commit_intent orelse return error.MissingIntent;
+        const meta_ts = self.metadata_timestamp_ms orelse author_info.timestamp_ms;
+
+        return .{
+            .snapshot = .{
+                .tree = self.tree,
+                .parents = self.parents.items,
+            },
+            .identity = .{
+                .author = author_info,
+                .committer = self.committer_info,
+            },
+            .metadata = .{
+                .timestamp_ms = meta_ts,
+                .intent = commit_intent,
+                .labels = self.labels.items,
+            },
+            .message = .{
+                .title = title_text,
+                .body = self.body_text,
+                .trailers = self.trailers.items,
+            },
+        };
+    }
+
+    /// Assemble and persist the commit.
+    pub fn write(self: *const CommitBuilder, store: *const Store) !Hash {
+        const info = try self.build();
+        return serializeCommit(self.alloc, store, info);
+    }
+
+    /// Assemble and persist the commit with its snapshot tree taken from a
+    /// saved `Index` root. Whatever tree hash the builder was constructed
+    /// with is overwritten by `index.index_root`.
+    pub fn writeFromIndex(self: *const CommitBuilder, store: *const Store, index: *const index_mod.Index) !Hash {
+        const info = try self.build();
+        return serializeFromIndex(self.alloc, store, index, info);
+    }
+};
+
+fn testCommit(
+    alloc: std.mem.Allocator,
+    store: *const Store,
+    tree_hash: Hash,
+    name: []const u8,
+    email: []const u8,
+    timestamp_ms: i64,
+    commit_title: []const u8,
+) !Hash {
+    var b = CommitBuilder.init(alloc, tree_hash);
+    defer b.deinit();
+    _ = b.author(name, email, timestamp_ms);
+    _ = b.intent(.chore);
+    _ = b.title(commit_title);
+    return b.write(store);
+}
+
 test "commit write and read round-trip" {
     const alloc = std.testing.allocator;
 
@@ -156,32 +343,18 @@ test "commit write and read round-trip" {
 
     const tree_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
-    const commit_hash = try write(alloc, &store, .{
-        .snapshot = .{
-            .tree = tree_hash,
-            .parents = &.{},
-        },
-        .identity = .{
-            .author = .{
-                .name = "Bruce Wayne",
-                .email = "bruce@wayne.corp",
-                .timestamp_ms = 1_700_000_000_000,
-            },
-        },
-        .metadata = .{
-            .timestamp_ms = 1_700_000_000_000,
-            .intent = .feature,
-            .labels = &.{ "core", "storage" },
-        },
-        .message = .{
-            .title = "Initial commit",
-            .body = "Create the initial repository structure.",
-            .trailers = &.{
-                .{ .key = "reviewed-by", .value = "alfred@wayne.corp" },
-                .{ .key = "closes", .value = "#1" },
-            },
-        },
-    });
+    var b = CommitBuilder.init(alloc, tree_hash);
+    defer b.deinit();
+    _ = b.author("Bruce Wayne", "bruce@wayne.corp", 1_700_000_000_000);
+    _ = b.intent(.feature);
+    _ = try b.label("core");
+    _ = try b.label("storage");
+    _ = b.title("Initial commit");
+    _ = b.body("Create the initial repository structure.");
+    _ = try b.trailer("reviewed-by", "alfred@wayne.corp");
+    _ = try b.trailer("closes", "#1");
+
+    const commit_hash = try b.write(&store);
 
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
@@ -222,23 +395,15 @@ test "commit with explicit committer" {
 
     const tree_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
-    const commit_hash = try write(alloc, &store, .{
-        .snapshot = .{ .tree = tree_hash, .parents = &.{} },
-        .identity = .{
-            .author = .{
-                .name = "Ada Lovelace",
-                .email = "ada@lab.net",
-                .timestamp_ms = 1_000,
-            },
-            .committer = .{
-                .name = "Nodus Bot",
-                .email = "bot@nodus.dev",
-                .timestamp_ms = 2_000,
-            },
-        },
-        .metadata = .{ .timestamp_ms = 1, .intent = .chore, .labels = &.{} },
-        .message = .{ .title = "cherry-pick: port auth fix", .body = "" },
-    });
+    var b = CommitBuilder.init(alloc, tree_hash);
+    defer b.deinit();
+    _ = b.author("Ada Lovelace", "ada@lab.net", 1_000);
+    _ = b.committer("Nodus Bot", "bot@nodus.dev", 2_000);
+    _ = b.intent(.chore);
+    _ = b.timestamp(1);
+    _ = b.title("cherry-pick: port auth fix");
+
+    const commit_hash = try b.write(&store);
 
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
@@ -263,26 +428,16 @@ test "commit is deterministic for same inputs" {
 
     const make_commit = struct {
         fn f(s: *const Store, a: std.mem.Allocator, th: Hash) !Hash {
-            return write(a, s, .{
-                .snapshot = .{ .tree = th, .parents = &.{} },
-                .identity = .{
-                    .author = .{
-                        .name = "Test User",
-                        .email = "test@nodus.dev",
-                        .timestamp_ms = 42,
-                    },
-                },
-                .metadata = .{
-                    .timestamp_ms = 42,
-                    .intent = .feature,
-                    .labels = &.{ "core", "storage" },
-                },
-                .message = .{
-                    .title = "msg",
-                    .body = "deterministic commit",
-                    .trailers = &.{.{ .key = "closes", .value = "#7" }},
-                },
-            });
+            var b = CommitBuilder.init(a, th);
+            defer b.deinit();
+            _ = b.author("Test User", "test@nodus.dev", 42);
+            _ = b.intent(.feature);
+            _ = try b.label("core");
+            _ = try b.label("storage");
+            _ = b.title("msg");
+            _ = b.body("deterministic commit");
+            _ = try b.trailer("closes", "#7");
+            return b.write(s);
         }
     }.f;
 
@@ -313,23 +468,21 @@ test "commit with parents" {
 
     const tree_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
-    const parent_hash = try write(alloc, &store, .{
-        .snapshot = .{ .tree = tree_hash, .parents = &.{} },
-        .identity = .{ .author = .{ .name = "Alan Turing", .email = "alan@nodus.dev", .timestamp_ms = 1_000 } },
-        .metadata = .{ .timestamp_ms = 1_000, .intent = .feature, .labels = &.{} },
-        .message = .{ .title = "root", .body = "" },
-    });
+    var root_b = CommitBuilder.init(alloc, tree_hash);
+    defer root_b.deinit();
+    _ = root_b.author("Alan Turing", "alan@nodus.dev", 1_000);
+    _ = root_b.intent(.feature);
+    _ = root_b.title("root");
+    const parent_hash = try root_b.write(&store);
 
-    const child_hash = try write(alloc, &store, .{
-        .snapshot = .{ .tree = tree_hash, .parents = &.{parent_hash} },
-        .identity = .{ .author = .{ .name = "Alan Turing", .email = "alan@nodus.dev", .timestamp_ms = 2_000 } },
-        .metadata = .{ .timestamp_ms = 2_000, .intent = .feature, .labels = &.{} },
-        .message = .{
-            .title = "second",
-            .body = "",
-            .trailers = &.{.{ .key = "cherry-picked", .value = "abc1234" }},
-        },
-    });
+    var child_b = CommitBuilder.init(alloc, tree_hash);
+    defer child_b.deinit();
+    _ = try child_b.parent(parent_hash);
+    _ = child_b.author("Alan Turing", "alan@nodus.dev", 2_000);
+    _ = child_b.intent(.feature);
+    _ = child_b.title("second");
+    _ = try child_b.trailer("cherry-picked", "abc1234");
+    const child_hash = try child_b.write(&store);
 
     var c = try read(alloc, &store, child_hash);
     defer c.deinit(alloc);
@@ -341,6 +494,60 @@ test "commit with parents" {
         "abc1234",
         c.message.trailer("cherry-picked").?,
     );
+}
+
+test "CommitBuilder rejects a commit with no author" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var objects_dir = try tmp.dir.makeOpenPath("objects", .{});
+    defer objects_dir.close();
+    var store = Store{ .dir = objects_dir, .alloc = alloc };
+
+    const tree_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    var b = CommitBuilder.init(alloc, tree_hash);
+    defer b.deinit();
+    _ = b.intent(.chore);
+    _ = b.title("no author");
+
+    try std.testing.expectError(error.MissingAuthor, b.write(&store));
+}
+
+test "CommitBuilder rejects a commit with no title" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var objects_dir = try tmp.dir.makeOpenPath("objects", .{});
+    defer objects_dir.close();
+    var store = Store{ .dir = objects_dir, .alloc = alloc };
+
+    const tree_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    var b = CommitBuilder.init(alloc, tree_hash);
+    defer b.deinit();
+    _ = b.author("No Title", "notitle@nodus.dev", 1);
+    _ = b.intent(.chore);
+
+    try std.testing.expectError(error.MissingTitle, b.write(&store));
+}
+
+test "CommitBuilder rejects a commit with no intent" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var objects_dir = try tmp.dir.makeOpenPath("objects", .{});
+    defer objects_dir.close();
+    var store = Store{ .dir = objects_dir, .alloc = alloc };
+
+    const tree_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    var b = CommitBuilder.init(alloc, tree_hash);
+    defer b.deinit();
+    _ = b.author("No Intent", "nointent@nodus.dev", 1);
+    _ = b.title("no intent");
+
+    try std.testing.expectError(error.MissingIntent, b.write(&store));
 }
 
 test "resolveHead returns null when HEAD missing" {
@@ -360,12 +567,7 @@ test "writeHeadRef and updateBranch and resolveHead round-trip" {
     var store = Store{ .dir = objects_dir, .alloc = alloc };
 
     const tree_hash = try store.put(.tree, &[_]u8{0} ** 4);
-    const commit_hash = try write(alloc, &store, .{
-        .snapshot = .{ .tree = tree_hash, .parents = &.{} },
-        .identity = .{ .author = .{ .name = "dev", .email = "dev@nodus.local", .timestamp_ms = 1 } },
-        .metadata = .{ .timestamp_ms = 1, .intent = .chore, .labels = &.{} },
-        .message = .{ .title = "init", .body = "" },
-    });
+    const commit_hash = try testCommit(alloc, &store, tree_hash, "dev", "dev@nodus.local", 1, "init");
 
     const ref_store = refs.RefStore.init(alloc, tmp.dir);
     const main = try refs.BranchName.parse("main");
