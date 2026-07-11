@@ -7,6 +7,7 @@ const hash_mod = @import("hash.zig");
 pub const Hash = hash_mod.Hash;
 
 const head_ref_prefix = "ref: refs/heads/";
+const HEADS_DIR = "refs/heads";
 
 /// A branch name that has already passed validation.
 /// Once you hold a BranchName, nothing downstream needs to re-check it —
@@ -27,7 +28,7 @@ pub const BranchName = struct {
     }
 
     fn refPath(self: BranchName, buf: []u8) ![]u8 {
-        return std.fmt.bufPrint(buf, "refs/heads/{s}", .{self.raw});
+        return std.fmt.bufPrint(buf, "{s}/{s}", .{ HEADS_DIR, self.raw });
     }
 };
 
@@ -38,7 +39,7 @@ pub const HeadState = union(enum) {
     symbolic: []u8, // owned
     detached: Hash,
 
-    fn deinit(self: HeadState, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: HeadState, alloc: std.mem.Allocator) void {
         switch (self) {
             .symbolic => |s| alloc.free(s),
             .detached => {},
@@ -95,7 +96,8 @@ pub const RefStore = struct {
     }
 
     /// Parses raw HEAD bytes into symbolic-or-detached state.
-    /// Private: every public method below is a thin projection of this single parse.
+    /// Every public method that touches HEAD is a thin projection of this
+    /// single parse — `headState` below is the public door to it.
     fn readHead(self: RefStore) !?HeadState {
         const head_bytes = self.dir.readFileAlloc(self.alloc, "HEAD", 256) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -110,6 +112,16 @@ pub const RefStore = struct {
             return HeadState{ .symbolic = try self.alloc.dupe(u8, branch) };
         }
         return HeadState{ .detached = try hash_mod.fromHex(trimmed) };
+    }
+
+    /// The raw parsed state of HEAD — symbolic (on a branch) or detached
+    /// (pointing directly at a commit) — for callers that need to tell
+    /// the two apart without immediately resolving to a hash (e.g.
+    /// `nodus status` printing "on branch main" vs "HEAD detached at
+    /// <hash>"). `null` if HEAD doesn't exist yet. Caller must call
+    /// `.deinit(alloc)` on the result.
+    pub fn headState(self: RefStore) !?HeadState {
+        return self.readHead();
     }
 
     /// Resolve HEAD to a concrete commit hash.
@@ -144,7 +156,7 @@ pub const RefStore = struct {
     /// Write `HEAD` as a symbolic ref to the given branch.
     pub fn writeHeadRef(self: RefStore, branch: BranchName) !void {
         var buf: [256]u8 = undefined;
-        const contents = try std.fmt.bufPrint(&buf, "ref: refs/heads/{s}", .{branch.raw});
+        const contents = try std.fmt.bufPrint(&buf, "ref: {s}/{s}", .{ HEADS_DIR, branch.raw });
         try AtomicFile.write(self.alloc, self.dir, "HEAD", contents);
     }
 
@@ -156,6 +168,7 @@ pub const RefStore = struct {
     }
 
     /// Update the reference file for `refs/heads/<branch>` to point at `hash`.
+    /// Creates the branch if it doesn't exist yet.
     pub fn updateBranch(self: RefStore, branch: BranchName, hash: Hash) !void {
         var path_buf: [256]u8 = undefined;
         const path = try branch.refPath(&path_buf);
@@ -168,7 +181,9 @@ pub const RefStore = struct {
 
     /// Read the hash stored in `refs/heads/<branch>`.
     ///
-    /// Returns `null` when the branch ref file does not exist.
+    /// Returns `null` when the branch ref file does not exist. This also
+    /// doubles as "resolve an arbitrary branch, independent of HEAD" —
+    /// e.g. for committing onto a branch other than the checked-out one.
     pub fn readBranch(self: RefStore, branch: BranchName) !?Hash {
         var path_buf: [256]u8 = undefined;
         const path = try branch.refPath(&path_buf);
@@ -180,6 +195,58 @@ pub const RefStore = struct {
         defer self.alloc.free(bytes);
 
         return try hash_mod.fromHex(std.mem.trim(u8, bytes, " \t\r\n"));
+    }
+
+    /// Whether `branch` currently has a ref file (has ever been
+    /// committed to), independent of whether it's checked out
+    pub fn branchExists(self: RefStore, branch: BranchName) !bool {
+        return (try self.readBranch(branch)) != null;
+    }
+
+    /// Remove `refs/heads/<branch>`. Errors with `error.BranchNotFound`
+    /// if the branch doesn't exist — callers that want delete-if-present
+    /// semantics should check `branchExists` first (or catch that error).
+    ///
+    /// NOTE: doesn't check whether `branch` is currently checked out via
+    /// HEAD; callers that care (e.g. a `nodus branch -d` command
+    /// refusing to delete the current branch) need that check themselves
+    /// — this is pure ref-file bookkeeping.
+    pub fn deleteBranch(self: RefStore, branch: BranchName) !void {
+        var path_buf: [256]u8 = undefined;
+        const path = try branch.refPath(&path_buf);
+
+        self.dir.deleteFile(path) catch |err| switch (err) {
+            error.FileNotFound => return error.BranchNotFound,
+            else => return err,
+        };
+    }
+
+    /// List every branch with a ref file under `refs/heads/` (including
+    /// nested ones, e.g. "release/2026/q3-hardening"), in no particular
+    /// order. Empty slice if no branches exist yet — a fresh repo isn't
+    /// an error. Caller owns the returned slice and each name in it.
+    pub fn listBranches(self: RefStore, alloc: std.mem.Allocator) ![][]u8 {
+        var heads = self.dir.openDir(HEADS_DIR, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return &.{},
+            else => return err,
+        };
+        defer heads.close();
+
+        var names: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (names.items) |n| alloc.free(n);
+            names.deinit(alloc);
+        }
+
+        var walker = try heads.walk(alloc);
+        defer walker.deinit();
+
+        while (try walker.next()) |entry| {
+            if (entry.kind != .file) continue;
+            try names.append(alloc, try alloc.dupe(u8, entry.path));
+        }
+
+        return names.toOwnedSlice(alloc);
     }
 };
 
@@ -421,4 +488,100 @@ test "writeHeadRef followed by writeDetachedHead correctly overwrites symbolic s
     const resolved = try store.resolveHead();
     try std.testing.expect(resolved != null);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mock_hash), std.mem.asBytes(&resolved.?));
+}
+
+test "headState distinguishes symbolic from detached without resolving" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = RefStore.init(allocator, tmp.dir);
+    const main = try BranchName.parse("main");
+
+    try std.testing.expectEqual(@as(?HeadState, null), try store.headState());
+
+    try store.writeHeadRef(main);
+    var symbolic_state = try store.headState() orelse return error.ExpectedHeadState;
+    defer symbolic_state.deinit(allocator);
+    try std.testing.expectEqualStrings("main", symbolic_state.symbolic);
+
+    var mock_hash: Hash = undefined;
+    @memset(std.mem.asBytes(&mock_hash), 0x33);
+    try store.writeDetachedHead(mock_hash);
+
+    var detached_state = try store.headState() orelse return error.ExpectedHeadState;
+    defer detached_state.deinit(allocator);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&mock_hash), std.mem.asBytes(&detached_state.detached));
+}
+
+test "branchExists reflects whether a branch has ever been committed to" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = RefStore.init(allocator, tmp.dir);
+    const main = try BranchName.parse("main");
+
+    try std.testing.expect(!try store.branchExists(main));
+
+    var mock_hash: Hash = undefined;
+    @memset(std.mem.asBytes(&mock_hash), 0x44);
+    try store.updateBranch(main, mock_hash);
+
+    try std.testing.expect(try store.branchExists(main));
+}
+
+test "deleteBranch removes the ref and errors on a repeat delete" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = RefStore.init(allocator, tmp.dir);
+    const feature = try BranchName.parse("feature/x");
+
+    var mock_hash: Hash = undefined;
+    @memset(std.mem.asBytes(&mock_hash), 0x66);
+    try store.updateBranch(feature, mock_hash);
+    try std.testing.expect(try store.branchExists(feature));
+
+    try store.deleteBranch(feature);
+    try std.testing.expect(!try store.branchExists(feature));
+
+    try std.testing.expectError(error.BranchNotFound, store.deleteBranch(feature));
+}
+
+test "listBranches finds nested branches and is empty for a fresh repo" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = RefStore.init(allocator, tmp.dir);
+
+    const empty = try store.listBranches(allocator);
+    defer allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    const main = try BranchName.parse("main");
+    const nested = try BranchName.parse("release/2026/q3-hardening");
+    var mock_hash: Hash = undefined;
+    @memset(std.mem.asBytes(&mock_hash), 0x77);
+    try store.updateBranch(main, mock_hash);
+    try store.updateBranch(nested, mock_hash);
+
+    const names = try store.listBranches(allocator);
+    defer {
+        for (names) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+
+    var saw_main = false;
+    var saw_nested = false;
+    for (names) |n| {
+        if (std.mem.eql(u8, n, "main")) saw_main = true;
+        // std.fs.Dir.Walker yields OS-native separators; accept either
+        if (std.mem.eql(u8, n, "release/2026/q3-hardening") or
+            std.mem.eql(u8, n, "release" ++ std.fs.path.sep_str ++ "2026" ++ std.fs.path.sep_str ++ "q3-hardening"))
+        {
+            saw_nested = true;
+        }
+    }
+    try std.testing.expect(saw_main);
+    try std.testing.expect(saw_nested);
 }
