@@ -6,7 +6,7 @@ const format = @import("index/format.zig");
 const entry_mod = @import("index/entry.zig");
 const page_store_mod = @import("index/page_store.zig");
 const btree = @import("index/btree.zig");
-const diff = @import("index/entry_diff.zig");
+const entry_diff = @import("index/entry_diff.zig");
 
 const Hash = hash_mod.Hash;
 const Store = object.Store;
@@ -33,7 +33,7 @@ pub const pathKey = entry_mod.pathKey;
 
 pub const PageStore = page_store_mod.PageStore;
 
-pub const diffRoots = diff.diffRoots;
+pub const diffRoots = entry_diff.diffRoots;
 
 /// The primary in-memory index of tracked files.
 ///
@@ -86,7 +86,7 @@ pub const Index = struct {
 
         const root = readIndexRoot(self.dir) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => {
-                // No existing index. Ensure in-memory state is consistent.
+                // No existing index. Ensure in-memory state is consistent
                 std.mem.sort(Entry, self.entries.items, {}, entry_mod.pathLessThan);
                 try self.rebuildPathIndex();
                 return;
@@ -123,6 +123,17 @@ pub const Index = struct {
     pub fn lookup(self: *const Index, path: []const u8) ?Entry {
         const idx = self.path_index.get(path) orelse return null;
         return self.entries.items[idx];
+    }
+
+    /// Remove a tracked path from the index. Does not touch the worktree
+    /// file — callers that want that too (e.g. `Repository.revert` undoing
+    /// an addition) delete it themselves. Returns `error.NotFound` if the
+    /// path isn't currently tracked
+    pub fn remove(self: *Index, path: []const u8) !void {
+        const idx = self.path_index.get(path) orelse return error.NotFound;
+        var removed = self.entries.orderedRemove(idx);
+        removed.deinit(self.alloc);
+        try self.rebuildPathIndex();
     }
 
     /// Add or update a file in the index, reading from `repo_root/path`
@@ -192,7 +203,7 @@ pub const Index = struct {
     /// Compute entry-level changes between `other_root` and the current index root
     /// Caller owns the returned slice; free with `freeChanges`
     pub fn diffAgainst(self: *const Index, other_root: Hash) DiffError![]EntryChange {
-        return diff.diffRoots(self.alloc, self.dir, other_root, self.index_root);
+        return entry_diff.diffRoots(self.alloc, self.dir, other_root, self.index_root);
     }
 
     fn rebuildPathIndex(self: *Index) !void {
@@ -457,6 +468,38 @@ test "index upsert replaces an existing entry in place" {
     try std.testing.expectEqual(@as(usize, 1), index.entries.items.len);
     const entry = index.lookup("note.txt") orelse return error.ExpectedEntry;
     try std.testing.expectEqual(@as(u64, 9), entry.size);
+}
+
+test "index remove drops a tracked path and reports NotFound afterward" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const nodus_dir = try tmp_dir.dir.makeOpenPath(".nodus", .{});
+    var index = Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
+    defer index.deinit();
+
+    try index.entries.append(alloc, .{
+        .path = try alloc.dupe(u8, "keep.txt"),
+        .blob_hash = hash_mod.blake3("keep"),
+        .size = 1,
+        .mode = 0o100644,
+        .mtime = 1,
+    });
+    try index.entries.append(alloc, .{
+        .path = try alloc.dupe(u8, "drop.txt"),
+        .blob_hash = hash_mod.blake3("drop"),
+        .size = 1,
+        .mode = 0o100644,
+        .mtime = 1,
+    });
+    try index.rebuildPathIndex();
+
+    try index.remove("drop.txt");
+    try std.testing.expectEqual(@as(usize, 1), index.entries.items.len);
+    try std.testing.expect(index.lookup("drop.txt") == null);
+    try std.testing.expect(index.lookup("keep.txt") != null);
+    try std.testing.expectError(error.NotFound, index.remove("drop.txt"));
 }
 
 test "index diffAgainst short-circuits on identical roots" {
