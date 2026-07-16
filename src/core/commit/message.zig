@@ -1,4 +1,5 @@
 const std = @import("std");
+const wire = @import("wire.zig");
 const MockReader = @import("testing.zig").MockReader;
 
 const MessageError = error{
@@ -39,10 +40,8 @@ pub const TrailerInfo = struct {
 
     pub fn serialize(self: TrailerInfo, writer: anytype) !void {
         try self.validate();
-        try writer.writeByte(@intCast(self.key.len));
-        try writer.writeAll(self.key);
-        try writer.writeInt(u16, @intCast(self.value.len), .little);
-        try writer.writeAll(self.value);
+        try wire.writeBytes(u8, writer, self.key);
+        try wire.writeBytes(u16, writer, self.value);
     }
 };
 
@@ -51,12 +50,10 @@ pub const Trailer = struct {
     value: []u8,
 
     pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !Trailer {
-        const key_len = try reader.takeByte();
-        const key = try alloc.dupe(u8, try reader.take(key_len));
+        const key = try wire.readBytesAlloc(u8, alloc, reader);
         errdefer alloc.free(key);
 
-        const value_len = try reader.takeInt(u16, .little);
-        const value = try alloc.dupe(u8, try reader.take(value_len));
+        const value = try wire.readBytesAlloc(u16, alloc, reader);
         errdefer alloc.free(value);
 
         // Re-validate on the way out so corrupt data is caught at read time.
@@ -81,40 +78,41 @@ pub const MessageInfo = struct {
     /// Order is preserved; duplicate keys are allowed.
     trailers: []const TrailerInfo = &.{},
 
-    pub fn validate(self: MessageInfo) MessageError!void {
-        const trimmed_title = std.mem.trim(u8, self.title, " \t\r\n");
-        const trimmed_body = std.mem.trim(u8, self.body, " \t\r\n");
+    /// Trimmed title/body, computed once so `validate`, `serialize`, and
+    /// `Message.initDupe` all agree on what "trimmed" means
+    fn trimmed(self: MessageInfo) struct { title: []const u8, body: []const u8 } {
+        return .{
+            .title = std.mem.trim(u8, self.title, " \t\r\n"),
+            .body = std.mem.trim(u8, self.body, " \t\r\n"),
+        };
+    }
 
-        if (trimmed_title.len == 0) return error.EmptyCommitMessage;
-        if (trimmed_title.len > std.math.maxInt(u16)) return error.TitleTooLong;
-        if (trimmed_body.len > std.math.maxInt(u32)) return error.BodyTooLong;
+    pub fn validate(self: MessageInfo) MessageError!void {
+        const t = self.trimmed();
+
+        if (t.title.len == 0) return error.EmptyCommitMessage;
+        if (t.title.len > std.math.maxInt(u16)) return error.TitleTooLong;
+        if (t.body.len > std.math.maxInt(u32)) return error.BodyTooLong;
         if (self.trailers.len > std.math.maxInt(u8)) return error.TooManyTrailers;
 
         // Prevent header injection and malformed commit titles by blocking newlines/nulls
         const illegal_title_chars = &[_]u8{ '\n', '\r', '\x00' };
-        if (std.mem.indexOfAny(u8, trimmed_title, illegal_title_chars) != null)
+        if (std.mem.indexOfAny(u8, t.title, illegal_title_chars) != null)
             return error.TitleContainsIllegalCharacters;
 
-        for (self.trailers) |t| try t.validate();
+        for (self.trailers) |trailer_info| try trailer_info.validate();
     }
 
     pub fn serialize(self: MessageInfo, writer: anytype) !void {
         try self.validate();
 
-        const trimmed_title = std.mem.trim(u8, self.title, " \t\r\n");
-        const trimmed_body = std.mem.trim(u8, self.body, " \t\r\n");
-
-        // Write title payload (u16 length prefixed)
-        try writer.writeInt(u16, @intCast(trimmed_title.len), .little);
-        try writer.writeAll(trimmed_title);
-
-        // Write body payload (u32 length prefixed to handle longer content)
-        try writer.writeInt(u32, @intCast(trimmed_body.len), .little);
-        try writer.writeAll(trimmed_body);
+        const t = self.trimmed();
+        try wire.writeBytes(u16, writer, t.title);
+        try wire.writeBytes(u32, writer, t.body);
 
         // trailers (u8 count, then each key/value)
-        try writer.writeByte(@intCast(self.trailers.len));
-        for (self.trailers) |t| try t.serialize(writer);
+        try wire.writeCount(u8, writer, self.trailers.len);
+        for (self.trailers) |trailer_info| try trailer_info.serialize(writer);
     }
 };
 
@@ -127,19 +125,18 @@ pub const Message = struct {
     pub fn initDupe(alloc: std.mem.Allocator, info: MessageInfo) !Message {
         try info.validate();
 
-        const trimmed_title = std.mem.trim(u8, info.title, " \t\r\n");
-        const trimmed_body = std.mem.trim(u8, info.body, " \t\r\n");
+        const t = info.trimmed();
 
-        const title = try alloc.dupe(u8, trimmed_title);
+        const title = try alloc.dupe(u8, t.title);
         errdefer alloc.free(title);
 
-        const body = try alloc.dupe(u8, trimmed_body);
+        const body = try alloc.dupe(u8, t.body);
         errdefer alloc.free(body);
 
         const trailers = try alloc.alloc(Trailer, info.trailers.len);
         var initialized: usize = 0;
         errdefer {
-            for (trailers[0..initialized]) |*t| t.deinit(alloc);
+            for (trailers[0..initialized]) |*tr| tr.deinit(alloc);
             alloc.free(trailers);
         }
 
@@ -160,15 +157,13 @@ pub const Message = struct {
     }
 
     pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !Message {
-        const title_len = try reader.takeInt(u16, .little);
-        const title = try alloc.dupe(u8, try reader.take(title_len));
+        const title = try wire.readBytesAlloc(u16, alloc, reader);
         errdefer alloc.free(title);
 
-        const body_len = try reader.takeInt(u32, .little);
-        const body = try alloc.dupe(u8, try reader.take(body_len));
+        const body = try wire.readBytesAlloc(u32, alloc, reader);
         errdefer alloc.free(body);
 
-        const trailer_count = try reader.takeByte();
+        const trailer_count = try wire.readCount(u8, reader);
         const trailers = try alloc.alloc(Trailer, trailer_count);
         var initialized: usize = 0;
         errdefer {
