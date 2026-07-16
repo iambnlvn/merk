@@ -1,4 +1,5 @@
 const std = @import("std");
+const wire = @import("wire.zig");
 const MockReader = @import("testing.zig").MockReader;
 
 pub const IdentityError = error{
@@ -47,17 +48,21 @@ pub const IdentityInfo = struct {
             return error.EmailContainsIllegalCharacters;
     }
 
+    /// Trimmed name/email, computed once so `serialize` and any future
+    /// caller don't each re-derive it
+    fn trimmed(self: IdentityInfo) struct { name: []const u8, email: []const u8 } {
+        return .{
+            .name = std.mem.trim(u8, self.name, " \t\r\n"),
+            .email = std.mem.trim(u8, self.email, " \t\r\n"),
+        };
+    }
+
     pub fn serialize(self: IdentityInfo, writer: anytype) !void {
         try self.validate();
 
-        const trimmed_name = std.mem.trim(u8, self.name, " \t\r\n");
-        const trimmed_email = std.mem.trim(u8, self.email, " \t\r\n");
-
-        try writer.writeInt(u16, @intCast(trimmed_name.len), .little);
-        try writer.writeAll(trimmed_name);
-
-        try writer.writeInt(u16, @intCast(trimmed_email.len), .little);
-        try writer.writeAll(trimmed_email);
+        const t = self.trimmed();
+        try wire.writeBytes(u16, writer, t.name);
+        try wire.writeBytes(u16, writer, t.email);
     }
 };
 
@@ -79,24 +84,25 @@ pub const TimestampedIdentityInfo = struct {
         try base.validate();
     }
 
+    /// Trimmed name/email plus the resolved (never-0) timestamp — the one
+    /// place `serialize` and `Identity.initDupe` both derive their data
+    /// from, so the trimming and auto-fill rules can't drift apart
+    fn trimmed(self: TimestampedIdentityInfo) struct { name: []const u8, email: []const u8, timestamp_ms: i64 } {
+        const base = (IdentityInfo{ .name = self.name, .email = self.email }).trimmed();
+        return .{
+            .name = base.name,
+            .email = base.email,
+            .timestamp_ms = wire.resolveTimestampMs(self.timestamp_ms),
+        };
+    }
+
     pub fn serialize(self: TimestampedIdentityInfo, writer: anytype) !void {
         try self.validate();
 
-        const trimmed_name = std.mem.trim(u8, self.name, " \t\r\n");
-        const trimmed_email = std.mem.trim(u8, self.email, " \t\r\n");
-
-        try writer.writeInt(u16, @intCast(trimmed_name.len), .little);
-        try writer.writeAll(trimmed_name);
-
-        try writer.writeInt(u16, @intCast(trimmed_email.len), .little);
-        try writer.writeAll(trimmed_email);
-
-        const ts: i64 = if (self.timestamp_ms != 0)
-            self.timestamp_ms
-        else
-            std.time.milliTimestamp();
-
-        try writer.writeInt(i64, ts, .little);
+        const t = self.trimmed();
+        try wire.writeBytes(u16, writer, t.name);
+        try wire.writeBytes(u16, writer, t.email);
+        try writer.writeInt(i64, t.timestamp_ms, .little);
     }
 };
 
@@ -113,30 +119,22 @@ pub const Identity = struct {
     ) !Identity {
         try info.validate();
 
-        const trimmed_name = std.mem.trim(u8, info.name, " \t\r\n");
-        const trimmed_email = std.mem.trim(u8, info.email, " \t\r\n");
+        const t = info.trimmed();
 
-        const name = try alloc.dupe(u8, trimmed_name);
+        const name = try alloc.dupe(u8, t.name);
         errdefer alloc.free(name);
 
-        const email = try alloc.dupe(u8, trimmed_email);
+        const email = try alloc.dupe(u8, t.email);
         errdefer alloc.free(email);
 
-        const ts: i64 = if (info.timestamp_ms != 0)
-            info.timestamp_ms
-        else
-            std.time.milliTimestamp();
-
-        return .{ .name = name, .email = email, .timestamp_ms = ts };
+        return .{ .name = name, .email = email, .timestamp_ms = t.timestamp_ms };
     }
 
     pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !Identity {
-        const name_len = try reader.takeInt(u16, .little);
-        const name = try alloc.dupe(u8, try reader.take(name_len));
+        const name = try wire.readBytesAlloc(u16, alloc, reader);
         errdefer alloc.free(name);
 
-        const email_len = try reader.takeInt(u16, .little);
-        const email = try alloc.dupe(u8, try reader.take(email_len));
+        const email = try wire.readBytesAlloc(u16, alloc, reader);
         errdefer alloc.free(email);
 
         const ts = try reader.takeInt(i64, .little);
