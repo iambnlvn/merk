@@ -1,4 +1,5 @@
 const std = @import("std");
+const wire = @import("wire.zig");
 const MockReader = @import("testing.zig").MockReader;
 
 pub const Intent = enum(u8) {
@@ -45,92 +46,24 @@ pub const CommitMetadataInfo = struct {
     ) !void {
         try self.validate();
 
-        const ts =
-            if (self.timestamp_ms != 0)
-                self.timestamp_ms
-            else
-                std.time.milliTimestamp();
-
-        try writer.writeInt(
-            i64,
-            ts,
-            .little,
-        );
-
-        try writer.writeByte(
-            @intFromEnum(self.intent),
-        );
-
-        try writer.writeInt(
-            u16,
-            @intCast(self.labels.len),
-            .little,
-        );
-
-        for (self.labels) |label| {
-            try writer.writeInt(
-                u16,
-                @intCast(label.len),
-                .little,
-            );
-
-            try writer.writeAll(label);
-        }
+        const ts = wire.resolveTimestampMs(self.timestamp_ms);
+        try writer.writeInt(i64, ts, .little);
+        try writer.writeByte(@intFromEnum(self.intent));
+        try wire.writeStringArray(u16, u16, writer, self.labels);
     }
 
     pub fn deserialize(
         alloc: std.mem.Allocator,
         reader: anytype,
     ) !CommitMetadata {
-        const timestamp_ms =
-            try reader.takeInt(
-                i64,
-                .little,
-            );
+        const timestamp_ms = try reader.takeInt(i64, .little);
 
-        const intent =
-            std.meta.intToEnum(
-                Intent,
-                try reader.takeByte(),
-            ) catch {
-                return error.CorruptCommit;
-            };
+        const intent = std.meta.intToEnum(
+            Intent,
+            try reader.takeByte(),
+        ) catch return error.CorruptCommit;
 
-        const label_count =
-            try reader.takeInt(
-                u16,
-                .little,
-            );
-
-        const labels =
-            try alloc.alloc(
-                []u8,
-                label_count,
-            );
-
-        var initialized: usize = 0;
-
-        errdefer {
-            for (labels[0..initialized]) |label| {
-                alloc.free(label);
-            }
-
-            alloc.free(labels);
-        }
-
-        while (initialized < label_count) : (initialized += 1) {
-            const len =
-                try reader.takeInt(
-                    u16,
-                    .little,
-                );
-
-            labels[initialized] =
-                try alloc.dupe(
-                    u8,
-                    try reader.take(len),
-                );
-        }
+        const labels = try wire.readStringArrayAlloc(u16, u16, alloc, reader);
 
         return .{
             .timestamp_ms = timestamp_ms,
