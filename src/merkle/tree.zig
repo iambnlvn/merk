@@ -1,5 +1,5 @@
 const std = @import("std");
-const hash_mod = @import("merk").hash;
+const hash_mod = @import("../crypto/crypto.zig").hash;
 const node = @import("node.zig");
 const entry_mod = @import("entry.zig");
 const page_store_mod = @import("page_store.zig");
@@ -32,7 +32,7 @@ fn toLeafEntry(e: Entry) LeafEntry {
 /// Serialize `entries` into a content-defined Merkle B-tree and return the
 /// hash of its root page.
 pub fn build(alloc: std.mem.Allocator, store: *const PageStore, entries: []const Entry) !Hash {
-    if (entries.len == 0) return hash_mod.ZERO_HASH;
+    if (entries.len == 0) return hash_mod.zero_hash;
 
     var level: std.ArrayList(ChildRef) = .empty;
     defer level.deinit(alloc);
@@ -161,14 +161,14 @@ fn freeTestEntries(alloc: std.mem.Allocator, entries: *std.ArrayList(Entry)) voi
     entries.deinit(alloc);
 }
 
-test "build of an empty entry list returns ZERO_HASH without touching the store" {
+test "build of an empty entry list returns zero_hash without touching the store" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const store = PageStore{ .alloc = alloc, .dir = tmp.dir };
 
     const root = try build(alloc, &store, &.{});
-    try std.testing.expectEqualSlices(u8, &hash_mod.ZERO_HASH, &root);
+    try std.testing.expectEqualSlices(u8, &hash_mod.zero_hash, &root);
 }
 
 test "build+collect round-trips a small entry set that fits one leaf page" {
@@ -184,7 +184,7 @@ test "build+collect round-trips a small entry set that fits one leaf page" {
     try entries.append(alloc, try testEntry(alloc, "c.txt", 3));
 
     const root = try build(alloc, &store, entries.items);
-    try std.testing.expect(!std.mem.eql(u8, &root, &hash_mod.ZERO_HASH));
+    try std.testing.expect(!std.mem.eql(u8, &root, &hash_mod.zero_hash));
 
     var collected: std.ArrayList(Entry) = .empty;
     defer freeTestEntries(alloc, &collected);

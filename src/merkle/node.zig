@@ -1,5 +1,5 @@
 const std = @import("std");
-const hash_mod = @import("merk").hash;
+const hash_mod = @import("../crypto/crypto.zig").hash;
 
 pub const Hash = hash_mod.Hash;
 
@@ -231,7 +231,7 @@ pub fn writeLeafEntry(writer: *std.Io.Writer, entry: LeafEntry) !void {
 }
 
 fn testLeaf(key: PathKey, path: []const u8) LeafEntry {
-    return .{ .key = key, .path = @constCast(path), .blob_hash = hash_mod.ZERO_HASH, .size = 1, .mode = 0o644, .mtime = 0 };
+    return .{ .key = key, .path = @constCast(path), .blob_hash = hash_mod.zero_hash, .size = 1, .mode = 0o644, .mtime = 0 };
 }
 
 fn buildTestLeafPage(page: *[PAGE_SIZE]u8, entries: []const LeafEntry) !void {

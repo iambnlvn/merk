@@ -1,5 +1,5 @@
 const std = @import("std");
-const hash_mod = @import("merk").hash;
+const hash_mod = @import("../crypto/crypto.zig").hash;
 const node = @import("node.zig");
 
 pub const Hash = hash_mod.Hash;

@@ -14,6 +14,7 @@ pub const build = tree.build;
 pub const diffRoots = diff.diffRoots;
 
 test {
+    _ = @import("entry.zig");
     // Forces the test runner to walk into every submodule's test blocks,
     // regardless of whether the runtime call graph reaches them — otherwise
     // a file only ever called from inside another merkle/ file (never

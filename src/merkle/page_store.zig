@@ -1,5 +1,5 @@
 const std = @import("std");
-const hash_mod = @import("merk").hash;
+const hash_mod = @import("../crypto/crypto.zig").hash;
 const node = @import("node.zig");
 
 const Hash = hash_mod.Hash;
@@ -140,7 +140,7 @@ fn testParseableLeafPage() [node.PAGE_SIZE]u8 {
     node.writeLeafEntry(&writer, .{
         .key = 1,
         .path = @constCast("only.txt"),
-        .blob_hash = hash_mod.ZERO_HASH,
+        .blob_hash = hash_mod.zero_hash,
         .size = 0,
         .mode = 0o644,
         .mtime = 0,
@@ -175,7 +175,7 @@ test "get on an unknown hash returns NotFound" {
     defer tmp.cleanup();
     const store = PageStore{ .alloc = std.testing.allocator, .dir = tmp.dir };
 
-    try std.testing.expectError(error.NotFound, store.getBytes(hash_mod.ZERO_HASH));
+    try std.testing.expectError(error.NotFound, store.getBytes(hash_mod.zero_hash));
 }
 
 test "getBytes detects on-disk corruption via content hash mismatch" {
