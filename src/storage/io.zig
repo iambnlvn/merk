@@ -28,8 +28,25 @@ pub const FileSystem = struct {
         /// Caller owns the returned slice
         readFile: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, path: []const u8, max_size: usize) anyerror!?[]u8,
 
+        /// Read up to `len` bytes starting at byte offset `offset`, without
+        /// reading the rest of the file. Returns `null` if the file does
+        /// not exist. If `offset` is at or past the end of the file,
+        /// returns an empty (zero-length) owned slice rather than an
+        /// error. If the file has fewer than `len` bytes available from
+        /// `offset`, returns only the bytes that exist — callers that need
+        /// to distinguish "short read" from "got everything requested"
+        /// should compare the returned slice's length against `len`.
+        /// Caller owns the returned slice
+        readRange: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, path: []const u8, offset: u64, len: usize) anyerror!?[]u8,
+
         /// Write `contents` to `path` atomically. Creates parent directories as needed
         writeFile: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, path: []const u8, contents: []const u8) anyerror!void,
+
+        /// Open `path` for sequential streaming reads, without loading it
+        /// into memory up front. Returns `null` if the file does not
+        /// exist. Caller must call `.close()` on the returned `FileHandle`
+        /// exactly once, whether or not it was fully read
+        openReader: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, path: []const u8) anyerror!?FileHandle,
 
         /// Delete a file. Returns `error.FileNotFound` if it does not exist
         /// Implementations may also opportunistically remove now-empty
@@ -86,8 +103,20 @@ pub const FileSystem = struct {
         return self.vtable.readFile(self.ptr, alloc, path, max_size);
     }
 
+    /// Read up to `len` bytes of `path` starting at `offset`, without
+    /// reading the whole file. See `VTable.readRange` for exact semantics
+    /// around short reads and out-of-range offsets.
+    pub fn readRange(self: FileSystem, alloc: std.mem.Allocator, path: []const u8, offset: u64, len: usize) !?[]u8 {
+        return self.vtable.readRange(self.ptr, alloc, path, offset, len);
+    }
+
     pub fn writeFile(self: FileSystem, alloc: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
         return self.vtable.writeFile(self.ptr, alloc, path, contents);
+    }
+
+    /// Open `path` for sequential streaming reads. See `VTable.openReader`.
+    pub fn openReader(self: FileSystem, alloc: std.mem.Allocator, path: []const u8) !?FileHandle {
+        return self.vtable.openReader(self.ptr, alloc, path);
     }
 
     pub fn deleteFile(self: FileSystem, path: []const u8) !void {
@@ -119,6 +148,33 @@ pub const FileSystem = struct {
     }
 };
 
+/// An open, sequential-read handle onto a single file, returned by
+/// `FileSystem.openReader`. Like `FileSystem` itself, this is a small
+/// vtable wrapper so `RealFs` (a real `std.fs.File`) and `TestFs` (a
+/// duplicated in-memory byte buffer with a cursor) are driven identically.
+///
+/// Contract: `read` behaves like `std.Io.Reader.readSliceShort` — it
+/// returns the number of bytes copied into `buffer` (which may be less
+/// than `buffer.len`), and `0` only at end-of-file. `close` must be called
+/// exactly once, after which the handle must not be used again.
+pub const FileHandle = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        read: *const fn (ptr: *anyopaque, buffer: []u8) anyerror!usize,
+        close: *const fn (ptr: *anyopaque) void,
+    };
+
+    pub fn read(self: FileHandle, buffer: []u8) !usize {
+        return self.vtable.read(self.ptr, buffer);
+    }
+
+    pub fn close(self: FileHandle) void {
+        self.vtable.close(self.ptr);
+    }
+};
+
 /// Metadata about a file. `mtime_ns` is nanoseconds since the Unix epoch;
 /// `TestFs` doesn't track real timestamps and always reports `0`.
 pub const FileStat = struct {
@@ -142,7 +198,9 @@ pub const RealFs = struct {
             .ptr = self,
             .vtable = &.{
                 .readFile = readFileImpl,
+                .readRange = readRangeImpl,
                 .writeFile = writeFileImpl,
+                .openReader = openReaderImpl,
                 .deleteFile = deleteFileImpl,
                 .fileExists = fileExistsImpl,
                 .statFile = statFileImpl,
@@ -160,6 +218,70 @@ pub const RealFs = struct {
             error.FileNotFound => return null,
             else => return err,
         };
+    }
+
+    fn readRangeImpl(ptr: *anyopaque, alloc: std.mem.Allocator, path: []const u8, offset: u64, len: usize) !?[]u8 {
+        const self: *RealFs = @ptrCast(@alignCast(ptr));
+        const file = self.dir.openFile(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer file.close();
+
+        const stat = try file.stat();
+        if (offset >= stat.size) return try alloc.alloc(u8, 0);
+
+        const available = stat.size - offset;
+        const to_read: usize = @intCast(@min(@as(u64, len), available));
+
+        try file.seekTo(offset);
+        const buf = try alloc.alloc(u8, to_read);
+        errdefer alloc.free(buf);
+
+        var total: usize = 0;
+        while (total < to_read) {
+            const n = try file.read(buf[total..]);
+            if (n == 0) break; // file shrank concurrently; return what we got
+            total += n;
+        }
+
+        return if (total == to_read) buf else try alloc.realloc(buf, total);
+    }
+
+    const RealFileHandle = struct {
+        alloc: std.mem.Allocator,
+        file: std.fs.File,
+    };
+
+    fn openReaderImpl(ptr: *anyopaque, alloc: std.mem.Allocator, path: []const u8) !?FileHandle {
+        const self: *RealFs = @ptrCast(@alignCast(ptr));
+        const file = self.dir.openFile(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        errdefer file.close();
+
+        const handle = try alloc.create(RealFileHandle);
+        handle.* = .{ .alloc = alloc, .file = file };
+
+        return FileHandle{
+            .ptr = handle,
+            .vtable = &.{
+                .read = realFileHandleRead,
+                .close = realFileHandleClose,
+            },
+        };
+    }
+
+    fn realFileHandleRead(ptr: *anyopaque, buffer: []u8) !usize {
+        const handle: *RealFileHandle = @ptrCast(@alignCast(ptr));
+        return handle.file.read(buffer);
+    }
+
+    fn realFileHandleClose(ptr: *anyopaque) void {
+        const handle: *RealFileHandle = @ptrCast(@alignCast(ptr));
+        handle.file.close();
+        handle.alloc.destroy(handle);
     }
 
     fn writeFileImpl(ptr: *anyopaque, alloc: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
@@ -321,7 +443,9 @@ pub const TestFs = struct {
             .ptr = self,
             .vtable = &.{
                 .readFile = readFileImpl,
+                .readRange = readRangeImpl,
                 .writeFile = writeFileImpl,
+                .openReader = openReaderImpl,
                 .deleteFile = deleteFileImpl,
                 .fileExists = fileExistsImpl,
                 .statFile = statFileImpl,
@@ -346,6 +470,58 @@ pub const TestFs = struct {
         const entry = self.files.get(path) orelse return null;
         if (entry.len > max_size) return error.FileTooBig;
         return try alloc.dupe(u8, entry);
+    }
+
+    fn readRangeImpl(ptr: *anyopaque, alloc: std.mem.Allocator, path: []const u8, offset: u64, len: usize) !?[]u8 {
+        const self: *TestFs = @ptrCast(@alignCast(ptr));
+        const entry = self.files.get(path) orelse return null;
+
+        if (offset >= entry.len) return try alloc.alloc(u8, 0);
+
+        const available = entry.len - offset;
+        const to_read: usize = @intCast(@min(@as(u64, len), available));
+        const start: usize = @intCast(offset);
+        return try alloc.dupe(u8, entry[start .. start + to_read]);
+    }
+
+    const TestFileHandle = struct {
+        alloc: std.mem.Allocator,
+        bytes: []u8, // owned duplicate, independent of the live map entry
+        pos: usize,
+    };
+
+    fn openReaderImpl(ptr: *anyopaque, alloc: std.mem.Allocator, path: []const u8) !?FileHandle {
+        const self: *TestFs = @ptrCast(@alignCast(ptr));
+        const entry = self.files.get(path) orelse return null;
+
+        const dup = try alloc.dupe(u8, entry);
+        errdefer alloc.free(dup);
+
+        const handle = try alloc.create(TestFileHandle);
+        handle.* = .{ .alloc = alloc, .bytes = dup, .pos = 0 };
+
+        return FileHandle{
+            .ptr = handle,
+            .vtable = &.{
+                .read = testFileHandleRead,
+                .close = testFileHandleClose,
+            },
+        };
+    }
+
+    fn testFileHandleRead(ptr: *anyopaque, buffer: []u8) !usize {
+        const handle: *TestFileHandle = @ptrCast(@alignCast(ptr));
+        const remaining = handle.bytes[handle.pos..];
+        const n = @min(buffer.len, remaining.len);
+        @memcpy(buffer[0..n], remaining[0..n]);
+        handle.pos += n;
+        return n;
+    }
+
+    fn testFileHandleClose(ptr: *anyopaque) void {
+        const handle: *TestFileHandle = @ptrCast(@alignCast(ptr));
+        handle.alloc.free(handle.bytes);
+        handle.alloc.destroy(handle);
     }
 
     fn writeFileImpl(ptr: *anyopaque, alloc: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
@@ -527,6 +703,146 @@ test "TestFs: readFileLimit enforces the caller's bound" {
     const ok = try tfs.fs().readFileLimit(alloc, "big.txt", 10);
     defer if (ok) |c| alloc.free(c);
     try std.testing.expect(ok != null);
+}
+
+test "TestFs: readRange returns a middle slice" {
+    const alloc = std.testing.allocator;
+    var tfs = TestFs.init(alloc);
+    defer tfs.deinit();
+
+    try tfs.fs().writeFile(alloc, "range.txt", "0123456789");
+
+    const mid = try tfs.fs().readRange(alloc, "range.txt", 3, 4);
+    defer if (mid) |m| alloc.free(m);
+    try std.testing.expect(mid != null);
+    try std.testing.expectEqualStrings("3456", mid.?);
+}
+
+test "TestFs: readRange past end of file returns empty slice, not an error" {
+    const alloc = std.testing.allocator;
+    var tfs = TestFs.init(alloc);
+    defer tfs.deinit();
+
+    try tfs.fs().writeFile(alloc, "range.txt", "short");
+
+    const past_end = try tfs.fs().readRange(alloc, "range.txt", 100, 10);
+    defer if (past_end) |p| alloc.free(p);
+    try std.testing.expect(past_end != null);
+    try std.testing.expectEqual(@as(usize, 0), past_end.?.len);
+}
+
+test "TestFs: readRange clamps a length that overruns the file" {
+    const alloc = std.testing.allocator;
+    var tfs = TestFs.init(alloc);
+    defer tfs.deinit();
+
+    try tfs.fs().writeFile(alloc, "range.txt", "0123456789");
+
+    const clamped = try tfs.fs().readRange(alloc, "range.txt", 8, 10);
+    defer if (clamped) |c| alloc.free(c);
+    try std.testing.expect(clamped != null);
+    try std.testing.expectEqualStrings("89", clamped.?);
+}
+
+test "TestFs: readRange on a missing file returns null" {
+    const alloc = std.testing.allocator;
+    var tfs = TestFs.init(alloc);
+    defer tfs.deinit();
+
+    const result = try tfs.fs().readRange(alloc, "ghost.txt", 0, 10);
+    try std.testing.expectEqual(@as(?[]u8, null), result);
+}
+
+test "TestFs: readRange at offset 0 with len 0 returns an empty slice" {
+    const alloc = std.testing.allocator;
+    var tfs = TestFs.init(alloc);
+    defer tfs.deinit();
+
+    try tfs.fs().writeFile(alloc, "range.txt", "0123456789");
+
+    const empty = try tfs.fs().readRange(alloc, "range.txt", 0, 0);
+    defer if (empty) |e| alloc.free(e);
+    try std.testing.expect(empty != null);
+    try std.testing.expectEqual(@as(usize, 0), empty.?.len);
+}
+
+test "TestFs: openReader streams a file across many small reads" {
+    const alloc = std.testing.allocator;
+    var tfs = TestFs.init(alloc);
+    defer tfs.deinit();
+
+    try tfs.fs().writeFile(alloc, "stream.txt", "the quick brown fox jumps over the lazy dog");
+
+    var handle = (try tfs.fs().openReader(alloc, "stream.txt")).?;
+    defer handle.close();
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+
+    var buf: [3]u8 = undefined;
+    while (true) {
+        const n = try handle.read(&buf);
+        if (n == 0) break;
+        try out.appendSlice(alloc, buf[0..n]);
+    }
+
+    try std.testing.expectEqualStrings("the quick brown fox jumps over the lazy dog", out.items);
+}
+
+test "TestFs: openReader on a missing file returns null" {
+    const alloc = std.testing.allocator;
+    var tfs = TestFs.init(alloc);
+    defer tfs.deinit();
+
+    const handle = try tfs.fs().openReader(alloc, "ghost.txt");
+    try std.testing.expectEqual(@as(?FileHandle, null), handle);
+}
+
+test "TestFs: openReader is independent of later writes to the same path" {
+    const alloc = std.testing.allocator;
+    var tfs = TestFs.init(alloc);
+    defer tfs.deinit();
+
+    try tfs.fs().writeFile(alloc, "stream.txt", "original contents");
+    var handle = (try tfs.fs().openReader(alloc, "stream.txt")).?;
+    defer handle.close();
+
+    // Overwrite the file after opening the handle — the handle should
+    // keep reading the snapshot it was opened with.
+    try tfs.fs().writeFile(alloc, "stream.txt", "REPLACED");
+
+    var buf: [64]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = try handle.read(buf[total..]);
+        if (n == 0) break;
+        total += n;
+    }
+    try std.testing.expectEqualStrings("original contents", buf[0..total]);
+}
+
+test "TestFs: two open readers on the same file have independent cursors" {
+    const alloc = std.testing.allocator;
+    var tfs = TestFs.init(alloc);
+    defer tfs.deinit();
+
+    try tfs.fs().writeFile(alloc, "stream.txt", "0123456789");
+
+    var handle_a = (try tfs.fs().openReader(alloc, "stream.txt")).?;
+    defer handle_a.close();
+    var handle_b = (try tfs.fs().openReader(alloc, "stream.txt")).?;
+    defer handle_b.close();
+
+    var buf_a: [4]u8 = undefined;
+    var buf_b: [2]u8 = undefined;
+    _ = try handle_a.read(&buf_a);
+    _ = try handle_b.read(&buf_b);
+    try std.testing.expectEqualStrings("0123", &buf_a);
+    try std.testing.expectEqualStrings("01", &buf_b);
+
+    const n_a2 = try handle_a.read(buf_a[0..2]);
+    try std.testing.expectEqualStrings("45", buf_a[0..n_a2]);
+    std.debug.print("read bytes: {s}\n", .{buf_a[0..n_a2]});
 }
 
 test "TestFs: overwrite updates contents" {
@@ -798,6 +1114,119 @@ test "RealFs: readFileLimit enforces the caller's bound" {
     const ok = try real.fs().readFileLimit(alloc, "big.txt", 10);
     defer if (ok) |c| alloc.free(c);
     try std.testing.expect(ok != null);
+}
+
+test "RealFs: readRange returns a middle slice on real disk" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var real = RealFs.init(tmp.dir);
+    try real.fs().writeFile(alloc, "range.txt", "0123456789");
+
+    const mid = try real.fs().readRange(alloc, "range.txt", 3, 4);
+    defer if (mid) |m| alloc.free(m);
+    try std.testing.expect(mid != null);
+    try std.testing.expectEqualStrings("3456", mid.?);
+}
+
+test "RealFs: readRange past end of file returns empty slice" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var real = RealFs.init(tmp.dir);
+    try real.fs().writeFile(alloc, "range.txt", "short");
+
+    const past_end = try real.fs().readRange(alloc, "range.txt", 100, 10);
+    defer if (past_end) |p| alloc.free(p);
+    try std.testing.expect(past_end != null);
+    try std.testing.expectEqual(@as(usize, 0), past_end.?.len);
+}
+
+test "RealFs: readRange clamps a length that overruns the file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var real = RealFs.init(tmp.dir);
+    try real.fs().writeFile(alloc, "range.txt", "0123456789");
+
+    const clamped = try real.fs().readRange(alloc, "range.txt", 8, 10);
+    defer if (clamped) |c| alloc.free(c);
+    try std.testing.expect(clamped != null);
+    try std.testing.expectEqualStrings("89", clamped.?);
+}
+
+test "RealFs: readRange on a missing file returns null" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var real = RealFs.init(tmp.dir);
+    const result = try real.fs().readRange(alloc, "ghost", 0, 10);
+    try std.testing.expectEqual(@as(?[]u8, null), result);
+}
+
+test "RealFs: openReader streams a file across many small reads" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var real = RealFs.init(tmp.dir);
+    try real.fs().writeFile(alloc, "stream.txt", "the quick brown fox jumps over the lazy dog");
+
+    var handle = (try real.fs().openReader(alloc, "stream.txt")).?;
+    defer handle.close();
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+
+    var buf: [3]u8 = undefined;
+    while (true) {
+        const n = try handle.read(&buf);
+        if (n == 0) break;
+        try out.appendSlice(alloc, buf[0..n]);
+    }
+
+    try std.testing.expectEqualStrings("the quick brown fox jumps over the lazy dog", out.items);
+}
+
+test "RealFs: openReader on a missing file returns null" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var real = RealFs.init(tmp.dir);
+    const handle = try real.fs().openReader(alloc, "ghost");
+    try std.testing.expectEqual(@as(?FileHandle, null), handle);
+}
+
+test "RealFs: two open readers on the same file have independent cursors" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var real = RealFs.init(tmp.dir);
+    try real.fs().writeFile(alloc, "stream.txt", "0123456789");
+
+    var handle_a = (try real.fs().openReader(alloc, "stream.txt")).?;
+    defer handle_a.close();
+    var handle_b = (try real.fs().openReader(alloc, "stream.txt")).?;
+    defer handle_b.close();
+
+    var buf_a: [4]u8 = undefined;
+    var buf_b: [2]u8 = undefined;
+    _ = try handle_a.read(&buf_a);
+    _ = try handle_b.read(&buf_b);
+    try std.testing.expectEqualStrings("0123", &buf_a);
+    try std.testing.expectEqualStrings("01", &buf_b);
+
+    // Ask for only 2 more bytes here — reusing the full 4-byte `buf_a`
+    // would read "4567" (4 bytes) instead of continuing where handle_a
+    // left off by exactly 2.
+    const n_a2 = try handle_a.read(buf_a[0..2]);
+    try std.testing.expectEqualStrings("45", buf_a[0..n_a2]);
 }
 
 test "RealFs: delete removes file" {
