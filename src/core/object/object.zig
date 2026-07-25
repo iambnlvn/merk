@@ -38,9 +38,14 @@ pub const Store = struct {
         const path = try self.objectPath(encoded.hash);
         defer self.alloc.free(path);
 
-        if (try self.fs.fileExists(path)) return encoded.hash;
+        if (!try self.fs.fileExists(path)) {
+            try self.fs.writeFile(self.alloc, path, encoded.bytes);
+        }
 
-        try self.fs.writeFile(self.alloc, path, encoded.bytes);
+        if (structural_hash) |sh| {
+            try self.addToStructuralIndex(sh, encoded.hash);
+        }
+
         return encoded.hash;
     }
 
@@ -75,29 +80,26 @@ pub const Store = struct {
         return h;
     }
 
-    /// Linear scan for every object sharing a given structural hash.
-    /// O(n) in the object count — fine for now, but the first thing to
-    /// replace with a real side-index once ast object volume grows.
+    /// every object hash ever registered under this structural hash, backed
+    /// by a small flat index file rather than a directory scan
     pub fn findByStructuralHash(self: *const Store, target: Hash) ![]Hash {
-        const names = try self.fs.listFiles(self.alloc, self.objects_dir);
-        defer freeNames(self.alloc, names);
+        const path = try self.structuralIndexPath(target);
+        defer self.alloc.free(path);
 
-        var matches: std.ArrayListUnmanaged(Hash) = .{};
-        errdefer matches.deinit(self.alloc);
+        const bytes = (try self.fs.readFile(self.alloc, path)) orelse
+            return try self.alloc.alloc(Hash, 0);
+        defer self.alloc.free(bytes);
 
-        for (names) |name| {
-            if (!isObjectFileName(name)) continue;
+        const hlen = @sizeOf(Hash);
+        const n = bytes.len / hlen;
+        const result = try self.alloc.alloc(Hash, n);
+        errdefer self.alloc.free(result);
 
-            const hex = name[name.len - 64 ..];
-            const obj_hash = hash_mod.fromHex(hex) catch continue;
-
-            const sh = (try self.getStructuralHash(obj_hash)) orelse continue;
-            if (std.mem.eql(u8, &sh, &target)) {
-                try matches.append(self.alloc, obj_hash);
-            }
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            @memcpy(&result[i], bytes[i * hlen ..][0..hlen]);
         }
-
-        return try matches.toOwnedSlice(self.alloc);
+        return result;
     }
 
     /// Read and parse only the fixed-size header, without pulling the
@@ -122,6 +124,10 @@ pub const Store = struct {
     ///  !NOTE: tho objects are meant to be immutable but this might be
     /// useful for gc-style tools
     pub fn delete(self: *const Store, obj_hash: Hash) !void {
+        if (self.getStructuralHash(obj_hash) catch null) |sh| {
+            self.removeFromStructuralIndex(sh, obj_hash) catch {};
+        }
+
         const path = try self.objectPath(obj_hash);
         defer self.alloc.free(path);
         try self.fs.deleteFile(path);
@@ -155,6 +161,69 @@ pub const Store = struct {
         }
         return total;
     }
+    fn structuralIndexPath(self: *const Store, sh: Hash) ![]u8 {
+        var hex_buf: [64]u8 = undefined;
+        const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{sh}) catch unreachable;
+
+        if (self.objects_dir.len == 0) {
+            return std.fmt.allocPrint(self.alloc, "structural_index/{s}/{s}/{s}", .{ hex[0..2], hex[2..4], hex });
+        }
+        return std.fmt.allocPrint(self.alloc, "{s}/structural_index/{s}/{s}/{s}", .{ self.objects_dir, hex[0..2], hex[2..4], hex });
+    }
+
+    fn addToStructuralIndex(self: *const Store, sh: Hash, obj_hash: Hash) !void {
+        const path = try self.structuralIndexPath(sh);
+        defer self.alloc.free(path);
+
+        const existing = try self.fs.readFile(self.alloc, path);
+        defer if (existing) |e| self.alloc.free(e);
+
+        if (existing) |bytes| {
+            const hashes = std.mem.bytesAsSlice(Hash, bytes);
+            for (hashes) |existing_hash| {
+                if (std.mem.eql(u8, &existing_hash, &obj_hash)) return; // already registered
+            }
+
+            const new_bytes = try self.alloc.alloc(u8, bytes.len + @sizeOf(Hash));
+            defer self.alloc.free(new_bytes);
+
+            @memcpy(new_bytes[0..bytes.len], bytes);
+            @memcpy(new_bytes[bytes.len..], &obj_hash);
+
+            try self.fs.writeFile(self.alloc, path, new_bytes);
+        } else {
+            try self.fs.writeFile(self.alloc, path, &obj_hash);
+        }
+    }
+
+    fn removeFromStructuralIndex(self: *const Store, sh: Hash, obj_hash: Hash) !void {
+        const path = try self.structuralIndexPath(sh);
+        defer self.alloc.free(path);
+
+        const existing = (try self.fs.readFile(self.alloc, path)) orelse return;
+        defer self.alloc.free(existing);
+
+        const new_bytes = try self.alloc.alloc(u8, existing.len);
+        defer self.alloc.free(new_bytes);
+
+        const existing_hashes = std.mem.bytesAsSlice(Hash, existing);
+        var out_hashes = std.mem.bytesAsSlice(Hash, new_bytes);
+        var out_count: usize = 0;
+
+        for (existing_hashes) |existing_hash| {
+            if (!std.mem.eql(u8, &existing_hash, &obj_hash)) {
+                out_hashes[out_count] = existing_hash;
+                out_count += 1;
+            }
+        }
+
+        if (out_count == 0) {
+            try self.fs.deleteFile(path);
+        } else {
+            const out_bytes = std.mem.sliceAsBytes(out_hashes[0..out_count]);
+            try self.fs.writeFile(self.alloc, path, out_bytes);
+        }
+    }
 
     pub const VerifyReport = struct {
         checked: usize = 0,
@@ -176,7 +245,7 @@ pub const Store = struct {
         defer freeNames(self.alloc, names);
 
         for (names) |name| {
-            if (!isObjectFileName(name)) continue;
+            if (!isObjectFileName(name) or name.len < 64) continue;
             report.checked += 1;
 
             const hex = name[name.len - 64 ..];
@@ -187,14 +256,16 @@ pub const Store = struct {
 
             if (self.get(obj_hash)) |obj| {
                 self.alloc.free(obj.payload);
-            } else |_| {
-                try report.corrupt.append(self.alloc, obj_hash);
+            } else |err| {
+                switch (err) {
+                    error.CorruptObject, error.HashMismatch => try report.corrupt.append(self.alloc, obj_hash),
+                    else => return err,
+                }
             }
         }
 
         return report;
     }
-
     /// Resolve a hex prefix to the single object hash it identifies
     pub fn resolveHashPrefix(self: *const Store, prefix: []const u8) !Hash {
         try hash_mod.parseHexPrefix(prefix);
