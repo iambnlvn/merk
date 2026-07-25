@@ -1,13 +1,3 @@
-//  On-disk layout (relative to whatever `objects_dir` Store is given):
-//    <objects_dir>/<xx>/<yy>/<full-hex-hash>
-//  Where <xx> = first 2 hex chars, <yy> = next 2 hex chars.
-//
-//  This is a thin layer over io.FileSystem: all the encode/decode/hash
-//  logic lives in object_format.zig, and all atomicity guarantees come
-//  from FileSystem.writeFile itself (see RealFs.writeFileImpl's
-//  temp-file-then-rename dance) — Store no longer manages any of that
-//  itself, which is the main win of building on io.zig.
-
 const std = @import("std");
 const io = @import("merk").io;
 const format = @import("./object_format.zig");
@@ -32,8 +22,17 @@ pub const Store = struct {
     }
 
     pub fn put(self: *const Store, obj_type: ObjectType, payload: []const u8) !Hash {
+        return self.putWithStructuralHash(obj_type, payload, null);
+    }
+
+    pub fn putWithStructuralHash(
+        self: *const Store,
+        obj_type: ObjectType,
+        payload: []const u8,
+        structural_hash: ?Hash,
+    ) !Hash {
         const codec = compression.choose(payload.len);
-        const encoded = try format.encodeAlloc(self.alloc, obj_type, payload, codec);
+        const encoded = try format.encodeAlloc(self.alloc, obj_type, payload, codec, structural_hash);
         defer self.alloc.free(encoded.bytes);
 
         const path = try self.objectPath(encoded.hash);
@@ -53,6 +52,52 @@ pub const Store = struct {
         defer self.alloc.free(bytes);
 
         return format.decodeFromBuffer(self.alloc, bytes);
+    }
+
+    /// Read just the structural hash of an object, without decompressing
+    /// or materializing its payload. Returns null if the object has none.
+    pub fn getStructuralHash(self: *const Store, obj_hash: Hash) !?Hash {
+        const path = try self.objectPath(obj_hash);
+        defer self.alloc.free(path);
+
+        const header_buf = (try self.fs.readRange(self.alloc, path, 0, format.header_len)) orelse return error.NotFound;
+        defer self.alloc.free(header_buf);
+        const header = try format.decodeHeaderFromBuffer(header_buf);
+
+        if (!header.has_structural_hash) return null;
+
+        const offset = format.structuralHashOffset(header);
+        const buf = (try self.fs.readRange(self.alloc, path, offset, format.structural_hash_len)) orelse return error.NotFound;
+        defer self.alloc.free(buf);
+
+        var h: Hash = undefined;
+        @memcpy(&h, buf[0..format.structural_hash_len]);
+        return h;
+    }
+
+    /// Linear scan for every object sharing a given structural hash.
+    /// O(n) in the object count — fine for now, but the first thing to
+    /// replace with a real side-index once ast object volume grows.
+    pub fn findByStructuralHash(self: *const Store, target: Hash) ![]Hash {
+        const names = try self.fs.listFiles(self.alloc, self.objects_dir);
+        defer freeNames(self.alloc, names);
+
+        var matches: std.ArrayListUnmanaged(Hash) = .{};
+        errdefer matches.deinit(self.alloc);
+
+        for (names) |name| {
+            if (!isObjectFileName(name)) continue;
+
+            const hex = name[name.len - 64 ..];
+            const obj_hash = hash_mod.fromHex(hex) catch continue;
+
+            const sh = (try self.getStructuralHash(obj_hash)) orelse continue;
+            if (std.mem.eql(u8, &sh, &target)) {
+                try matches.append(self.alloc, obj_hash);
+            }
+        }
+
+        return try matches.toOwnedSlice(self.alloc);
     }
 
     /// Read and parse only the fixed-size header, without pulling the
@@ -536,4 +581,73 @@ test "ObjectReader.init on a missing hash returns NotFound" {
     ghost[0] = 0xEF;
 
     try std.testing.expectError(error.NotFound, ObjectReader.init(&store, ghost));
+}
+
+test "findByStructuralHash finds every ast object sharing a structural hash" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+
+    const store = Store.init(alloc, tfs.fs(), "objects");
+
+    const shared_sh: Hash = [_]u8{0xAB} ** 32;
+    const other_sh: Hash = [_]u8{0xCD} ** 32;
+
+    // Two distinct `ast` payloads that normalize to the same structural
+    // hash (e.g. same logic, different formatting/comments)
+    const h1 = try store.putWithStructuralHash(.ast, "fn foo() void { return; }", shared_sh);
+    const h2 = try store.putWithStructuralHash(.ast, "fn foo() void {\n    return;\n}", shared_sh);
+
+    // An unrelated ast object with a different structural hash
+    const h3 = try store.putWithStructuralHash(.ast, "fn bar() void {}", other_sh);
+
+    // A plain blob with no structural hash at all — must never surface
+    const h4 = try store.put(.blob, "not an ast object");
+
+    const matches = try store.findByStructuralHash(shared_sh);
+    defer alloc.free(matches);
+
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+
+    var found_h1 = false;
+    var found_h2 = false;
+    for (matches) |m| {
+        if (std.mem.eql(u8, &m, &h1)) found_h1 = true;
+        if (std.mem.eql(u8, &m, &h2)) found_h2 = true;
+        // Sanity: neither the differently-hashed nor the plain blob leaked in
+        try std.testing.expect(!std.mem.eql(u8, &m, &h3));
+        try std.testing.expect(!std.mem.eql(u8, &m, &h4));
+    }
+    try std.testing.expect(found_h1);
+    try std.testing.expect(found_h2);
+
+    const no_matches = try store.findByStructuralHash(std.mem.zeroes(Hash));
+    defer alloc.free(no_matches);
+    try std.testing.expectEqual(@as(usize, 0), no_matches.len);
+}
+
+test "getStructuralHash returns null for objects encoded without one" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const h = try store.put(.blob, "no structural hash here");
+
+    const sh = try store.getStructuralHash(h);
+    try std.testing.expect(sh == null);
+}
+
+test "getStructuralHash round-trips without touching the payload" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const sh: Hash = [_]u8{0x42} ** 32;
+    const h = try store.putWithStructuralHash(.ast, "struct Foo { x: i32 }", sh);
+
+    const got = try store.getStructuralHash(h);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualSlices(u8, &sh, &got.?);
 }
