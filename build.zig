@@ -113,7 +113,17 @@ pub fn build(b: *std.Build) void {
         optimize,
         mod,
     );
+    const obj_step = addModuleTest(
+        b,
+        "test-object",
+        "Run object unit tests",
+        "src/core/object/object.zig",
+        target,
+        optimize,
+        mod,
+    );
 
     test_step.dependOn(refs_step);
     test_step.dependOn(focus_step);
+    test_step.dependOn(obj_step);
 }

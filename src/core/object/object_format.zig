@@ -25,13 +25,13 @@ pub const ObjectType = enum(u8) {
 pub const MAGIC: u32 = 0x4D_45_52_4B;
 pub const VERSION: u8 = 2;
 
-/// Size in bytes of the fixed-width header described above
+/// Size in bytes of the fixed-width header described above.
 pub const header_len = 16;
 const hash_len = @sizeOf(Hash);
 
 /// Size in bytes of the structural hash trailer, when present. Exported
-/// so callers (e.g. Store) can compute offsets without reaching into
-/// this module's internals.
+/// so `Store` can compute trailer offsets without reaching into this
+/// module's internals.
 pub const structural_hash_len = hash_len;
 
 const flag_has_structural_hash: u8 = 1 << 0;
@@ -48,10 +48,8 @@ pub const ObjectHeader = struct {
 pub const Object = struct {
     obj_type: ObjectType,
     payload: []u8,
-    /// Present only for objects (typically `ast`) encoded with a
-    /// structural hash. Callers are responsible for computing this over
-    /// whatever normalized representation they use; this module just
-    /// stores and verifies it round-trips.
+    /// Round-tripped exactly as encoded. See the trust-boundary note
+    /// above: this is not integrity-checked the way content hashing is.
     structural_hash: ?Hash = null,
 };
 
@@ -96,6 +94,11 @@ pub fn encodeAlloc(
     return .{ .bytes = bytes, .hash = obj_hash };
 }
 
+/// Fully decode an object: header, decompressed body, verified content
+/// hash. Fails closed on every structural anomaly — bad magic, wrong
+/// version, out-of-range enum bytes, a length that doesn't match the
+/// header's claims, or a content hash mismatch all return an error
+/// rather than a partially-trustworthy `Object`
 pub fn decodeFromBuffer(alloc: std.mem.Allocator, bytes: []const u8) !Object {
     if (bytes.len < header_len) return error.CorruptObject;
     const header = try decodeHeaderFromBuffer(bytes[0..header_len]);
@@ -126,6 +129,19 @@ pub fn decodeFromBuffer(alloc: std.mem.Allocator, bytes: []const u8) !Object {
     return .{ .obj_type = header.obj_type, .payload = payload, .structural_hash = structural_hash };
 }
 
+/// Decode just the fixed header, without touching the body. This is the
+/// primitive `Store.getHeader` and `Store.getStructuralHash` build on to
+/// answer cheap questions ("does this object have a structural hash?")
+/// without paying for a decompress.
+///
+/// `bytes` is untrusted — it comes straight off disk and may be
+/// truncated, bit-rotted, or hostile. Validation applied, in order:
+///
+///   - magic mismatch      -> `error.CorruptObject`
+///   - version mismatch    -> `error.UnsupportedVersion` (distinct from
+///                             CorruptObject: "I don't know how to read
+///                             this version" vs. "this is garbage")
+///   - `type`/`codec` byte with no matching enum tag -> `error.CorruptObject`.
 pub fn decodeHeaderFromBuffer(bytes: []const u8) !ObjectHeader {
     if (bytes.len < header_len) return error.CorruptObject;
 
@@ -135,8 +151,9 @@ pub fn decodeHeaderFromBuffer(bytes: []const u8) !ObjectHeader {
     const version = bytes[4];
     if (version != VERSION) return error.UnsupportedVersion;
 
-    const obj_type: ObjectType = @enumFromInt(bytes[5]);
-    const codec: compression.Codec = @enumFromInt(bytes[6]);
+    const obj_type = std.meta.intToEnum(ObjectType, bytes[5]) catch return error.CorruptObject;
+    const codec = std.meta.intToEnum(compression.Codec, bytes[6]) catch return error.CorruptObject;
+
     const flags = bytes[7];
     const payload_len = std.mem.readInt(u32, bytes[8..12], .little);
     const stored_len = std.mem.readInt(u32, bytes[12..16], .little);
@@ -168,6 +185,11 @@ pub fn structuralHashOffset(header: ObjectHeader) usize {
     return header_len + @as(usize, header.stored_len) + hash_len;
 }
 
+// TODO(chunking): content-defined chunking — splitting large payloads
+// into chunks referenced by a manifest object instead of one monolithic
+// blob — would plug in here via a real chunk callback passed to
+// `compression.encodeBody`. `noOpChunk` is a placeholder satisfying that
+// callback's signature until chunking exists; it performs no chunking.
 fn noOpChunk(_: []const u8) void {}
 
 fn compressAlloc(alloc: std.mem.Allocator, codec: compression.Codec, payload: []const u8) ![]u8 {
@@ -269,12 +291,51 @@ test "decodeHeaderFromBuffer rejects a truncated buffer" {
     try std.testing.expectError(error.CorruptObject, decodeHeaderFromBuffer(&bytes));
 }
 
+test "decodeHeaderFromBuffer rejects an out-of-range object type byte" {
+    var bytes: [header_len]u8 = undefined;
+    std.mem.writeInt(u32, bytes[0..4], MAGIC, .little);
+    bytes[4] = VERSION;
+    bytes[5] = 0xFF; // no ObjectType tag is 255
+    bytes[6] = 0;
+    @memset(bytes[7..], 0);
+
+    try std.testing.expectError(error.CorruptObject, decodeHeaderFromBuffer(&bytes));
+}
+
+test "decodeHeaderFromBuffer rejects an out-of-range codec byte" {
+    var bytes: [header_len]u8 = undefined;
+    std.mem.writeInt(u32, bytes[0..4], MAGIC, .little);
+    bytes[4] = VERSION;
+    bytes[5] = @intFromEnum(ObjectType.blob);
+    bytes[6] = 0xFF; // no Codec tag is 255
+    @memset(bytes[7..], 0);
+
+    try std.testing.expectError(error.CorruptObject, decodeHeaderFromBuffer(&bytes));
+}
+
+test "decodeHeaderFromBuffer ignores unrecognized flag bits (forward compatibility)" {
+    var bytes: [header_len]u8 = undefined;
+    std.mem.writeInt(u32, bytes[0..4], MAGIC, .little);
+    bytes[4] = VERSION;
+    bytes[5] = @intFromEnum(ObjectType.blob);
+    bytes[6] = @intFromEnum(compression.Codec.none);
+    bytes[7] = 0b1000_0001; // known bit 0 set + an unrecognized high bit
+    std.mem.writeInt(u32, bytes[8..12], 0, .little);
+    std.mem.writeInt(u32, bytes[12..16], 0, .little);
+
+    // Must not error: an unrecognized flag bit is ignored, not treated
+    // as corruption, so an object written by a hypothetical future
+    // version (that only sets metadata flags, no new trailer bytes)
+    // still decodes cleanly under this version.
+    const header = try decodeHeaderFromBuffer(&bytes);
+    try std.testing.expect(header.has_structural_hash);
+}
+
 test "decodeFromBuffer rejects a tampered trailer hash" {
     const alloc = std.testing.allocator;
     const encoded = try encodeAlloc(alloc, .blob, "tamper me", .none, null);
     defer alloc.free(encoded.bytes);
 
-    // Flip a bit in the trailing hash without touching anything else
     encoded.bytes[encoded.bytes.len - 1] ^= 0xFF;
 
     try std.testing.expectError(error.HashMismatch, decodeFromBuffer(alloc, encoded.bytes));
@@ -285,7 +346,6 @@ test "decodeFromBuffer rejects a buffer shorter than the header claims" {
     const encoded = try encodeAlloc(alloc, .blob, "size mismatch", .none, null);
     defer alloc.free(encoded.bytes);
 
-    // Truncate the buffer so it no longer matches header_len + stored_len + hash_len
     const truncated = encoded.bytes[0 .. encoded.bytes.len - 4];
     try std.testing.expectError(error.CorruptObject, decodeFromBuffer(alloc, truncated));
 }
@@ -328,8 +388,6 @@ test "structural hash trailer does not affect the content hash" {
     const with_sh = try encodeAlloc(alloc, .ast, payload, .none, sh);
     defer alloc.free(with_sh.bytes);
 
-    // Same type + same payload => same content hash, regardless of
-    // whether a structural hash is attached
     try std.testing.expectEqualSlices(u8, &without_sh.hash, &with_sh.hash);
 }
 
@@ -349,8 +407,6 @@ test "decodeHeaderFromBuffer reports has_structural_hash from the flags byte" {
 }
 
 test "old-style objects with a zero flags byte decode with no structural hash" {
-    // Simulates a pre-existing object encoded before this feature existed:
-    // byte 7 was always-zero `reserved`, which is exactly flags = 0 today.
     const alloc = std.testing.allocator;
     const encoded = try encodeAlloc(alloc, .blob, "legacy object", .none, null);
     defer alloc.free(encoded.bytes);
