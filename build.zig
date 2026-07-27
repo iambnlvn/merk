@@ -123,7 +123,18 @@ pub fn build(b: *std.Build) void {
         mod,
     );
 
+    const commit_step = addModuleTest(
+        b,
+        "test-commit",
+        "Run commit unit tests",
+        "src/core/commit.zig",
+        target,
+        optimize,
+        mod,
+    );
+
     test_step.dependOn(refs_step);
     test_step.dependOn(focus_step);
     test_step.dependOn(obj_step);
+    test_step.dependOn(commit_step);
 }
