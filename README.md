@@ -1,29 +1,29 @@
-# Nodus
+# merk
 
-Nodus is a small, content-addressed distributed version control system written in Zig.
+merk is a small, content-addressed distributed version control system written in Zig.
 It focuses on a clean core/CLI separation, structured commit metadata, and an extensible diff engine.
 
 ## Features
 
-- `nodus init` — initialize a repository
-- `nodus add` — stage files in the index
-- `nodus commit` — create structured commits with trailers, intent, labels, and author/committer metadata
-- `nodus diff` — compare working tree, index, or commit histories with configurable diff rendering
-- `nodus show` — inspect commit contents and metadata
-- `nodus write-tree` — write the current index as a tree object
+- `merk init` — initialize a repository
+- `merk add` — stage files in the index
+- `merk commit` — create structured commits with trailers, intent, labels, and author/committer metadata
+- `merk diff` — compare working tree, index, or commit histories with configurable diff rendering
+- `merk show` — inspect commit contents and metadata
+- `merk write-tree` — write the current index as a tree object
 - Content-addressed object store using BLAKE3
 
 ## Quick start
 
 ```bash
 zig build install
-./zig-out/bin/nodus init
-./zig-out/bin/nodus add src/**/*.zig
-./zig-out/bin/nodus commit -m "feat: add initial diff command"
-./zig-out/bin/nodus diff
+./zig-out/bin/merk init
+./zig-out/bin/merk add src/**/*.zig
+./zig-out/bin/merk commit -m "feat: add initial diff command"
+./zig-out/bin/merk diff
 ```
 
-If you want to run `nodus` without using the install prefix directly, add the install bin directory to your `PATH`:
+If you want to run `merk` without using the install prefix directly, add the install bin directory to your `PATH`:
 
 ```bash
 export PATH="$PWD/zig-out/bin:$PATH"
@@ -31,33 +31,33 @@ export PATH="$PWD/zig-out/bin:$PATH"
 
 ## Commands
 
-### `nodus init`
+### `merk init`
 
 Create a new repository in the current directory.
 
-### `nodus add <path>`
+### `merk add <path>`
 
 Stage files into the index.
 
-### `nodus commit -m <message>`
+### `merk commit -m <message>`
 
 Record staged changes as a new commit.
 
-### `nodus diff [options] [<path>...]`
+### `merk diff [options] [<path>...]`
 
 Show changes between the working tree and index, or between commits using `--rev`.
 
-### `nodus show`
+### `merk show`
 
 Inspect commit data and differences for a commit or range.
 
-### `nodus write-tree`
+### `merk write-tree`
 
 Write the current staging index as a tree object.
 
 ## Diff command overview
 
-`nodus diff` supports:
+`merk diff` supports:
 
 - `--format` — `unified`, `side-by-side`, `blocks`, `ops`, `summary`
 - `--level` — `file`, `hunk`, `line`, `word`
@@ -67,7 +67,7 @@ Write the current staging index as a tree object.
 - `--show` — `added`, `deleted`, `modified`
 - `--rev` — compare commits by full or short hash prefixes
 
-`nodus diff --rev <hash>` now resolves short commit prefixes against the local object store.
+`merk diff --rev <hash>` now resolves short commit prefixes against the local object store.
 
 ## Development
 

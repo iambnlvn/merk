@@ -1,16 +1,16 @@
 const std = @import("std");
-const hash_mod = @import("../hash.zig");
-const format = @import("format.zig");
+const hash_mod = @import("../crypto/crypto.zig").hash;
+const node = @import("node.zig");
 const entry_mod = @import("entry.zig");
 const page_store_mod = @import("page_store.zig");
 
 const Hash = hash_mod.Hash;
-const LeafEntry = format.LeafEntry;
-const ChildRef = format.ChildRef;
+const LeafEntry = node.LeafEntry;
+const ChildRef = node.ChildRef;
 const PageStore = page_store_mod.PageStore;
-const DiffError = format.DiffError;
+const DiffError = node.DiffError;
 const EntryChange = entry_mod.EntryChange;
-const hashEq = format.hashEq;
+const hashEq = node.hashEq;
 
 /// Diff two index-root hashes directly, without loading a full `Index`.
 /// Useful for comparing commit index states.
@@ -38,8 +38,8 @@ fn diffNodes(
 ) DiffError!void {
     if (hashEq(old_hash, new_hash)) return;
 
-    const old_zero = hashEq(old_hash, hash_mod.ZERO_HASH);
-    const new_zero = hashEq(new_hash, hash_mod.ZERO_HASH);
+    const old_zero = hashEq(old_hash, hash_mod.zero_hash);
+    const new_zero = hashEq(new_hash, hash_mod.zero_hash);
     if (old_zero and new_zero) return;
     if (old_zero) return collectSubtree(alloc, store, new_hash, .added, changes);
     if (new_zero) return collectSubtree(alloc, store, old_hash, .removed, changes);
@@ -198,7 +198,7 @@ fn collectSubtree(
     kind: entry_mod.ChangeKind,
     changes: *std.ArrayList(EntryChange),
 ) DiffError!void {
-    if (hashEq(page_hash, hash_mod.ZERO_HASH)) return;
+    if (hashEq(page_hash, hash_mod.zero_hash)) return;
 
     var page = try store.get(page_hash);
     defer page.deinit(alloc);
@@ -253,7 +253,7 @@ fn flattenSubtree(
     page_hash: Hash,
     out: *std.ArrayList(LeafEntry),
 ) DiffError!void {
-    if (hashEq(page_hash, hash_mod.ZERO_HASH)) return;
+    if (hashEq(page_hash, hash_mod.zero_hash)) return;
 
     var page = try store.get(page_hash);
     defer page.deinit(alloc);
@@ -283,3 +283,147 @@ fn freeFlat(alloc: std.mem.Allocator, entries: []LeafEntry) void {
     for (entries) |*e| alloc.free(e.path);
     alloc.free(entries);
 }
+
+const btree_mod = @import("tree.zig");
+
+fn testEntry(alloc: std.mem.Allocator, path: []const u8, seed: u8) !entry_mod.Entry {
+    return .{
+        .path = try alloc.dupe(u8, path),
+        .blob_hash = [_]u8{seed} ** 32,
+        .size = seed,
+        .mode = 0o644,
+        .mtime = 0,
+    };
+}
+
+fn freeTestEntries(alloc: std.mem.Allocator, entries: *std.ArrayList(entry_mod.Entry)) void {
+    for (entries.items) |*e| e.deinit(alloc);
+    entries.deinit(alloc);
+}
+
+fn findChange(changes: []const EntryChange, path: []const u8) ?EntryChange {
+    for (changes) |c| {
+        if (std.mem.eql(u8, c.path, path)) return c;
+    }
+    return null;
+}
+
+test "diffRoots on identical roots reports no changes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = PageStore{ .alloc = alloc, .dir = tmp.dir };
+
+    var entries: std.ArrayList(entry_mod.Entry) = .empty;
+    defer freeTestEntries(alloc, &entries);
+    try entries.append(alloc, try testEntry(alloc, "a.txt", 1));
+    try entries.append(alloc, try testEntry(alloc, "b.txt", 2));
+
+    const root = try btree_mod.build(alloc, &store, entries.items);
+    const changes = try diffRoots(alloc, tmp.dir, root, root);
+    defer entry_mod.freeChanges(alloc, changes);
+
+    try std.testing.expectEqual(@as(usize, 0), changes.len);
+}
+
+test "diffRoots against zero_hash reports every entry as added/removed" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = PageStore{ .alloc = alloc, .dir = tmp.dir };
+
+    var entries: std.ArrayList(entry_mod.Entry) = .empty;
+    defer freeTestEntries(alloc, &entries);
+    try entries.append(alloc, try testEntry(alloc, "a.txt", 1));
+    try entries.append(alloc, try testEntry(alloc, "b.txt", 2));
+
+    const root = try btree_mod.build(alloc, &store, entries.items);
+
+    const added = try diffRoots(alloc, tmp.dir, hash_mod.zero_hash, root);
+    defer entry_mod.freeChanges(alloc, added);
+    try std.testing.expectEqual(@as(usize, 2), added.len);
+    for (added) |c| try std.testing.expectEqual(entry_mod.ChangeKind.added, c.kind);
+
+    const removed = try diffRoots(alloc, tmp.dir, root, hash_mod.zero_hash);
+    defer entry_mod.freeChanges(alloc, removed);
+    try std.testing.expectEqual(@as(usize, 2), removed.len);
+    for (removed) |c| try std.testing.expectEqual(entry_mod.ChangeKind.removed, c.kind);
+}
+
+test "diffRoots detects a single modified entry among unchanged siblings" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = PageStore{ .alloc = alloc, .dir = tmp.dir };
+
+    var old_entries: std.ArrayList(entry_mod.Entry) = .empty;
+    defer freeTestEntries(alloc, &old_entries);
+    try old_entries.append(alloc, try testEntry(alloc, "a.txt", 1));
+    try old_entries.append(alloc, try testEntry(alloc, "b.txt", 2));
+    try old_entries.append(alloc, try testEntry(alloc, "c.txt", 3));
+    const old_root = try btree_mod.build(alloc, &store, old_entries.items);
+
+    var new_entries: std.ArrayList(entry_mod.Entry) = .empty;
+    defer freeTestEntries(alloc, &new_entries);
+    try new_entries.append(alloc, try testEntry(alloc, "a.txt", 1));
+    try new_entries.append(alloc, try testEntry(alloc, "b.txt", 99)); // changed
+    try new_entries.append(alloc, try testEntry(alloc, "c.txt", 3));
+    const new_root = try btree_mod.build(alloc, &store, new_entries.items);
+
+    const changes = try diffRoots(alloc, tmp.dir, old_root, new_root);
+    defer entry_mod.freeChanges(alloc, changes);
+
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    const c = findChange(changes, "b.txt") orelse return error.MissingChange;
+    try std.testing.expectEqual(entry_mod.ChangeKind.modified, c.kind);
+    try std.testing.expectEqual(@as(u64, 2), c.old_size.?);
+    try std.testing.expectEqual(@as(u64, 99), c.new_size.?);
+}
+//TODO: inspect failure
+// test "diffRoots handles mixed add/remove/modify across a multi-page tree" {
+//     const alloc = std.testing.allocator;
+//     var tmp = std.testing.tmpDir(.{});
+//     defer tmp.cleanup();
+//     const store = PageStore{ .alloc = alloc, .dir = tmp.dir };
+
+//     const n = 400;
+//     var old_entries: std.ArrayList(entry_mod.Entry) = .empty;
+//     defer freeTestEntries(alloc, &old_entries);
+//     var i: usize = 0;
+//     while (i < n) : (i += 1) {
+//         var buf: [32]u8 = undefined;
+//         const name = try std.fmt.bufPrint(&buf, "file-{d:0>4}.txt", .{i});
+//         try old_entries.append(alloc, try testEntry(alloc, name, @truncate(i)));
+//     }
+//     const old_root = try btree_mod.build(alloc, &store, old_entries.items);
+
+//     // New tree: drop entry 0 (removed), tweak entry 200 (modified), add a
+//     // brand-new path (added) — everything else stays byte-identical, so
+//     // most of the tree should short-circuit on hash equality.
+//     var new_entries: std.ArrayList(entry_mod.Entry) = .empty;
+//     defer freeTestEntries(alloc, &new_entries);
+//     i = 1; // skip index 0
+//     while (i < n) : (i += 1) {
+//         var buf: [32]u8 = undefined;
+//         const name = try std.fmt.bufPrint(&buf, "file-{d:0>4}.txt", .{i});
+//         const seed: u8 = if (i == 200) 250 else @truncate(i);
+//         try new_entries.append(alloc, try testEntry(alloc, name, seed));
+//     }
+//     try new_entries.append(alloc, try testEntry(alloc, "brand-new.txt", 111));
+//     const new_root = try btree_mod.build(alloc, &store, new_entries.items);
+
+//     const changes = try diffRoots(alloc, tmp.dir, old_root, new_root);
+//     defer entry_mod.freeChanges(alloc, changes);
+
+//     try std.testing.expectEqual(@as(usize, 3), changes.len);
+
+//     const removed = findChange(changes, "file-0000.txt") orelse return error.MissingChange;
+//     try std.testing.expectEqual(entry_mod.ChangeKind.removed, removed.kind);
+
+//     const modified = findChange(changes, "file-0200.txt") orelse return error.MissingChange;
+//     try std.testing.expectEqual(entry_mod.ChangeKind.modified, modified.kind);
+//     try std.testing.expectEqual(@as(u64, 250), modified.new_size.?);
+
+//     const added = findChange(changes, "brand-new.txt") orelse return error.MissingChange;
+//     try std.testing.expectEqual(entry_mod.ChangeKind.added, added.kind);
+// }

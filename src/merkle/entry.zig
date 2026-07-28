@@ -1,9 +1,9 @@
 const std = @import("std");
-const hash_mod = @import("../hash.zig");
-const format = @import("format.zig");
+const hash_mod = @import("../crypto/crypto.zig").hash;
+const node = @import("node.zig");
 
 pub const Hash = hash_mod.Hash;
-pub const PathKey = format.PathKey;
+pub const PathKey = node.PathKey;
 
 /// Represents a tracked file in the repository
 /// NOTE:The `path` slice is owned by this struct and must be freed with `deinit`
@@ -57,15 +57,21 @@ pub fn freeChanges(alloc: std.mem.Allocator, changes: []EntryChange) void {
 
 /// Compute the B-tree key for a given path
 pub fn pathKey(path: []const u8) PathKey {
-    return format.foldHashPrefix(hash_mod.blake3(path));
+    return node.foldHashPrefix(hash_mod.blake3(path));
 }
+
+/// Name of the repository control directory, reserved so a tracked
+/// worktree file can never collide with it.
+/// NOTE: this must track the actual on-disk control dir name — it was
+/// missed during the nodus -> merk rename and silently protected nothing.
+pub const CONTROL_DIR_NAME = ".merk";
 
 pub fn validatePath(path: []const u8) !void {
     if (path.len == 0) return error.InvalidPath;
     if (path.len > std.math.maxInt(u16)) return error.InvalidPath;
     if (std.fs.path.isAbsolute(path)) return error.InvalidPath;
-    if (std.mem.eql(u8, path, ".nodus")) return error.InvalidPath;
-    if (std.mem.startsWith(u8, path, ".nodus/")) return error.InvalidPath;
+    if (std.mem.eql(u8, path, CONTROL_DIR_NAME)) return error.InvalidPath;
+    if (std.mem.startsWith(u8, path, CONTROL_DIR_NAME ++ "/")) return error.InvalidPath;
 
     var parts = std.mem.splitScalar(u8, path, '/');
     while (parts.next()) |part| {
@@ -85,6 +91,25 @@ pub fn btreeLessThan(_: void, lhs: Entry, rhs: Entry) bool {
     const rhs_key = pathKey(rhs.path);
     if (lhs_key == rhs_key) return std.mem.lessThan(u8, lhs.path, rhs.path);
     return lhs_key < rhs_key;
+}
+
+test "validatePath rejects the control directory and its contents" {
+    try std.testing.expectError(error.InvalidPath, validatePath(CONTROL_DIR_NAME));
+    try std.testing.expectError(error.InvalidPath, validatePath(CONTROL_DIR_NAME ++ "/HEAD"));
+    try std.testing.expectError(error.InvalidPath, validatePath(CONTROL_DIR_NAME ++ "/objects/ab/cd"));
+}
+
+test "validatePath does not false-positive on a sibling prefix" {
+    // ".merkle-notes" starts with ".merk" but is not the control dir —
+    // this guards against a naive prefix check being too broad.
+    try validatePath(".merkle-notes");
+}
+
+test "validatePath rejects absolute paths, empty paths, and .. segments" {
+    try std.testing.expectError(error.InvalidPath, validatePath(""));
+    try std.testing.expectError(error.InvalidPath, validatePath("/etc/passwd"));
+    try std.testing.expectError(error.InvalidPath, validatePath("a/../b"));
+    try std.testing.expectError(error.InvalidPath, validatePath("a//b"));
 }
 
 test "pathKey is deterministic big-endian prefix" {
