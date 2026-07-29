@@ -1,4 +1,4 @@
-# `nodus diff`
+# `merk diff`
 
 > **Status:** Core engine stable. CLI surface in active development. Some features listed below are **planned** and not yet implemented.
 
@@ -6,12 +6,12 @@
 
 ## Overview
 
-`nodus diff` compares two sets of files and produces a human-readable or machine-parseable delta. It is the default command for reviewing changes in the Nodus DVCS.
+`merk diff` compares two sets of files and produces a human-readable or machine-parseable delta. It is the default command for reviewing changes in the merk DVCS.
 
-Unlike Git's diff, Nodus separates **what to compare**, **how to render**, and **how much detail to show** into independent axes. This lets you compose commands like:
+Unlike Git's diff, merk separates **what to compare**, **how to render**, and **how much detail to show** into independent axes. This lets you compose commands like:
 
 ```bash
-nodus diff --format side-by-side --level word --context full
+merk diff --format side-by-side --level word --context full
 ```
 
 ---
@@ -29,22 +29,22 @@ nodus diff --format side-by-side --level word --context full
 
 ```bash
 # Default: modern unified view of working tree changes
-nodus diff
+merk diff
 
 # Side-by-side review mode (recommended)
-nodus diff --format side-by-side
+merk diff --format side-by-side
 
 # Only see what files changed
-nodus diff --level file
+merk diff --level file
 
 # Deep inspection with full context and word-level changes
-nodus diff --format unified --level word --context full
+merk diff --format unified --level word --context full
 
 # Use a preset profile
-nodus diff --profile review
+merk diff --profile review
 
 # Pick a different line-diff algorithm
-nodus diff --algo patience
+merk diff --algo patience
 ```
 
 ---
@@ -53,19 +53,19 @@ nodus diff --algo patience
 
 ### A. What to Compare _(Partially Planned)_
 
-| Invocation        | Description                                             | Status                                                                                                                       |
-| ----------------- | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| _(no args)_       | Compare working tree against the index                  | **Stable**                                                                                                                   |
-| `--working`       | Explicitly compare working tree against index (default) | **Stable**                                                                                                                   |
-| `--staged`        | Compare the index against HEAD (staged changes)         | **Not implemented** — flag is accepted by the parser but the command errors out (`error.NotImplemented`) rather than running |
-| `--rev <hash>`    | Compare a commit by full or short hash prefix           | **Stable** — supports 64-char or 8+ char abbreviations mapped through the local object store |
-| `--rev <hash-a> --rev <hash-b>` | Compare two commits in order                      | **Stable** — both commits can be resolved from full or short prefixes | 
+| Invocation                      | Description                                             | Status                                                                                                                       |
+| ------------------------------- | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| _(no args)_                     | Compare working tree against the index                  | **Stable**                                                                                                                   |
+| `--working`                     | Explicitly compare working tree against index (default) | **Stable**                                                                                                                   |
+| `--staged`                      | Compare the index against HEAD (staged changes)         | **Not implemented** — flag is accepted by the parser but the command errors out (`error.NotImplemented`) rather than running |
+| `--rev <hash>`                  | Compare a commit by full or short hash prefix           | **Stable** — supports 64-char or 8+ char abbreviations mapped through the local object store                                 |
+| `--rev <hash-a> --rev <hash-b>` | Compare two commits in order                            | **Stable** — both commits can be resolved from full or short prefixes                                                        |
 
 ```bash
-nodus diff                    # working vs index
-nodus diff --staged           # currently errors: not implemented
-nodus diff HEAD~1             # planned: ref vs working
-nodus diff v1.0.0 main        # planned: two refs
+merk diff                    # working vs index
+merk diff --staged           # currently errors: not implemented
+merk diff HEAD~1             # planned: ref vs working
+merk diff v1.0.0 main        # planned: two refs
 ```
 
 ---
@@ -83,9 +83,9 @@ Controls the visual layout of the diff.
 | `summary`      | One-line per file                                       | **Stable** |
 
 ```bash
-nodus diff -f side-by-side
-nodus diff -f blocks
-nodus diff --format ops
+merk diff -f side-by-side
+merk diff -f blocks
+merk diff --format ops
 ```
 
 ---
@@ -102,9 +102,9 @@ Controls how granular the output is.
 | `word` | Inline word-level diff with `[-old-]` / `[+new+]` markers | **Stable** |
 
 ```bash
-nodus diff -l file
-nodus diff --level word
-nodus diff -f side-by-side -l word
+merk diff -l file
+merk diff --level word
+merk diff -f side-by-side -l word
 ```
 
 ---
@@ -120,9 +120,9 @@ Controls which algorithm produces the line-level edit script. Word-level diffing
 | `histogram` | Like Patience but uses occurrence-frequency buckets instead of requiring strict uniqueness. Default. Degrades to Myers when no useful anchor is found. | **Stable** |
 
 ```bash
-nodus diff --algo myers
-nodus diff --algo patience
-nodus diff --algo histogram   # default
+merk diff --algo myers
+merk diff --algo patience
+merk diff --algo histogram   # default
 ```
 
 ---
@@ -139,9 +139,9 @@ How many unchanged lines to show around each change.
 | `full`     | Entire file                    | **Stable** |
 
 ```bash
-nodus diff -c 10
-nodus diff --context minimal
-nodus diff --context full
+merk diff -c 10
+merk diff --context minimal
+merk diff --context full
 ```
 
 ---
@@ -157,7 +157,7 @@ Group the output by directory or flatten it.
 | `dirs`  | Group by parent directory         | **Stable** |
 
 ```bash
-nodus diff --group dirs
+merk diff --group dirs
 ```
 
 Output:
@@ -187,8 +187,8 @@ Show only specific kinds of changes.
 `--show` overrides any of the `--only-*` shorthand flags if both are given.
 
 ```bash
-nodus diff --only-modified
-nodus diff --show added,deleted
+merk diff --only-modified
+merk diff --show added,deleted
 ```
 
 ---
@@ -202,8 +202,8 @@ When used with `--level line`, highlights changed words inside lines using `[-ol
 | **Partially implemented** — word-level data is computed for every diff. Dedicated rendering (`renderWordDiff` / the `word` level) is stable; interleaving word markers into other formats like `side-by-side` is **planned**. |
 
 ```bash
-nodus diff --word
-nodus diff -f unified --word
+merk diff --word
+merk diff -f unified --word
 ```
 
 ---
@@ -217,7 +217,7 @@ Heuristic detection of moved lines across files.
 | **Planned** — the `--detect-moves` flag exists on the CLI and is accepted, and `RenderConfig.detect_moves` is plumbed through, but no move-detection logic exists in the core engine yet. Setting this flag currently has no effect on output. |
 
 ```bash
-nodus diff --detect-moves   # accepted, but no effect yet
+merk diff --detect-moves   # accepted, but no effect yet
 ```
 
 ---
@@ -234,8 +234,8 @@ nodus diff --detect-moves   # accepted, but no effect yet
 The CLI fully resolves the requested color mode against TTY detection (see `cmds/diff.zig`'s `resolveColor`), but no renderer currently emits ANSI escape codes — `core/diff.zig`'s output is always plain text regardless of what `--color` resolves to. This is intentionally separated: color is a CLI/presentation concern and the core renderers don't carry a color dependency at all.
 
 ```bash
-nodus diff --no-color       # accepted, output is plain text either way
-nodus diff --color always   # accepted, output is plain text either way
+merk diff --no-color       # accepted, output is plain text either way
+merk diff --color always   # accepted, output is plain text either way
 ```
 
 ---
@@ -251,8 +251,8 @@ Pre-configured combinations of flags for common workflows.
 | `debug`  | `--format ops --context full`                      | **Stable** |
 
 ```bash
-nodus diff --profile review
-nodus diff --profile ci
+merk diff --profile review
+merk diff --profile ci
 ```
 
 ---
@@ -266,8 +266,8 @@ Provide paths as positional arguments to limit the diff scope.
 | **Stable** — prefix matching against file paths. |
 
 ```bash
-nodus diff src/
-nodus diff src/auth.zig src/parser.zig
+merk diff src/
+merk diff src/auth.zig src/parser.zig
 ```
 
 ---
@@ -277,59 +277,59 @@ nodus diff src/auth.zig src/parser.zig
 ### 1. Clean review mode (recommended default)
 
 ```bash
-nodus diff --format side-by-side --level line --group files
+merk diff --format side-by-side --level line --group files
 # or simply
-nodus diff --profile review
+merk diff --profile review
 ```
 
 ### 2. Minimal summary for CI
 
 ```bash
-nodus diff --format summary --level file
+merk diff --format summary --level file
 # or
-nodus diff --profile ci
+merk diff --profile ci
 ```
 
 ### 3. Deep inspection mode
 
 ```bash
-nodus diff --format unified --level word --context full
+merk diff --format unified --level word --context full
 ```
 
 ### 4. Structural debugging
 
 ```bash
-nodus diff --format ops --group dirs
+merk diff --format ops --group dirs
 ```
 
 ### 5. Git-like compatibility mode
 
 ```bash
-nodus diff --format unified
+merk diff --format unified
 ```
 
 ### 6. Review only modified files in a directory
 
 ```bash
-nodus diff --only-modified --format side-by-side src/
+merk diff --only-modified --format side-by-side src/
 ```
 
 ### 7. Try a different diff algorithm on a noisy file
 
 ```bash
-nodus diff --algo patience src/parser.zig
+merk diff --algo patience src/parser.zig
 ```
 
 ### 8. Check what files are dirty before a commit
 
 ```bash
-nodus diff --level file
+merk diff --level file
 ```
 
 ### 9. Full word-level diff
 
 ```bash
-nodus diff --level word
+merk diff --level word
 ```
 
 ---

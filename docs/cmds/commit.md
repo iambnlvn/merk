@@ -1,4 +1,4 @@
-# `nodus commit`
+# `merk commit`
 
 Record staged changes as a new commit.
 
@@ -38,7 +38,7 @@ Record staged changes as a new commit.
 
 ## Overview
 
-`nodus commit` snapshots the current index into a content-addressed commit
+`merk commit` snapshots the current index into a content-addressed commit
 object and advances the current branch ref to point at it. Each commit carries:
 
 - a **title** and optional **body** (the human-readable message)
@@ -56,17 +56,17 @@ object and advances the current branch ref to point at it. Each commit carries:
 The index must be non-empty. Stage files first:
 
 ```
-nodus add <path>
+merk add <path>
 ```
 
-Running `nodus commit` against an empty index returns an error immediately.
+Running `merk commit` against an empty index returns an error immediately.
 
 ---
 
 ## Basic usage
 
 ```
-nodus commit -m "fix: correct off-by-one in range parser"
+merk commit -m "fix: correct off-by-one in range parser"
 ```
 
 The `-m` / `--message` flag is the only required input. Everything else has
@@ -141,7 +141,7 @@ Labels and trailers are printed if present.
 ### Title
 
 ```
-nodus commit -m "feat: add histogram diff algorithm"
+merk commit -m "feat: add histogram diff algorithm"
 ```
 
 The title is required. It must be non-empty after trimming whitespace and must
@@ -150,7 +150,7 @@ not contain newlines or null bytes. Maximum length is 65 535 bytes (u16).
 ### Body
 
 ```
-nodus commit -m "refactor: split diff engine" \
+merk commit -m "refactor: split diff engine" \
   --body "Myers, Patience, and Histogram are now separate modules.
 
 The shared LCS core is extracted into diff/lcs.zig."
@@ -171,7 +171,7 @@ so they are queryable without parsing.
 **1. Embedded in `--body`** (extracted automatically)
 
 ```
-nodus commit -m "fix: memory leak in store" \
+merk commit -m "fix: memory leak in store" \
   --body "Freed the slab on error paths.
 
 closes: #88
@@ -184,7 +184,7 @@ stored body, and recorded as structured trailers.
 **2. Explicit `--trailer` flag**
 
 ```
-nodus commit -m "fix: memory leak in store" \
+merk commit -m "fix: memory leak in store" \
   --trailer "closes=#88,reviewed-by=bob@example.com"
 ```
 
@@ -228,7 +228,7 @@ front-matter, prose that happens to use colons), pass `--no-body-trailers` to
 treat the entire body as plain text:
 
 ```
-nodus commit -m "docs: add config reference" \
+merk commit -m "docs: add config reference" \
   --body "timeout: 30s
 retries: 3
 host: localhost" \
@@ -242,7 +242,7 @@ host: localhost" \
 ### Intent
 
 ```
-nodus commit -m "fix: null check on empty ref" --intent fix
+merk commit -m "fix: null check on empty ref" --intent fix
 ```
 
 Intent is a machine-readable semantic tag for the type of change. It maps to
@@ -272,13 +272,13 @@ They have no enforced schema — use whatever conventions suit the project.
 **Via `--label` flag** (comma-separated):
 
 ```
-nodus commit -m "feat: dark mode" --label "ui,design-system"
+merk commit -m "feat: dark mode" --label "ui,design-system"
 ```
 
 **Via positional arguments** (appended after any `--label` values):
 
 ```
-nodus commit -m "feat: dark mode" -- ui design-system
+merk commit -m "feat: dark mode" -- ui design-system
 ```
 
 Both can be combined. Labels from `--label` come first, then positional args,
@@ -293,7 +293,7 @@ in the order they are supplied.
 The author is the person who wrote the change.
 
 ```
-nodus commit -m "fix: typo" \
+merk commit -m "fix: typo" \
   --author "Alice" \
   --author-email "alice@example.com" \
   --author-date "2025-03-14"
@@ -301,27 +301,27 @@ nodus commit -m "fix: typo" \
 
 Resolution order for each field:
 
-| Field     | Flag                       | Env var              | Fallback        |
-| --------- | -------------------------- | -------------------- | --------------- |
-| Name      | `--author`                 | `NODUS_AUTHOR_NAME`  | `$USER`         |
-| Email     | `--author-email`           | `NODUS_AUTHOR_EMAIL` | `unknown@local` |
-| Timestamp | `--author-date` / `--date` | —                    | current time    |
+| Field     | Flag                       | Env var             | Fallback        |
+| --------- | -------------------------- | ------------------- | --------------- |
+| Name      | `--author`                 | `merk_AUTHOR_NAME`  | `$USER`         |
+| Email     | `--author-email`           | `merk_AUTHOR_EMAIL` | `unknown@local` |
+| Timestamp | `--author-date` / `--date` | —                   | current time    |
 
 ### Committer
 
 The committer is the person who applied the change to the repository. In
-normal local development the committer is the same as the author, so nodus
+normal local development the committer is the same as the author, so merk
 omits the committer field entirely and the core serialiser mirrors the author
 bytes on the wire.
 
 Supply any committer flag to create a distinct committer record:
 
 ```
-nodus commit -m "chore: apply patch from upstream" \
+merk commit -m "chore: apply patch from upstream" \
   --author "Alan Turing" \
   --author-email "alan@lab.net" \
-  --committer "Nodus Bot" \
-  --committer-email "bot@nodus.dev" \
+  --committer "merk Bot" \
+  --committer-email "bot@merk.dev" \
   --committer-date "2025-06-01"
 ```
 
@@ -330,7 +330,7 @@ author:
 
 ```
 # Only the committer email differs; name and date mirror the author.
-nodus commit -m "ci: apply formatter" --committer-email "fmt-bot@ci.internal"
+merk commit -m "ci: apply formatter" --committer-email "fmt-bot@ci.internal"
 ```
 
 Resolution order for committer fields:
@@ -361,18 +361,18 @@ Passing a string that matches neither format is a hard error.
 
 ### Environment variables
 
-| Variable             | Used for                |
-| -------------------- | ----------------------- |
-| `NODUS_AUTHOR_NAME`  | Author name fallback    |
-| `NODUS_AUTHOR_EMAIL` | Author email fallback   |
-| `USER`               | Author name last-resort |
+| Variable            | Used for                |
+| ------------------- | ----------------------- |
+| `merk_AUTHOR_NAME`  | Author name fallback    |
+| `merk_AUTHOR_EMAIL` | Author email fallback   |
+| `USER`              | Author name last-resort |
 
 ---
 
 ## Flag reference
 
 ```
-usage: nodus commit -m <msg> [options] [labels...]
+usage: merk commit -m <msg> [options] [labels...]
 
 options:
   -m, --message <msg>          commit title (required)
@@ -387,8 +387,8 @@ options:
   -l, --label <label[,label]>  comma-separated scope labels; positional args
                                also accepted
 
-      --author <name>          author name  ($NODUS_AUTHOR_NAME / $USER fallback)
-      --author-email <addr>    author email  ($NODUS_AUTHOR_EMAIL fallback)
+      --author <name>          author name  ($merk_AUTHOR_NAME / $USER fallback)
+      --author-email <addr>    author email  ($merk_AUTHOR_EMAIL fallback)
       --author-date <date>     author timestamp: Unix-ms or YYYY-MM-DD (default: now)
       --date <date>            alias for --author-date
 
@@ -408,13 +408,13 @@ options:
 **Minimal commit:**
 
 ```
-nodus commit -m "fix: handle empty index gracefully"
+merk commit -m "fix: handle empty index gracefully"
 ```
 
 **With body and intent:**
 
 ```
-nodus commit -m "refactor: extract LCS core" \
+merk commit -m "refactor: extract LCS core" \
   --body "Myers, Patience, and Histogram all share the same LCS primitive now." \
   --intent refactor
 ```
@@ -422,13 +422,13 @@ nodus commit -m "refactor: extract LCS core" \
 **With labels:**
 
 ```
-nodus commit -m "feat: add dark mode toggle" --intent feature --label "ui,a11y"
+merk commit -m "feat: add dark mode toggle" --intent feature --label "ui,a11y"
 ```
 
 **Body trailers extracted automatically:**
 
 ```
-nodus commit -m "fix: double-free in test teardown" \
+merk commit -m "fix: double-free in test teardown" \
   --body "The slab was freed twice on error paths in commit_test.zig.
 
 closes: #102
@@ -441,14 +441,14 @@ Stored trailers: `closes=#102`, `reviewed-by=carol@example.com`
 **Explicit trailers only:**
 
 ```
-nodus commit -m "chore: bump zig toolchain" \
+merk commit -m "chore: bump zig toolchain" \
   --trailer "breaks=build.zig.zon,reviewed-by=alice@example.com"
 ```
 
 **Mixed body and explicit trailers:**
 
 ```
-nodus commit -m "feat: patience diff" \
+merk commit -m "feat: patience diff" \
   --body "Implements the Patience algorithm alongside Myers.
 
 closes: #77" \
@@ -460,25 +460,25 @@ Trailer order in the stored object: `closes=#77`, then `reviewed-by=bob@example.
 **Backdated commit:**
 
 ```
-nodus commit -m "docs: initial readme" --date 2024-01-01
+merk commit -m "docs: initial readme" --date 2024-01-01
 ```
 
 **Cherry-pick with distinct committer:**
 
 ```
-nodus commit -m "fix: backport null check from main" \
+merk commit -m "fix: backport null check from main" \
   --author "Alice" \
   --author-email "alice@example.com" \
   --author-date 2025-01-15 \
-  --committer "Nodus Bot" \
-  --committer-email "bot@nodus.dev" \
+  --committer "merk Bot" \
+  --committer-email "bot@merk.dev" \
   --trailer "cherry-picked=a1b2c3d4"
 ```
 
 **Suppress body trailer extraction:**
 
 ```
-nodus commit -m "docs: config schema reference" \
+merk commit -m "docs: config schema reference" \
   --body "timeout: 30s
 host: localhost" \
   --no-body-trailers
