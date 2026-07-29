@@ -70,6 +70,30 @@ pub const Commit = struct {
     metadata: CommitMetadata,
     message: Message,
 
+    /// True for a commit with no parents — the start of a history, not
+    /// necessarily the very first commit ever made (e.g. a grafted or
+    /// re-rooted history can have more than one root)
+    pub fn isRoot(self: Commit) bool {
+        return self.parents.len == 0;
+    }
+
+    /// True for a commit with more than one parent. Doesn't distinguish
+    /// *why* — check individual `parents[i].kind` for that (a commit can
+    /// have two parents without either being tagged `.merge`, and a
+    /// single non-`.normal` parent, e.g. `.cherry_pick`, isn't a merge)
+    pub fn isMerge(self: Commit) bool {
+        return self.parents.len > 1;
+    }
+
+    /// Just the hashes, dropping `ParentKind` — for callers doing plain
+    /// graph traversal (e.g. a log walker) that don't care why an edge
+    /// exists, only that it does. Caller frees with `alloc.free`
+    pub fn parentHashesAlloc(self: Commit, alloc: std.mem.Allocator) ![]Hash {
+        const hashes = try alloc.alloc(Hash, self.parents.len);
+        for (self.parents, 0..) |p, i| hashes[i] = p.hash;
+        return hashes;
+    }
+
     pub fn deinit(self: *Commit, alloc: std.mem.Allocator) void {
         alloc.free(self.parents);
         self.identity.deinit(alloc);
@@ -153,6 +177,13 @@ pub fn read(
     };
 }
 
+/// Everything needed to populate a builder for an ordinary commit,
+/// independent of where the snapshot and parents come from. Callers
+/// that resolve those themselves (e.g. `Repository`, reading HEAD and
+/// resolving the current snapshot root) still supply them separately —
+/// this only covers the identity/metadata/message fields, which is
+/// exactly what tends to get re-derived by every caller that builds
+/// commits from user input
 pub const CommitRequest = struct {
     author_name: []const u8,
     author_email: []const u8,
@@ -198,12 +229,15 @@ pub const CommitRequest = struct {
 ///   const commit_hash = try b.write(&store);
 ///
 /// A caller with a `CommitRequest` in hand (e.g. from user input) can
-/// load it in one call instead of the individual setters above:
+/// build directly from it instead of the individual setters above:
 ///
-///   var b = CommitBuilder.init(alloc, snapshot_root);
+///   var b = try CommitBuilder.fromRequest(alloc, snapshot_root, request);
 ///   defer b.deinit();
-///   _ = try b.applyRequest(request);
 ///   const commit_hash = try b.write(&store);
+///
+/// (Or, if the snapshot isn't resolved yet when the request is built:
+/// `CommitBuilder.init` + `.applyRequest(request)` do the same thing in
+/// two steps.)
 ///
 /// A caller doing a merge or cherry-pick records that directly instead
 /// of leaving it to the message:
@@ -229,9 +263,27 @@ pub const CommitBuilder = struct {
     /// `snapshot_root` is the root hash of whatever content-addressed
     /// structure represents this commit's full state — resolve it from
     /// your tree/index implementation before calling this. See the
-    /// module doc comment: this builder never looks past this one hash
+    /// module doc comment: this builder never looks past this one hash.
     pub fn init(alloc: std.mem.Allocator, snapshot_root: Hash) CommitBuilder {
         return .{ .alloc = alloc, .snapshot_root = snapshot_root };
+    }
+
+    /// Shortcut for `init` immediately followed by `applyRequest` — the
+    /// common shape for any caller that already has a full
+    /// `CommitRequest` in hand (a CLI command, `Repository.commit`, ...)
+    /// and just needs a resolved snapshot root to go with it. Parents
+    /// still get added separately via `.parent()` / `.parentWithKind()`,
+    /// since `CommitRequest` deliberately doesn't carry them (see its
+    /// doc comment).
+    pub fn fromRequest(
+        alloc: std.mem.Allocator,
+        snapshot_root: Hash,
+        request: CommitRequest,
+    ) !CommitBuilder {
+        var b = CommitBuilder.init(alloc, snapshot_root);
+        errdefer b.deinit();
+        _ = try b.applyRequest(request);
+        return b;
     }
 
     pub fn deinit(self: *CommitBuilder) void {
@@ -257,6 +309,13 @@ pub const CommitBuilder = struct {
     /// Add several `.normal` parents at once
     pub fn parentsFrom(self: *CommitBuilder, hashes: []const Hash) !*CommitBuilder {
         for (hashes) |h| _ = try self.parent(h);
+        return self;
+    }
+
+    /// Add several parents at once with the same explicit `ParentKind`
+    /// — e.g. a single commit that transplants several branch tips
+    pub fn parentsWithKind(self: *CommitBuilder, hashes: []const Hash, kind: ParentKind) !*CommitBuilder {
+        for (hashes) |h| _ = try self.parentWithKind(h, kind);
         return self;
     }
 
@@ -323,7 +382,8 @@ pub const CommitBuilder = struct {
     /// options-style struct (`Repository.commit`, a CLI command, ...)
     /// don't each re-derive this same sequence themselves — they supply
     /// a `CommitRequest` and, separately, whatever snapshot/parent
-    /// resolution is specific to them.
+    /// resolution is specific to them. Prefer `CommitBuilder.fromRequest`
+    /// when the snapshot root is already resolved at construction time
     pub fn applyRequest(self: *CommitBuilder, request: CommitRequest) !*CommitBuilder {
         _ = self.author(request.author_name, request.author_email, request.author_timestamp_ms);
         if (request.committer_name) |name| {
@@ -427,6 +487,34 @@ test "CommitBuilder.applyRequest populates author, committer default, and traile
     try std.testing.expectEqualStrings("#5", c.message.trailer("closes").?);
     try std.testing.expectEqual(@as(usize, 1), c.metadata.labels.len);
     try std.testing.expectEqualStrings("core", c.metadata.labels[0]);
+}
+
+test "CommitBuilder.fromRequest is equivalent to init + applyRequest" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = Store.init(alloc, tfs.fs(), "objects");
+
+    const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    var b = try CommitBuilder.fromRequest(alloc, snapshot_hash, .{
+        .author_name = "Grace Hopper",
+        .author_email = "grace@nodus.dev",
+        .author_timestamp_ms = 2_000,
+        .intent = .docs,
+        .title = "via fromRequest",
+    });
+    defer b.deinit();
+
+    const commit_hash = try b.write(&store);
+
+    var c = try read(alloc, &store, commit_hash);
+    defer c.deinit(alloc);
+
+    try std.testing.expectEqualStrings("Grace Hopper", c.identity.author.name);
+    try std.testing.expectEqualStrings("via fromRequest", c.message.title);
+    try std.testing.expect(c.isRoot());
+    try std.testing.expect(!c.isMerge());
 }
 
 test "commit write and read round-trip" {
@@ -577,6 +665,8 @@ test "commit with a normal parent" {
         "abc1234",
         c.message.trailer("cherry-picked").?,
     );
+    try std.testing.expect(!c.isRoot());
+    try std.testing.expect(!c.isMerge());
 }
 
 test "commit records why a parent edge exists: merge and cherry-pick" {
@@ -605,7 +695,42 @@ test "commit records why a parent edge exists: merge and cherry-pick" {
     try std.testing.expectEqual(ParentKind.normal, mc.parents[0].kind);
     try std.testing.expectEqual(ParentKind.merge, mc.parents[1].kind);
     try std.testing.expectEqualSlices(u8, &branch_hash, &mc.parents[1].hash);
+    try std.testing.expect(mc.isMerge());
+    try std.testing.expect(!mc.isRoot());
 }
+
+test "parentsWithKind adds several parents sharing one kind" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    const a_hash = try testCommit(alloc, &store, snapshot_hash, "Dev A", "a@nodus.dev", 1, "a");
+    const b_hash = try testCommit(alloc, &store, snapshot_hash, "Dev B", "b@nodus.dev", 2, "b");
+    const c_hash = try testCommit(alloc, &store, snapshot_hash, "Dev C", "c@nodus.dev", 3, "c");
+
+    var octopus_b = CommitBuilder.init(alloc, snapshot_hash);
+    defer octopus_b.deinit();
+    _ = try octopus_b.parentsWithKind(&.{ a_hash, b_hash, c_hash }, .merge);
+    _ = octopus_b.author("Dev D", "d@nodus.dev", 4);
+    _ = octopus_b.intent(.chore);
+    _ = octopus_b.title("octopus merge");
+    const octopus_hash = try octopus_b.write(&store);
+
+    var oc = try read(alloc, &store, octopus_hash);
+    defer oc.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), oc.parents.len);
+    for (oc.parents) |p| try std.testing.expectEqual(ParentKind.merge, p.kind);
+
+    const hashes = try oc.parentHashesAlloc(alloc);
+    defer alloc.free(hashes);
+    try std.testing.expectEqualSlices(u8, &a_hash, &hashes[0]);
+    try std.testing.expectEqualSlices(u8, &b_hash, &hashes[1]);
+    try std.testing.expectEqualSlices(u8, &c_hash, &hashes[2]);
+}
+
 test "CommitBuilder rejects a commit with an unset (zero) snapshot" {
     const alloc = std.testing.allocator;
     var tfs = io.TestFs.init(alloc);
