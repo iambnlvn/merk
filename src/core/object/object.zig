@@ -49,6 +49,21 @@ pub const Store = struct {
         return encoded.hash;
     }
 
+    pub fn putReader(self: *const Store, obj_type: ObjectType, size_hint: u64, reader: anytype) !Hash {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.alloc);
+        try buf.ensureTotalCapacity(self.alloc, std.math.cast(usize, size_hint) orelse 0);
+
+        var chunk: [64 * 1024]u8 = undefined;
+        while (true) {
+            const n = try reader.read(&chunk);
+            if (n == 0) break;
+            try buf.appendSlice(self.alloc, chunk[0..n]);
+        }
+
+        return self.put(obj_type, buf.items);
+    }
+
     pub fn get(self: *const Store, obj_hash: Hash) !Object {
         const path = try self.objectPath(obj_hash);
         defer self.alloc.free(path);
