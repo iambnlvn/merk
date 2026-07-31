@@ -3,6 +3,7 @@ const hash_mod = @import("../crypto/crypto.zig").hash;
 const node = @import("node.zig");
 const entry_mod = @import("entry.zig");
 const page_store_mod = @import("page_store.zig");
+const io = @import("merk").io;
 
 const Hash = hash_mod.Hash;
 const Entry = entry_mod.Entry;
@@ -163,9 +164,9 @@ fn freeTestEntries(alloc: std.mem.Allocator, entries: *std.ArrayList(Entry)) voi
 
 test "build of an empty entry list returns zero_hash without touching the store" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const store = PageStore{ .alloc = alloc, .dir = tmp.dir };
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
 
     const root = try build(alloc, &store, &.{});
     try std.testing.expectEqualSlices(u8, &hash_mod.zero_hash, &root);
@@ -173,9 +174,9 @@ test "build of an empty entry list returns zero_hash without touching the store"
 
 test "build+collect round-trips a small entry set that fits one leaf page" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const store = PageStore{ .alloc = alloc, .dir = tmp.dir };
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
 
     var entries: std.ArrayList(Entry) = .empty;
     defer freeTestEntries(alloc, &entries);
@@ -202,9 +203,9 @@ test "build+collect round-trips a small entry set that fits one leaf page" {
 
 test "build+collect round-trips a large entry set spanning multiple pages and levels" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const store = PageStore{ .alloc = alloc, .dir = tmp.dir };
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
 
     const n = 600;
     var entries: std.ArrayList(Entry) = .empty;
@@ -240,9 +241,9 @@ test "build+collect round-trips a large entry set spanning multiple pages and le
 
 test "build is deterministic — same entries in a different order produce the same root" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const store = PageStore{ .alloc = alloc, .dir = tmp.dir };
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
 
     var forward: std.ArrayList(Entry) = .empty;
     defer freeTestEntries(alloc, &forward);

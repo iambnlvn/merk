@@ -29,16 +29,7 @@ const LEAF_ENTRY_FIXED_LEN: usize = 8 + 2 + 32 + 8 + 8 + 16;
 /// Serialized size of an internal child reference: separator(8) + hash(32).
 pub const CHILD_REF_LEN: usize = 8 + 32;
 
-pub const DiffError = error{
-    OutOfMemory,
-    NotFound,
-    HashMismatch,
-    CorruptIndexPage,
-    CorruptIndex,
-    UnsupportedPageVersion,
-    EndOfStream,
-    ReadFailed,
-} || std.fs.File.OpenError || std.fs.File.ReadError;
+pub const DiffError = anyerror;
 
 /// Serialized form of an entry as stored in a leaf page.
 /// The `path` slice is owned and must be freed when the containing `Page`

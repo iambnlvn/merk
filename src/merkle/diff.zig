@@ -3,6 +3,7 @@ const hash_mod = @import("../crypto/crypto.zig").hash;
 const node = @import("node.zig");
 const entry_mod = @import("entry.zig");
 const page_store_mod = @import("page_store.zig");
+const io = @import("merk").io;
 
 const Hash = hash_mod.Hash;
 const LeafEntry = node.LeafEntry;
@@ -13,17 +14,19 @@ const EntryChange = entry_mod.EntryChange;
 const hashEq = node.hashEq;
 
 /// Diff two index-root hashes directly, without loading a full `Index`.
-/// Useful for comparing commit index states.
+/// Useful for comparing commit index states. Caller supplies `store`
+/// (rather than diffRoots constructing one itself) so callers control which
+/// `FileSystem`/`pages_dir` the pages live under — diff.zig doesn't need to
+/// know that convention.
 /// Caller owns the returned slice; free with `entry_mod.freeChanges`.
-pub fn diffRoots(alloc: std.mem.Allocator, dir: std.fs.Dir, old_root: Hash, new_root: Hash) DiffError![]EntryChange {
-    var store = PageStore{ .alloc = alloc, .dir = dir };
+pub fn diffRoots(alloc: std.mem.Allocator, store: *const PageStore, old_root: Hash, new_root: Hash) DiffError![]EntryChange {
     var changes: std.ArrayList(EntryChange) = .empty;
     errdefer {
         for (changes.items) |*c| c.deinit(alloc);
         changes.deinit(alloc);
     }
 
-    try diffNodes(alloc, &store, old_root, new_root, &changes);
+    try diffNodes(alloc, store, old_root, new_root, &changes);
     return try changes.toOwnedSlice(alloc);
 }
 
@@ -310,9 +313,9 @@ fn findChange(changes: []const EntryChange, path: []const u8) ?EntryChange {
 
 test "diffRoots on identical roots reports no changes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const store = PageStore{ .alloc = alloc, .dir = tmp.dir };
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
 
     var entries: std.ArrayList(entry_mod.Entry) = .empty;
     defer freeTestEntries(alloc, &entries);
@@ -320,7 +323,7 @@ test "diffRoots on identical roots reports no changes" {
     try entries.append(alloc, try testEntry(alloc, "b.txt", 2));
 
     const root = try btree_mod.build(alloc, &store, entries.items);
-    const changes = try diffRoots(alloc, tmp.dir, root, root);
+    const changes = try diffRoots(alloc, &store, root, root);
     defer entry_mod.freeChanges(alloc, changes);
 
     try std.testing.expectEqual(@as(usize, 0), changes.len);
@@ -328,9 +331,9 @@ test "diffRoots on identical roots reports no changes" {
 
 test "diffRoots against zero_hash reports every entry as added/removed" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const store = PageStore{ .alloc = alloc, .dir = tmp.dir };
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
 
     var entries: std.ArrayList(entry_mod.Entry) = .empty;
     defer freeTestEntries(alloc, &entries);
@@ -339,12 +342,12 @@ test "diffRoots against zero_hash reports every entry as added/removed" {
 
     const root = try btree_mod.build(alloc, &store, entries.items);
 
-    const added = try diffRoots(alloc, tmp.dir, hash_mod.zero_hash, root);
+    const added = try diffRoots(alloc, &store, hash_mod.zero_hash, root);
     defer entry_mod.freeChanges(alloc, added);
     try std.testing.expectEqual(@as(usize, 2), added.len);
     for (added) |c| try std.testing.expectEqual(entry_mod.ChangeKind.added, c.kind);
 
-    const removed = try diffRoots(alloc, tmp.dir, root, hash_mod.zero_hash);
+    const removed = try diffRoots(alloc, &store, root, hash_mod.zero_hash);
     defer entry_mod.freeChanges(alloc, removed);
     try std.testing.expectEqual(@as(usize, 2), removed.len);
     for (removed) |c| try std.testing.expectEqual(entry_mod.ChangeKind.removed, c.kind);
@@ -352,9 +355,9 @@ test "diffRoots against zero_hash reports every entry as added/removed" {
 
 test "diffRoots detects a single modified entry among unchanged siblings" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const store = PageStore{ .alloc = alloc, .dir = tmp.dir };
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
 
     var old_entries: std.ArrayList(entry_mod.Entry) = .empty;
     defer freeTestEntries(alloc, &old_entries);
@@ -370,7 +373,7 @@ test "diffRoots detects a single modified entry among unchanged siblings" {
     try new_entries.append(alloc, try testEntry(alloc, "c.txt", 3));
     const new_root = try btree_mod.build(alloc, &store, new_entries.items);
 
-    const changes = try diffRoots(alloc, tmp.dir, old_root, new_root);
+    const changes = try diffRoots(alloc, &store, old_root, new_root);
     defer entry_mod.freeChanges(alloc, changes);
 
     try std.testing.expectEqual(@as(usize, 1), changes.len);
@@ -379,13 +382,14 @@ test "diffRoots detects a single modified entry among unchanged siblings" {
     try std.testing.expectEqual(@as(u64, 2), c.old_size.?);
     try std.testing.expectEqual(@as(u64, 99), c.new_size.?);
 }
-//TODO: inspect failure
+
+//TODO: inspect failure (pre-existing, unrelated to the io.FileSystem migration)
 // test "diffRoots handles mixed add/remove/modify across a multi-page tree" {
 //     const alloc = std.testing.allocator;
-//     var tmp = std.testing.tmpDir(.{});
-//     defer tmp.cleanup();
-//     const store = PageStore{ .alloc = alloc, .dir = tmp.dir };
-
+//     var tfs = io.TestFs.init(alloc);
+//     defer tfs.deinit();
+//     const store = PageStore.init(alloc, tfs.fs(), "index/pages");
+//
 //     const n = 400;
 //     var old_entries: std.ArrayList(entry_mod.Entry) = .empty;
 //     defer freeTestEntries(alloc, &old_entries);
@@ -396,10 +400,7 @@ test "diffRoots detects a single modified entry among unchanged siblings" {
 //         try old_entries.append(alloc, try testEntry(alloc, name, @truncate(i)));
 //     }
 //     const old_root = try btree_mod.build(alloc, &store, old_entries.items);
-
-//     // New tree: drop entry 0 (removed), tweak entry 200 (modified), add a
-//     // brand-new path (added) — everything else stays byte-identical, so
-//     // most of the tree should short-circuit on hash equality.
+//
 //     var new_entries: std.ArrayList(entry_mod.Entry) = .empty;
 //     defer freeTestEntries(alloc, &new_entries);
 //     i = 1; // skip index 0
@@ -411,19 +412,19 @@ test "diffRoots detects a single modified entry among unchanged siblings" {
 //     }
 //     try new_entries.append(alloc, try testEntry(alloc, "brand-new.txt", 111));
 //     const new_root = try btree_mod.build(alloc, &store, new_entries.items);
-
-//     const changes = try diffRoots(alloc, tmp.dir, old_root, new_root);
+//
+//     const changes = try diffRoots(alloc, &store, old_root, new_root);
 //     defer entry_mod.freeChanges(alloc, changes);
-
+//
 //     try std.testing.expectEqual(@as(usize, 3), changes.len);
-
+//
 //     const removed = findChange(changes, "file-0000.txt") orelse return error.MissingChange;
 //     try std.testing.expectEqual(entry_mod.ChangeKind.removed, removed.kind);
-
+//
 //     const modified = findChange(changes, "file-0200.txt") orelse return error.MissingChange;
 //     try std.testing.expectEqual(entry_mod.ChangeKind.modified, modified.kind);
 //     try std.testing.expectEqual(@as(u64, 250), modified.new_size.?);
-
+//
 //     const added = findChange(changes, "brand-new.txt") orelse return error.MissingChange;
 //     try std.testing.expectEqual(entry_mod.ChangeKind.added, added.kind);
 // }
