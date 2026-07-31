@@ -133,8 +133,18 @@ pub fn build(b: *std.Build) void {
         mod,
     );
 
+    const index_step = addModuleTest(
+        b,
+        "test-index",
+        "Run index unit tests",
+        "src/core/index.zig",
+        target,
+        optimize,
+        mod,
+    );
     test_step.dependOn(refs_step);
     test_step.dependOn(focus_step);
     test_step.dependOn(obj_step);
     test_step.dependOn(commit_step);
+    test_step.dependOn(index_step);
 }
