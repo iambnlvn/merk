@@ -142,9 +142,20 @@ pub fn build(b: *std.Build) void {
         optimize,
         mod,
     );
+
+    const history_step = addModuleTest(
+        b,
+        "test-history",
+        "Run history unit tests",
+        "src/core/history.zig",
+        target,
+        optimize,
+        mod,
+    );
     test_step.dependOn(refs_step);
     test_step.dependOn(focus_step);
     test_step.dependOn(obj_step);
     test_step.dependOn(commit_step);
     test_step.dependOn(index_step);
+    test_step.dependOn(history_step);
 }
