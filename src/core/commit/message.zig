@@ -70,9 +70,27 @@ pub const Trailer = struct {
     }
 };
 
+/// Character encoding of `title`/`body`. merk doesn't transcode
+/// anything itself — this is a label so downstream tooling (a UI, a
+/// terminal renderer, an export to some other format) knows how to
+/// interpret the bytes instead of assuming UTF-8 and mangling
+/// legacy/localized commit messages
+pub const Encoding = enum(u8) {
+    utf8 = 0,
+    ascii = 1,
+    latin1 = 2,
+    /// Encoding is known to be something else, or unknown — bytes are
+    /// stored as-is regardless; this is purely descriptive.
+    other = 255,
+};
+
 pub const MessageInfo = struct {
     title: []const u8,
     body: []const u8 = "",
+
+    /// Character encoding of `title`/`body`. Defaults to UTF-8, which
+    /// is what merk assumes unless told otherwise
+    encoding: Encoding = .utf8,
 
     /// Structured trailers appended after the body.
     /// Order is preserved; duplicate keys are allowed.
@@ -106,6 +124,8 @@ pub const MessageInfo = struct {
     pub fn serialize(self: MessageInfo, writer: anytype) !void {
         try self.validate();
 
+        try writer.writeByte(@intFromEnum(self.encoding));
+
         const t = self.trimmed();
         try wire.writeBytes(u16, writer, t.title);
         try wire.writeBytes(u32, writer, t.body);
@@ -119,6 +139,7 @@ pub const MessageInfo = struct {
 pub const Message = struct {
     title: []u8,
     body: []u8,
+    encoding: Encoding,
 
     trailers: []Trailer,
 
@@ -152,11 +173,17 @@ pub const Message = struct {
         return .{
             .title = title,
             .body = body,
+            .encoding = info.encoding,
             .trailers = trailers,
         };
     }
 
     pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !Message {
+        const encoding = std.meta.intToEnum(
+            Encoding,
+            try reader.takeByte(),
+        ) catch return error.CorruptCommit;
+
         const title = try wire.readBytesAlloc(u16, alloc, reader);
         errdefer alloc.free(title);
 
@@ -180,12 +207,14 @@ pub const Message = struct {
         const info = MessageInfo{
             .title = title,
             .body = body,
+            .encoding = encoding,
         };
         try info.validate();
 
         return .{
             .title = title,
             .body = body,
+            .encoding = encoding,
             .trailers = trailers,
         };
     }
@@ -250,9 +279,28 @@ test "MessageInfo serialization format - no trailers" {
 
     try info.serialize(buf.writer(alloc));
 
-    // u16 title len + title + u32 body len + body + u8 trailer count (0)
-    const expected = "\x16\x00fix(core): memory leak\x08\x00\x00\x00resolved\x00";
+    // encoding byte (utf8 = 0) + u16 title len + title + u32 body len + body
+    // + u8 trailer count (0)
+    const expected = "\x00\x16\x00fix(core): memory leak\x08\x00\x00\x00resolved\x00";
     try std.testing.expectEqualSlices(u8, expected, buf.items);
+}
+
+test "MessageInfo serialization records a non-default encoding" {
+    const info = MessageInfo{
+        .title = "legacy import",
+        .encoding = .latin1,
+    };
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try info.serialize(buf.writer(alloc));
+
+    try std.testing.expectEqual(@as(u8, 2), buf.items[0]);
+
+    var mock_reader = MockReader{ .buffer = buf.items };
+    var msg = try Message.deserialize(alloc, &mock_reader);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqual(Encoding.latin1, msg.encoding);
 }
 
 test "MessageInfo serialization format - with trailers" {
@@ -276,6 +324,7 @@ test "MessageInfo serialization format - with trailers" {
     defer msg.deinit(alloc);
 
     try std.testing.expectEqualStrings("fix: patch the thing", msg.title);
+    try std.testing.expectEqual(Encoding.utf8, msg.encoding);
     try std.testing.expectEqual(@as(usize, 2), msg.trailers.len);
     try std.testing.expectEqualStrings("closes", msg.trailers[0].key);
     try std.testing.expectEqualStrings("#42", msg.trailers[0].value);
@@ -366,8 +415,8 @@ test "Message lifecycle via initDupe" {
 
 test "Message deserialization from binary stream - legacy no trailers" {
     const allocator = std.testing.allocator;
-    // Wire format with 0 trailers (backward compat)
-    const serialized_data = "\x0c\x00refactor: io\x04\x00\x00\x00done\x00";
+    // Wire format with encoding byte (utf8 = 0) and 0 trailers
+    const serialized_data = "\x00\x0c\x00refactor: io\x04\x00\x00\x00done\x00";
 
     var mock_reader = MockReader{ .buffer = serialized_data };
     var msg = try Message.deserialize(allocator, &mock_reader);
@@ -375,5 +424,6 @@ test "Message deserialization from binary stream - legacy no trailers" {
 
     try std.testing.expectEqualStrings("refactor: io", msg.title);
     try std.testing.expectEqualStrings("done", msg.body);
+    try std.testing.expectEqual(Encoding.utf8, msg.encoding);
     try std.testing.expectEqual(@as(usize, 0), msg.trailers.len);
 }
