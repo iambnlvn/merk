@@ -17,40 +17,25 @@ const Store = object_mod.Store;
 /// - `index_root`: The BLAKE3 hash of the root page of the serialized B-tree.
 pub const Index = struct {
     alloc: std.mem.Allocator,
-    dir: std.fs.Dir,
+    fs: io.FileSystem,
+    /// Directory the index's on-disk state (index_root file, page store)
+    /// lives under, relative to `fs`'s root. May be "" if `fs` is already
+    /// rooted there. Mirrors `object.Store`'s `objects_dir` convention —
+    /// typically ".merk" when `fs` is rooted at the repo root.
+    index_dir: []const u8,
     entries: std.ArrayList(merkle_mod.Entry),
     /// path -> index into `entries`. Updated by `upsert()` and `rebuildPathIndex()`.
     path_index: std.StringHashMapUnmanaged(usize) = .empty,
     index_root: Hash = hash_mod.zero_hash,
 
-    /// Open an index in `repo_root/.nodus`, creating the directory if needed.
-    pub fn init(alloc: std.mem.Allocator, repo_root: []const u8) !Index {
-        return initInDir(alloc, std.fs.cwd(), repo_root);
-    }
-
-    /// Same as `init`, but resolves `repo_root` against `base_dir` instead
-    /// of assuming the real process cwd. This lets Repository (and tests)
-    /// open a repo rooted anywhere, e.g. inside a `std.testing.tmpDir`,
-    /// without every other call site having to care.
-    pub fn initInDir(alloc: std.mem.Allocator, base_dir: std.fs.Dir, repo_root: []const u8) !Index {
-        const nodus_path = try std.fs.path.join(alloc, &.{ repo_root, ".nodus" });
-        defer alloc.free(nodus_path);
-
-        try base_dir.makePath(nodus_path);
-        const dir = try base_dir.openDir(nodus_path, .{});
-
-        return .{
-            .alloc = alloc,
-            .dir = dir,
-            .entries = .empty,
-        };
+    pub fn init(alloc: std.mem.Allocator, fs: io.FileSystem, index_dir: []const u8) Index {
+        return .{ .alloc = alloc, .fs = fs, .index_dir = index_dir, .entries = .empty };
     }
 
     pub fn deinit(self: *Index) void {
         clearEntries(self);
         self.entries.deinit(self.alloc);
         self.path_index.deinit(self.alloc);
-        self.dir.close();
     }
 
     /// Load the index from disk. If no index exists, starts empty
@@ -58,20 +43,23 @@ pub const Index = struct {
         clearEntries(self);
         self.index_root = hash_mod.zero_hash;
 
-        const root = readIndexRoot(self.dir) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => {
-                // No existing index. Ensure in-memory state is consistent
-                std.mem.sort(merkle_mod.Entry, self.entries.items, {}, merkle_mod.pathLessThan);
-                try self.rebuildPathIndex();
-                return;
-            },
-            else => return err,
+        const root_path = try self.subPath("index/index_root");
+        defer self.alloc.free(root_path);
+
+        const root = (try readIndexRoot(self.fs, self.alloc, root_path)) orelse {
+            // No existing index. Ensure in-memory state is consistent
+            std.mem.sort(merkle_mod.Entry, self.entries.items, {}, merkle_mod.pathLessThan);
+            try self.rebuildPathIndex();
+            return;
         };
 
         self.index_root = root;
         if (merkle_mod.hashEq(root, hash_mod.zero_hash)) return;
 
-        var store = merkle_mod.PageStore{ .alloc = self.alloc, .dir = self.dir };
+        const pages_dir = try self.subPath("index/pages");
+        defer self.alloc.free(pages_dir);
+        const store = merkle_mod.PageStore.init(self.alloc, self.fs, pages_dir);
+
         try merkle_mod.collect(self.alloc, &store, root, &self.entries);
         std.mem.sort(merkle_mod.Entry, self.entries.items, {}, merkle_mod.pathLessThan);
         try self.rebuildPathIndex();
@@ -83,13 +71,23 @@ pub const Index = struct {
         std.mem.sort(merkle_mod.Entry, self.entries.items, {}, merkle_mod.pathLessThan);
         try self.rebuildPathIndex();
 
-        // Remove old root metadata and write new tree
-        self.dir.deleteFile("index") catch {};
-        try self.dir.makePath("index/pages");
+        // Best-effort cleanup of a legacy single-file "index" blob from an
+        // older on-disk format, which would otherwise block RealFs from
+        // creating "index/" as a directory
+        const legacy_index_path = try self.subPath("index");
+        defer self.alloc.free(legacy_index_path);
+        self.fs.deleteFile(legacy_index_path) catch {};
 
-        var store = merkle_mod.PageStore{ .alloc = self.alloc, .dir = self.dir };
+        const pages_dir = try self.subPath("index/pages");
+        defer self.alloc.free(pages_dir);
+        const store = merkle_mod.PageStore.init(self.alloc, self.fs, pages_dir);
+
         const root = try merkle_mod.build(self.alloc, &store, self.entries.items);
-        try writeIndexRoot(self.dir, root);
+
+        const root_path = try self.subPath("index/index_root");
+        defer self.alloc.free(root_path);
+        try self.fs.writeFile(self.alloc, root_path, &root);
+
         self.index_root = root;
     }
 
@@ -119,7 +117,11 @@ pub const Index = struct {
         return self.addFileFromDir(store, cwd, full_path, path);
     }
 
-    /// Add or update a file, reading from an explicit directory handle
+    /// Add or update a file, reading from an explicit directory handle.
+    ///
+    /// NOTE: this reads worktree files (arbitrary user content anywhere on
+    /// disk), which is a different concern from the index's own storage
+    /// above — it deliberately stays on `std.fs.Dir` rather than `io.FileSystem`
     pub fn addFileFromDir(
         self: *Index,
         store: *const Store,
@@ -175,7 +177,17 @@ pub const Index = struct {
     /// Compute entry-level changes between `other_root` and the current index root
     /// Caller owns the returned slice; free with `freeChanges`
     pub fn diffAgainst(self: *const Index, other_root: Hash) merkle_mod.DiffError![]merkle_mod.EntryChange {
-        return merkle_mod.diffRoots(self.alloc, self.dir, other_root, self.index_root);
+        const pages_dir = try self.subPath("index/pages");
+        defer self.alloc.free(pages_dir);
+        const store = merkle_mod.PageStore.init(self.alloc, self.fs, pages_dir);
+        return merkle_mod.diffRoots(self.alloc, &store, other_root, self.index_root);
+    }
+
+    /// Join `self.index_dir` with a sub-path, e.g. "index/pages" ->
+    /// "<index_dir>/index/pages". Caller owns and must free the result.
+    fn subPath(self: *const Index, sub: []const u8) ![]u8 {
+        if (self.index_dir.len == 0) return self.alloc.dupe(u8, sub);
+        return std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.index_dir, sub });
     }
 
     fn rebuildPathIndex(self: *Index) !void {
@@ -222,63 +234,23 @@ fn clearEntries(index: *Index) void {
     index.path_index.clearRetainingCapacity();
 }
 
-fn readIndexRoot(dir: std.fs.Dir) merkle_mod.DiffError!Hash {
-    const file = try dir.openFile("index/index_root", .{});
-    defer file.close();
+fn readIndexRoot(fs: io.FileSystem, alloc: std.mem.Allocator, path: []const u8) !?Hash {
+    const bytes = (try fs.readFile(alloc, path)) orelse return null;
+    defer alloc.free(bytes);
+
+    if (bytes.len != @sizeOf(Hash)) return error.CorruptIndex;
 
     var root: Hash = undefined;
-    var reader_buf: [32]u8 = undefined;
-    var file_reader = file.readerStreaming(&reader_buf);
-    @memcpy(&root, try file_reader.interface.take(root.len));
-
-    if (file_reader.interface.takeByte()) |_| return error.CorruptIndex else |err| switch (err) {
-        error.EndOfStream => {},
-        else => return err,
-    }
-
+    @memcpy(&root, bytes[0..@sizeOf(Hash)]);
     return root;
-}
-
-fn writeIndexRoot(dir: std.fs.Dir, root: Hash) !void {
-    dir.deleteFile("index") catch {};
-    try dir.makePath("index");
-
-    const tmp_name = "index/index_root.tmp";
-    const final_name = "index/index_root";
-
-    const file = try dir.createFile(tmp_name, .{ .truncate = true });
-    var file_closed = false;
-    defer if (!file_closed) file.close();
-    errdefer {
-        if (!file_closed) {
-            file.close();
-            file_closed = true;
-        }
-        dir.deleteFile(tmp_name) catch {};
-    }
-
-    try file.writeAll(&root);
-    try file.sync();
-    file.close();
-    file_closed = true;
-
-    dir.rename(tmp_name, final_name) catch |err| switch (err) {
-        error.PathAlreadyExists => {
-            try dir.deleteFile(final_name);
-            try dir.rename(tmp_name, final_name);
-        },
-        else => return err,
-    };
 }
 
 test "index save and load round-trip through page store" {
     const alloc = std.testing.allocator;
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
 
-    const nodus_dir = try tmp_dir.dir.makeOpenPath(".nodus", .{});
-
-    var index = Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
+    var index = Index.init(alloc, tfs.fs(), "merk");
     defer index.deinit();
     try index.entries.append(alloc, .{
         .path = try alloc.dupe(u8, "src/main.zig"),
@@ -289,11 +261,10 @@ test "index save and load round-trip through page store" {
     });
     try index.save();
 
-    try tmp_dir.dir.access(".nodus/index/index_root", .{});
+    try std.testing.expect(tfs.hasFile("merk/index/index_root"));
     try std.testing.expect(!merkle_mod.hashEq(index.index_root, hash_mod.zero_hash));
 
-    const read_dir = try tmp_dir.dir.openDir(".nodus", .{});
-    var loaded = Index{ .alloc = alloc, .dir = read_dir, .entries = .empty };
+    var loaded = Index.init(alloc, tfs.fs(), "merk");
     defer loaded.deinit();
     try loaded.load();
 
@@ -308,12 +279,10 @@ test "index save and load round-trip through page store" {
 
 test "index writes multiple leaves behind internal root" {
     const alloc = std.testing.allocator;
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
 
-    const nodus_dir = try tmp_dir.dir.makeOpenPath(".nodus", .{});
-
-    var index = Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
+    var index = Index.init(alloc, tfs.fs(), "merk");
     defer index.deinit();
 
     for (0..140) |i| {
@@ -329,7 +298,7 @@ test "index writes multiple leaves behind internal root" {
 
     try index.save();
 
-    var store = merkle_mod.PageStore{ .alloc = alloc, .dir = index.dir };
+    const store = merkle_mod.PageStore.init(alloc, tfs.fs(), "merk/index/pages");
     var root_page = try store.get(index.index_root);
     defer root_page.deinit(alloc);
 
@@ -338,8 +307,7 @@ test "index writes multiple leaves behind internal root" {
         .leaf => return error.ExpectedInternalRoot,
     }
 
-    const read_dir = try tmp_dir.dir.openDir(".nodus", .{});
-    var loaded = Index{ .alloc = alloc, .dir = read_dir, .entries = .empty };
+    var loaded = Index.init(alloc, tfs.fs(), "merk");
     defer loaded.deinit();
     try loaded.load();
     try std.testing.expectEqual(@as(usize, 140), loaded.entries.items.len);
@@ -352,22 +320,21 @@ test "index addFile stores blob and upserts entry" {
     defer tmp_dir.cleanup();
 
     try tmp_dir.dir.writeFile(.{ .sub_path = "note.txt", .data = "first" });
-    const nodus_dir = try tmp_dir.dir.makeOpenPath(".nodus", .{});
 
     var real_fs = io.RealFs.init(tmp_dir.dir);
-    const store = Store.init(alloc, real_fs.fs(), ".nodus/objects");
-    var index = Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
+    const object_store = Store.init(alloc, real_fs.fs(), "merk/objects");
+    var index = Index.init(alloc, real_fs.fs(), "merk");
     defer index.deinit();
 
-    const hash1 = try index.addFileFromDir(&store, tmp_dir.dir, "note.txt", "note.txt");
+    const hash1 = try index.addFileFromDir(&object_store, tmp_dir.dir, "note.txt", "note.txt");
     try std.testing.expectEqual(@as(usize, 1), index.entries.items.len);
-    try std.testing.expect(store.exists(hash1));
+    try std.testing.expect(object_store.exists(hash1));
 
     try tmp_dir.dir.writeFile(.{ .sub_path = "note.txt", .data = "second" });
-    const hash2 = try index.addFileFromDir(&store, tmp_dir.dir, "note.txt", "note.txt");
+    const hash2 = try index.addFileFromDir(&object_store, tmp_dir.dir, "note.txt", "note.txt");
     try std.testing.expectEqual(@as(usize, 1), index.entries.items.len);
     try std.testing.expect(!merkle_mod.hashEq(hash1, hash2));
-    try std.testing.expect(store.exists(hash2));
+    try std.testing.expect(object_store.exists(hash2));
 }
 
 test "index stateOf reports deleted file" {
@@ -375,8 +342,9 @@ test "index stateOf reports deleted file" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const nodus_dir = try tmp_dir.dir.makeOpenPath(".nodus", .{});
-    var index = Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    var index = Index.init(alloc, tfs.fs(), "merk");
     defer index.deinit();
 
     const entry = merkle_mod.Entry{
@@ -399,18 +367,16 @@ test "index lookup works after addFile without an intervening save" {
     try tmp_dir.dir.writeFile(.{ .sub_path = "zzz.txt", .data = "z" });
     try tmp_dir.dir.writeFile(.{ .sub_path = "aaa.txt", .data = "a" });
 
-    const nodus_dir = try tmp_dir.dir.makeOpenPath(".nodus", .{});
-
     var real_fs = io.RealFs.init(tmp_dir.dir);
-    const store = Store.init(alloc, real_fs.fs(), ".nodus/objects");
-    var index = Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
+    const object_store = Store.init(alloc, real_fs.fs(), "merk/objects");
+    var index = Index.init(alloc, real_fs.fs(), "merk");
     defer index.deinit();
 
     // Insert lexicographically out of order (z before a). A binary-search
     // lookup over an unsorted `entries` array would fail to find "aaa.txt"
     // here; the path_index map must not care about ordering.
-    _ = try index.addFileFromDir(&store, tmp_dir.dir, "zzz.txt", "zzz.txt");
-    _ = try index.addFileFromDir(&store, tmp_dir.dir, "aaa.txt", "aaa.txt");
+    _ = try index.addFileFromDir(&object_store, tmp_dir.dir, "zzz.txt", "zzz.txt");
+    _ = try index.addFileFromDir(&object_store, tmp_dir.dir, "aaa.txt", "aaa.txt");
 
     try std.testing.expect(index.lookup("zzz.txt") != null);
     try std.testing.expect(index.lookup("aaa.txt") != null);
@@ -423,16 +389,15 @@ test "index upsert replaces an existing entry in place" {
     defer tmp_dir.cleanup();
 
     try tmp_dir.dir.writeFile(.{ .sub_path = "note.txt", .data = "v1" });
-    const nodus_dir = try tmp_dir.dir.makeOpenPath(".nodus", .{});
 
     var real_fs = io.RealFs.init(tmp_dir.dir);
-    const store = Store.init(alloc, real_fs.fs(), ".nodus/objects");
-    var index = Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
+    const object_store = Store.init(alloc, real_fs.fs(), "merk/objects");
+    var index = Index.init(alloc, real_fs.fs(), "merk");
     defer index.deinit();
 
-    _ = try index.addFileFromDir(&store, tmp_dir.dir, "note.txt", "note.txt");
+    _ = try index.addFileFromDir(&object_store, tmp_dir.dir, "note.txt", "note.txt");
     try tmp_dir.dir.writeFile(.{ .sub_path = "note.txt", .data = "v2-longer" });
-    _ = try index.addFileFromDir(&store, tmp_dir.dir, "note.txt", "note.txt");
+    _ = try index.addFileFromDir(&object_store, tmp_dir.dir, "note.txt", "note.txt");
 
     try std.testing.expectEqual(@as(usize, 1), index.entries.items.len);
     const entry = index.lookup("note.txt") orelse return error.ExpectedEntry;
@@ -441,11 +406,10 @@ test "index upsert replaces an existing entry in place" {
 
 test "index remove drops a tracked path and reports NotFound afterward" {
     const alloc = std.testing.allocator;
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
 
-    const nodus_dir = try tmp_dir.dir.makeOpenPath(".nodus", .{});
-    var index = Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
+    var index = Index.init(alloc, tfs.fs(), "merk");
     defer index.deinit();
 
     try index.entries.append(alloc, .{
@@ -473,11 +437,10 @@ test "index remove drops a tracked path and reports NotFound afterward" {
 
 test "index diffAgainst short-circuits on identical roots" {
     const alloc = std.testing.allocator;
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
 
-    const nodus_dir = try tmp_dir.dir.makeOpenPath(".nodus", .{});
-    var index = Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
+    var index = Index.init(alloc, tfs.fs(), "merk");
     defer index.deinit();
     try index.entries.append(alloc, .{
         .path = try alloc.dupe(u8, "a.txt"),
@@ -495,12 +458,10 @@ test "index diffAgainst short-circuits on identical roots" {
 
 test "index diffAgainst detects added, removed, and modified entries" {
     const alloc = std.testing.allocator;
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
 
-    const nodus_dir = try tmp_dir.dir.makeOpenPath(".nodus", .{});
-
-    var old_index = Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
+    var old_index = Index.init(alloc, tfs.fs(), "merk");
     defer old_index.deinit();
     try old_index.entries.append(alloc, .{
         .path = try alloc.dupe(u8, "keep.txt"),
@@ -526,8 +487,7 @@ test "index diffAgainst detects added, removed, and modified entries" {
     try old_index.save();
     const old_root = old_index.index_root;
 
-    const read_dir = try tmp_dir.dir.openDir(".nodus", .{});
-    var new_index = Index{ .alloc = alloc, .dir = read_dir, .entries = .empty };
+    var new_index = Index.init(alloc, tfs.fs(), "merk");
     defer new_index.deinit();
     try new_index.load();
 
