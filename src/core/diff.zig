@@ -5,7 +5,23 @@
 //  Neither pass requires the AST to work — they operate on raw source bytes.
 //  The AST delta layer lives in an intent layer and consumes these results.
 //
-
+//  This file has two halves:
+//
+//    1. A storage-agnostic content-diff engine (Myers/Patience/Histogram,
+//       FileDiff/WordDelta, all the render formats) — unchanged from
+//       before, since none of it ever touched how snapshots are stored.
+//
+//    2. A thin merkle-tree adapter (`diffSnapshotRoots`, `diffCommits`,
+//       `diffCommitAgainstParent`) that turns two snapshot-root hashes
+//       into per-path `EntryChange`s via `merk.merkle.diffRoots`, then
+//       runs the content-diff engine over just the paths that changed.
+//       The old tree-walking/pruning logic that used to live in this
+//       file (separately handling legacy `tree_mod` trees, `index_mod`
+//       B-tree pages, and the "one side is legacy, one is index" mixed
+//       case) is gone — `merk.merkle` is now the only snapshot
+//       representation, and its `diffRoots` already does the pruning
+//       (identical page hashes are never even read from disk).
+//
 //  Myers     — O(ND) shortest edit script.  Minimal edits, can produce noisy
 //              hunks when coincidental matches exist deep in changed regions
 //
@@ -27,158 +43,37 @@ pub const Op = enum(u8) {
     del = 2,
 };
 
-const object_mod = @import("object.zig");
-const tree_mod = @import("tree.zig");
-const hash_mod = @import("hash.zig");
+const merk = @import("merk");
+const hash_mod = merk.crypto.hash;
+const merkle_mod = merk.merkle;
+const object_mod = @import("object/object.zig");
 const commit_mod = @import("commit.zig");
-const index_mod = @import("index.zig");
 
-/// Diff the tree of `new_commit` against the tree of `old_commit`
-/// Pass `null` for `old_commit` to diff against an empty tree, e.g. for
-/// the root commit, where there is no parent to compare against
-pub fn diffCommits(
+const Hash = hash_mod.Hash;
+
+/// Diff two snapshot roots — hashes of merkle B-tree pages built by
+/// `merk.merkle.build` (what `Index.save`/`History.commit` produce).
+/// `old_root == null` means "empty tree" (the root-commit case): every
+/// entry in `new_root` shows up as added.
+///
+/// The tree walk itself is `merkle_mod.diffRoots`'s job — including the
+/// pruning that makes it cheap: identical page hashes are skipped
+/// without ever being read from disk, so an unchanged subtree costs
+/// nothing regardless of its size. This function's only responsibility
+/// is turning the resulting per-path `EntryChange`s into content-level
+/// line/word diffs by fetching just the changed blobs.
+pub fn diffSnapshotRoots(
     alloc: std.mem.Allocator,
     store: *const object_mod.Store,
-    old_commit: ?hash_mod.Hash,
-    new_commit: hash_mod.Hash,
+    page_store: *const merkle_mod.PageStore,
+    old_root: ?Hash,
+    new_root: Hash,
     algo: Algorithm,
 ) !CommitDiff {
-    var new_c = try commit_mod.read(alloc, store, new_commit);
-    defer new_c.deinit(alloc);
+    const normalized_old = old_root orelse hash_mod.zero_hash;
+    const changes = try merkle_mod.diffRoots(alloc, page_store, normalized_old, new_root);
+    defer merkle_mod.freeChanges(alloc, changes);
 
-    var old_tree: ?hash_mod.Hash = null;
-    var old_c: ?commit_mod.Commit = null;
-    defer if (old_c) |*c| c.deinit(alloc);
-
-    if (old_commit) |oc| {
-        old_c = try commit_mod.read(alloc, store, oc);
-        old_tree = old_c.?.snapshot.tree;
-    }
-
-    return diffTreeHashes(alloc, store, old_tree, new_c.snapshot.tree, algo);
-}
-
-/// Diff commits whose snapshots point at index roots. If either root is not
-/// present in the index page store, falls back to the legacy tree-object diff.
-pub fn diffCommitsFromIndexRoots(
-    alloc: std.mem.Allocator,
-    store: *const object_mod.Store,
-    page_store: *const index_mod.PageStore,
-    old_commit: ?hash_mod.Hash,
-    new_commit: hash_mod.Hash,
-    algo: Algorithm,
-) !CommitDiff {
-    var new_c = try commit_mod.read(alloc, store, new_commit);
-    defer new_c.deinit(alloc);
-
-    var old_root: ?hash_mod.Hash = null;
-    var old_c: ?commit_mod.Commit = null;
-    defer if (old_c) |*c| c.deinit(alloc);
-
-    if (old_commit) |oc| {
-        old_c = try commit_mod.read(alloc, store, oc);
-        old_root = old_c.?.snapshot.tree;
-    }
-
-    return diffSnapshotRoots(alloc, store, page_store, old_root, new_c.snapshot.tree, algo);
-}
-
-/// Diff `new_commit` against its first parent. If `new_commit` has no
-/// parents (a root commit), diffs against an empty tree
-pub fn diffCommitAgainstParent(
-    alloc: std.mem.Allocator,
-    store: *const object_mod.Store,
-    new_commit: hash_mod.Hash,
-    algo: Algorithm,
-) !CommitDiff {
-    var new_c = try commit_mod.read(alloc, store, new_commit);
-    defer new_c.deinit(alloc);
-
-    const old_tree: ?hash_mod.Hash = if (new_c.snapshot.parents.len > 0) blk: {
-        var parent_c = try commit_mod.read(alloc, store, new_c.snapshot.parents[0]);
-        defer parent_c.deinit(alloc);
-        break :blk parent_c.snapshot.tree;
-    } else null;
-
-    return diffTreeHashes(alloc, store, old_tree, new_c.snapshot.tree, algo);
-}
-
-/// Diff `new_commit` against its first parent using index-root Merkle pruning.
-/// Falls back to legacy tree-object diff when comparing old commits.
-pub fn diffCommitAgainstParentFromIndexRoot(
-    alloc: std.mem.Allocator,
-    store: *const object_mod.Store,
-    page_store: *const index_mod.PageStore,
-    new_commit: hash_mod.Hash,
-    algo: Algorithm,
-) !CommitDiff {
-    var new_c = try commit_mod.read(alloc, store, new_commit);
-    defer new_c.deinit(alloc);
-
-    const old_root: ?hash_mod.Hash = if (new_c.snapshot.parents.len > 0) blk: {
-        var parent_c = try commit_mod.read(alloc, store, new_c.snapshot.parents[0]);
-        defer parent_c.deinit(alloc);
-        break :blk parent_c.snapshot.tree;
-    } else null;
-
-    return diffSnapshotRoots(alloc, store, page_store, old_root, new_c.snapshot.tree, algo);
-}
-
-/// Diff two trees directly. `old_tree == null` means "empty tree" (nothing
-/// on the old side — every file in `new_tree` shows up as added)
-pub fn diffTreeHashes(
-    alloc: std.mem.Allocator,
-    store: *const object_mod.Store,
-    old_tree: ?hash_mod.Hash,
-    new_tree: hash_mod.Hash,
-    algo: Algorithm,
-) !CommitDiff {
-    const old_flat: []tree_mod.FlatEntry = if (old_tree) |t|
-        try tree_mod.readToFlatEntries(alloc, store, t)
-    else
-        &[_]tree_mod.FlatEntry{};
-    defer if (old_tree != null) tree_mod.freeFlatEntries(alloc, old_flat);
-
-    const new_flat = try tree_mod.readToFlatEntries(alloc, store, new_tree);
-    defer tree_mod.freeFlatEntries(alloc, new_flat);
-
-    var blobs: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (blobs.items) |b| alloc.free(b);
-        blobs.deinit(alloc);
-    }
-
-    const old_snaps = try alloc.alloc(FileSnapshot, old_flat.len);
-    defer alloc.free(old_snaps);
-    for (old_flat, 0..) |e, i| {
-        const obj = try store.get(e.hash);
-        try blobs.append(alloc, obj.payload);
-        old_snaps[i] = .{ .path = e.path, .content = obj.payload };
-    }
-
-    const new_snaps = try alloc.alloc(FileSnapshot, new_flat.len);
-    defer alloc.free(new_snaps);
-    for (new_flat, 0..) |e, i| {
-        const obj = try store.get(e.hash);
-        try blobs.append(alloc, obj.payload);
-        new_snaps[i] = .{ .path = e.path, .content = obj.payload };
-    }
-
-    var cd = try diffCommitWith(alloc, old_snaps, new_snaps, algo);
-    cd.blobs = try blobs.toOwnedSlice(alloc);
-    return cd;
-}
-
-/// Diff two persisted index roots. Equal page hashes prune whole subtrees
-/// without reading entries or blobs under that subtree.
-pub fn diffIndexRoots(
-    alloc: std.mem.Allocator,
-    store: *const object_mod.Store,
-    page_store: *const index_mod.PageStore,
-    old_root: ?hash_mod.Hash,
-    new_root: hash_mod.Hash,
-    algo: Algorithm,
-) !CommitDiff {
     var file_diffs: std.ArrayList(FileDiff) = .empty;
     var blobs: std.ArrayList([]u8) = .empty;
     errdefer {
@@ -188,60 +83,78 @@ pub fn diffIndexRoots(
         blobs.deinit(alloc);
     }
 
-    const normalized_old = if (old_root) |root| root else hash_mod.ZERO_HASH;
-    try diffIndexRecursive(
-        alloc,
-        store,
-        page_store,
-        maybeNonZero(normalized_old),
-        maybeNonZero(new_root),
-        algo,
-        &file_diffs,
-        &blobs,
-    );
+    for (changes) |c| {
+        const old_src = if (c.old_blob_hash) |h| blk: {
+            const obj = try store.get(h);
+            try blobs.append(alloc, obj.payload);
+            break :blk obj.payload;
+        } else "";
 
-    const files = try file_diffs.toOwnedSlice(alloc);
-    errdefer {
-        for (files) |*f| f.deinit(alloc);
-        alloc.free(files);
+        const new_src = if (c.new_blob_hash) |h| blk: {
+            const obj = try store.get(h);
+            try blobs.append(alloc, obj.payload);
+            break :blk obj.payload;
+        } else "";
+
+        try file_diffs.append(alloc, try diffFileWith(alloc, c.path, old_src, new_src, algo));
     }
 
     return .{
-        .files = files,
+        .files = try file_diffs.toOwnedSlice(alloc),
         .line_diff_hash = .{0} ** 32,
         .word_diff_hash = .{0} ** 32,
         .blobs = try blobs.toOwnedSlice(alloc),
     };
 }
 
-fn diffSnapshotRoots(
+/// Diff the snapshot of `new_commit` against the snapshot of `old_commit`.
+/// Pass `null` for `old_commit` to diff against an empty tree, e.g. for
+/// the root commit, where there is no parent to compare against.
+pub fn diffCommits(
     alloc: std.mem.Allocator,
     store: *const object_mod.Store,
-    page_store: *const index_mod.PageStore,
-    old_root: ?hash_mod.Hash,
-    new_root: hash_mod.Hash,
+    page_store: *const merkle_mod.PageStore,
+    old_commit: ?Hash,
+    new_commit: Hash,
     algo: Algorithm,
 ) !CommitDiff {
-    const old_is_index = if (old_root) |root| rootLooksLikeIndexRoot(page_store, root) else true;
-    const new_is_index = rootLooksLikeIndexRoot(page_store, new_root);
+    var new_c = try commit_mod.read(alloc, store, new_commit);
+    defer new_c.deinit(alloc);
 
-    if (old_is_index and new_is_index) {
-        return diffIndexRoots(alloc, store, page_store, old_root, new_root, algo);
-    }
-    if (!old_is_index and !new_is_index) {
-        return diffTreeHashes(alloc, store, old_root, new_root, algo);
+    var old_root: ?Hash = null;
+    var old_c: ?commit_mod.Commit = null;
+    defer if (old_c) |*c| c.deinit(alloc);
+
+    if (old_commit) |oc| {
+        old_c = try commit_mod.read(alloc, store, oc);
+        old_root = old_c.?.snapshot;
     }
 
-    return diffMixedSnapshotRoots(
-        alloc,
-        store,
-        page_store,
-        old_root,
-        old_is_index,
-        new_root,
-        new_is_index,
-        algo,
-    );
+    return diffSnapshotRoots(alloc, store, page_store, old_root, new_c.snapshot, algo);
+}
+
+/// Diff `new_commit` against its first parent. If `new_commit` has no
+/// parents (a root commit), diffs against an empty tree. For a merge
+/// commit (more than one `ParentInfo`), this is a first-parent diff —
+/// same convention `git show` uses by default — not a diff against
+/// every parent.
+pub fn diffCommitAgainstParent(
+    alloc: std.mem.Allocator,
+    store: *const object_mod.Store,
+    page_store: *const merkle_mod.PageStore,
+    new_commit: Hash,
+    algo: Algorithm,
+) !CommitDiff {
+    var new_c = try commit_mod.read(alloc, store, new_commit);
+    defer new_c.deinit(alloc);
+
+    const old_root: ?Hash = if (new_c.parents.len > 0) blk: {
+        var parent_c = try commit_mod.read(alloc, store, new_c.parents[0].hash);
+        defer parent_c.deinit(alloc);
+        break :blk parent_c.snapshot;
+    } else null;
+
+    return diffSnapshotRoots(alloc, store, page_store, old_root, new_c.snapshot, algo);
 }
 
 pub const LineDelta = struct {
@@ -462,6 +375,12 @@ pub fn diffCommit(
     return diffCommitWith(alloc, old_files, new_files, .histogram);
 }
 
+/// Diff two already-in-memory (path, content) snapshots directly, without
+/// touching any store — for callers that have both full file sets on hand
+/// already (e.g. comparing a worktree scan to the index) rather than two
+/// stored merkle roots. For diffing stored snapshots/commits, prefer
+/// `diffSnapshotRoots`/`diffCommits`, which only fetch the blobs that
+/// actually changed instead of every file on both sides.
 pub fn diffCommitWith(
     alloc: std.mem.Allocator,
     old_files: []const FileSnapshot,
@@ -504,379 +423,305 @@ pub fn diffCommitWith(
     };
 }
 
-fn maybeNonZero(hash: hash_mod.Hash) ?hash_mod.Hash {
-    if (std.mem.eql(u8, &hash, &hash_mod.ZERO_HASH)) return null;
-    return hash;
-}
+pub fn renderCommit(writer: anytype, cd: *const CommitDiff, config: RenderConfig, alloc: std.mem.Allocator) !void {
+    var filtered: std.ArrayList(*const FileDiff) = .empty;
+    defer filtered.deinit(alloc);
 
-fn rootLooksLikeIndexRoot(page_store: *const index_mod.PageStore, root: hash_mod.Hash) bool {
-    if (std.mem.eql(u8, &root, &hash_mod.ZERO_HASH)) return true;
-    _ = page_store.getBytes(root) catch return false;
-    return true;
-}
-
-fn diffMixedSnapshotRoots(
-    alloc: std.mem.Allocator,
-    store: *const object_mod.Store,
-    page_store: *const index_mod.PageStore,
-    old_root: ?hash_mod.Hash,
-    old_is_index: bool,
-    new_root: hash_mod.Hash,
-    new_is_index: bool,
-    algo: Algorithm,
-) !CommitDiff {
-    var blobs: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (blobs.items) |blob| alloc.free(blob);
-        blobs.deinit(alloc);
+    for (cd.files) |*fd| {
+        const status = fileStatus(fd);
+        if (!config.filter.allows(status)) continue;
+        try filtered.append(alloc, fd);
     }
 
-    var old_index_entries: std.ArrayList(index_mod.LeafEntry) = .empty;
-    defer freeLeafEntries(alloc, &old_index_entries);
-    var new_index_entries: std.ArrayList(index_mod.LeafEntry) = .empty;
-    defer freeLeafEntries(alloc, &new_index_entries);
-
-    var old_flat: ?[]tree_mod.FlatEntry = null;
-    defer if (old_flat) |entries| tree_mod.freeFlatEntries(alloc, entries);
-    var new_flat: ?[]tree_mod.FlatEntry = null;
-    defer if (new_flat) |entries| tree_mod.freeFlatEntries(alloc, entries);
-
-    const old_files = try rootToFileSnapshots(
-        alloc,
-        store,
-        page_store,
-        old_root,
-        old_is_index,
-        &old_index_entries,
-        &old_flat,
-        &blobs,
-    );
-    defer alloc.free(old_files);
-
-    const new_files = try rootToFileSnapshots(
-        alloc,
-        store,
-        page_store,
-        new_root,
-        new_is_index,
-        &new_index_entries,
-        &new_flat,
-        &blobs,
-    );
-    defer alloc.free(new_files);
-
-    var cd = try diffCommitWith(alloc, old_files, new_files, algo);
-    cd.blobs = try blobs.toOwnedSlice(alloc);
-    return cd;
-}
-
-fn rootToFileSnapshots(
-    alloc: std.mem.Allocator,
-    store: *const object_mod.Store,
-    page_store: *const index_mod.PageStore,
-    root: ?hash_mod.Hash,
-    is_index: bool,
-    index_entries: *std.ArrayList(index_mod.LeafEntry),
-    flat_entries: *?[]tree_mod.FlatEntry,
-    blobs: *std.ArrayList([]u8),
-) ![]FileSnapshot {
-    const actual_root = if (root) |value| value else return alloc.alloc(FileSnapshot, 0);
-    if (std.mem.eql(u8, &actual_root, &hash_mod.ZERO_HASH)) return alloc.alloc(FileSnapshot, 0);
-
-    if (is_index) {
-        try collectSubtreeEntries(alloc, page_store, actual_root, index_entries);
-        std.mem.sort(index_mod.LeafEntry, index_entries.items, {}, leafEntryLessThan);
-
-        const files = try alloc.alloc(FileSnapshot, index_entries.items.len);
-        for (index_entries.items, 0..) |entry, i| {
-            const obj = try store.get(entry.blob_hash);
-            try blobs.append(alloc, obj.payload);
-            files[i] = .{ .path = entry.path, .content = obj.payload };
+    if (config.group_by == .dirs) {
+        const groups = try groupByDirectory(alloc, filtered.items);
+        defer {
+            for (groups) |g| alloc.free(g.files);
+            alloc.free(groups);
         }
-        return files;
-    }
-
-    const flat = try tree_mod.readToFlatEntries(alloc, store, actual_root);
-    flat_entries.* = flat;
-
-    const files = try alloc.alloc(FileSnapshot, flat.len);
-    for (flat, 0..) |entry, i| {
-        const obj = try store.get(entry.hash);
-        try blobs.append(alloc, obj.payload);
-        files[i] = .{ .path = entry.path, .content = obj.payload };
-    }
-    return files;
-}
-
-fn diffIndexRecursive(
-    alloc: std.mem.Allocator,
-    store: *const object_mod.Store,
-    page_store: *const index_mod.PageStore,
-    old_hash: ?hash_mod.Hash,
-    new_hash: ?hash_mod.Hash,
-    algo: Algorithm,
-    out: *std.ArrayList(FileDiff),
-    blobs: *std.ArrayList([]u8),
-) anyerror!void {
-    if (old_hash != null and new_hash != null and std.mem.eql(u8, &old_hash.?, &new_hash.?)) return;
-
-    if (old_hash == null and new_hash == null) return;
-    if (old_hash == null) {
-        try appendAddedSubtree(alloc, store, page_store, new_hash.?, algo, out, blobs);
-        return;
-    }
-    if (new_hash == null) {
-        try appendDeletedSubtree(alloc, store, page_store, old_hash.?, algo, out, blobs);
+        for (groups) |g| {
+            try writer.print("{s}/\n", .{g.dir});
+            for (g.files) |fd| {
+                try writer.print("  {s}\n", .{std.fs.path.basename(fd.path)});
+            }
+            try writer.writeByte('\n');
+        }
         return;
     }
 
-    var old_page = try page_store.get(old_hash.?);
-    defer old_page.deinit(alloc);
-    var new_page = try page_store.get(new_hash.?);
-    defer new_page.deinit(alloc);
-
-    switch (old_page) {
-        .leaf => |old_entries| switch (new_page) {
-            .leaf => |new_entries| try diffLeafEntries(alloc, store, old_entries.items, new_entries.items, algo, out, blobs),
-            .internal => try diffCollectedSubtrees(alloc, store, page_store, old_hash.?, new_hash.?, algo, out, blobs),
-        },
-        .internal => |old_children| switch (new_page) {
-            .leaf => try diffCollectedSubtrees(alloc, store, page_store, old_hash.?, new_hash.?, algo, out, blobs),
-            .internal => |new_children| try diffInternalChildren(
-                alloc,
-                store,
-                page_store,
-                old_children.items,
-                new_children.items,
-                algo,
-                out,
-                blobs,
-            ),
-        },
+    for (filtered.items) |fd| {
+        try renderFileDiff(writer, fd, config);
     }
 }
 
-fn diffInternalChildren(
-    alloc: std.mem.Allocator,
-    store: *const object_mod.Store,
-    page_store: *const index_mod.PageStore,
-    old_children: []const index_mod.ChildRef,
-    new_children: []const index_mod.ChildRef,
-    algo: Algorithm,
-    out: *std.ArrayList(FileDiff),
-    blobs: *std.ArrayList([]u8),
-) !void {
-    var old_i: usize = 0;
-    var new_i: usize = 0;
-    while (old_i < old_children.len or new_i < new_children.len) {
-        const cmp: std.math.Order = blk: {
-            if (old_i >= old_children.len) break :blk .gt;
-            if (new_i >= new_children.len) break :blk .lt;
-            break :blk comparePathKey(old_children[old_i].separator, new_children[new_i].separator);
+pub fn renderFileDiff(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
+    if (config.level == .file) {
+        const status = fileStatus(fd);
+        const sc = switch (status) {
+            .added => "A",
+            .deleted => "D",
+            .modified => "M",
+            .unchanged => "~",
         };
+        try writer.print("{s} {s} (+{d} -{d})\n", .{ sc, fd.path, fd.lines_added, fd.lines_removed });
+        return;
+    }
 
-        if (cmp == .eq) {
-            try diffIndexRecursive(
-                alloc,
-                store,
-                page_store,
-                old_children[old_i].page_hash,
-                new_children[new_i].page_hash,
-                algo,
-                out,
-                blobs,
-            );
-            old_i += 1;
-            new_i += 1;
-        } else if (cmp == .lt) {
-            try appendDeletedSubtree(alloc, store, page_store, old_children[old_i].page_hash, algo, out, blobs);
-            old_i += 1;
-        } else {
-            try appendAddedSubtree(alloc, store, page_store, new_children[new_i].page_hash, algo, out, blobs);
-            new_i += 1;
+    if (config.level == .word) {
+        try renderWordHighlight(writer, fd);
+        return;
+    }
+
+    switch (config.format) {
+        .unified => try renderUnified(writer, fd, config),
+        .side_by_side => try renderSideBySide(writer, fd, config),
+        .blocks => try renderBlockOriented(writer, fd, config),
+        .ops => try renderOperations(writer, fd, config),
+        .summary => try renderSummary(writer, fd),
+    }
+}
+
+pub fn renderUnified(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
+    try writer.print("FILE  {s}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{fd.path});
+    if (fd.line_deltas.len == 0) return;
+
+    var it = HunkIterator.init(fd.line_deltas, config.contextLines());
+    while (it.next()) |hunk| {
+        const line_num = hunk.displayLineNum();
+        try writer.print("~ Line {d}\n", .{line_num});
+        for (fd.line_deltas[hunk.start..hunk.end]) |d| {
+            const prefix: []const u8 = switch (d.op) {
+                .eq => "  ",
+                .del => "- ",
+                .ins => "+ ",
+            };
+            try writer.print("{s}{s}\n", .{ prefix, d.content });
+        }
+        try writer.writeByte('\n');
+    }
+}
+
+fn renderSideBySide(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
+    const col_width = maxLineWidth(fd.line_deltas, @as(usize, @intCast(config.max_width)));
+    const sep = " │ ";
+
+    try writer.print("FILE  {s}\n", .{fd.path});
+    try writer.writeAll("│ Before");
+    padTo(writer, col_width, 6);
+    try writer.writeAll(sep);
+    try writer.writeAll("After");
+    padTo(writer, col_width, 5);
+    try writer.writeByte('\n');
+
+    const total_width = 1 + col_width + sep.len + col_width + 1;
+    for (0..total_width) |_| try writer.writeAll("─");
+    try writer.writeByte('\n');
+
+    for (fd.line_deltas) |d| {
+        const left = if (d.op == .ins) "" else d.content;
+        const right = if (d.op == .del) "" else d.content;
+        try writer.writeAll("│");
+        try writePadded(writer, left, col_width);
+        try writer.writeAll(sep);
+        try writePadded(writer, right, col_width);
+        try writer.writeByte('\n');
+    }
+    try writer.writeByte('\n');
+}
+
+fn renderBlockOriented(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
+    try writer.print("FILE: {s}\n", .{fd.path});
+    if (fd.line_deltas.len == 0) return;
+
+    var it = HunkIterator.init(fd.line_deltas, config.contextLines());
+    var change_number: usize = 1;
+    while (it.next()) |hunk| {
+        try writer.print("CHANGE #{d}\n", .{change_number});
+        try writeSectionDivider(writer, 32);
+        try writer.writeAll("BEFORE\n");
+        for (fd.line_deltas[hunk.start..hunk.end]) |d| if (d.op != .ins) try writer.print("{s}\n", .{d.content});
+        try writer.writeAll("AFTER\n");
+        for (fd.line_deltas[hunk.start..hunk.end]) |d| if (d.op != .del) try writer.print("{s}\n", .{d.content});
+        try writer.writeByte('\n');
+        change_number += 1;
+    }
+}
+
+fn renderOperations(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
+    try writer.print("FILE  {s}\n", .{fd.path});
+    try writer.print("STATUS: {s}\n\n", .{statusString(fileStatus(fd))});
+    if (fd.line_deltas.len == 0) return;
+
+    var it = HunkIterator.init(fd.line_deltas, config.contextLines());
+    while (it.next()) |hunk| {
+        const line_num = hunk.displayLineNum();
+        try writer.print("FROM line {d}\n", .{line_num});
+        for (fd.line_deltas[hunk.start..hunk.end]) |d| if (d.op != .ins) try writer.print("  {s}\n", .{d.content});
+        try writer.print("\nTO line {d}\n", .{line_num});
+        for (fd.line_deltas[hunk.start..hunk.end]) |d| if (d.op != .del) try writer.print("  {s}\n", .{d.content});
+        try writer.writeByte('\n');
+    }
+}
+
+fn renderSummary(writer: anytype, fd: *const FileDiff) !void {
+    const status = fileStatus(fd);
+    const sc = switch (status) {
+        .added => "A",
+        .deleted => "D",
+        .modified => "M",
+        .unchanged => "~",
+    };
+    try writer.print("{s} {s} (+{d} -{d})\n", .{ sc, fd.path, fd.lines_added, fd.lines_removed });
+}
+
+fn renderWordHighlight(writer: anytype, fd: *const FileDiff) !void {
+    try writer.print("WORD HIGHLIGHT: {s}\n", .{fd.path});
+    try renderWordDeltas(writer, fd.word_deltas);
+}
+
+pub fn renderWordDiff(writer: anytype, fd: *const FileDiff) !void {
+    try writer.print("WORD HIGHLIGHT: {s}\n", .{fd.path});
+    try renderWordDeltas(writer, fd.word_deltas);
+}
+
+fn renderWordDeltas(writer: anytype, word_deltas: []const WordDelta) !void {
+    var current_line: u32 = 0;
+    for (word_deltas) |d| {
+        if (d.lineno != current_line) {
+            if (current_line != 0) try writer.writeByte('\n');
+            try writer.print("Line {d}: ", .{d.lineno});
+            current_line = d.lineno;
+        }
+        switch (d.op) {
+            .eq => try writer.print("{s}", .{d.word}),
+            .ins => try writer.print("[+{s}+]", .{d.word}),
+            .del => try writer.print("[-{s}-]", .{d.word}),
         }
     }
+    if (current_line != 0) try writer.writeByte('\n');
 }
 
-fn diffCollectedSubtrees(
-    alloc: std.mem.Allocator,
-    store: *const object_mod.Store,
-    page_store: *const index_mod.PageStore,
-    old_hash: hash_mod.Hash,
-    new_hash: hash_mod.Hash,
-    algo: Algorithm,
-    out: *std.ArrayList(FileDiff),
-    blobs: *std.ArrayList([]u8),
-) !void {
-    var old_entries: std.ArrayList(index_mod.LeafEntry) = .empty;
-    defer freeLeafEntries(alloc, &old_entries);
-    var new_entries: std.ArrayList(index_mod.LeafEntry) = .empty;
-    defer freeLeafEntries(alloc, &new_entries);
+const Hunk = struct {
+    start: usize,
+    end: usize,
+    deltas: []const LineDelta,
 
-    try collectSubtreeEntries(alloc, page_store, old_hash, &old_entries);
-    try collectSubtreeEntries(alloc, page_store, new_hash, &new_entries);
-    std.mem.sort(index_mod.LeafEntry, old_entries.items, {}, leafEntryLessThan);
-    std.mem.sort(index_mod.LeafEntry, new_entries.items, {}, leafEntryLessThan);
-
-    try diffLeafEntries(alloc, store, old_entries.items, new_entries.items, algo, out, blobs);
-}
-
-fn appendAddedSubtree(
-    alloc: std.mem.Allocator,
-    store: *const object_mod.Store,
-    page_store: *const index_mod.PageStore,
-    page_hash: hash_mod.Hash,
-    algo: Algorithm,
-    out: *std.ArrayList(FileDiff),
-    blobs: *std.ArrayList([]u8),
-) !void {
-    var entries: std.ArrayList(index_mod.LeafEntry) = .empty;
-    defer freeLeafEntries(alloc, &entries);
-    try collectSubtreeEntries(alloc, page_store, page_hash, &entries);
-    std.mem.sort(index_mod.LeafEntry, entries.items, {}, leafEntryLessThan);
-
-    for (entries.items) |entry| {
-        try appendFileDiffFromHashes(alloc, store, entry.path, null, entry.blob_hash, algo, out, blobs);
-    }
-}
-
-fn appendDeletedSubtree(
-    alloc: std.mem.Allocator,
-    store: *const object_mod.Store,
-    page_store: *const index_mod.PageStore,
-    page_hash: hash_mod.Hash,
-    algo: Algorithm,
-    out: *std.ArrayList(FileDiff),
-    blobs: *std.ArrayList([]u8),
-) !void {
-    var entries: std.ArrayList(index_mod.LeafEntry) = .empty;
-    defer freeLeafEntries(alloc, &entries);
-    try collectSubtreeEntries(alloc, page_store, page_hash, &entries);
-    std.mem.sort(index_mod.LeafEntry, entries.items, {}, leafEntryLessThan);
-
-    for (entries.items) |entry| {
-        try appendFileDiffFromHashes(alloc, store, entry.path, entry.blob_hash, null, algo, out, blobs);
-    }
-}
-
-fn collectSubtreeEntries(
-    alloc: std.mem.Allocator,
-    page_store: *const index_mod.PageStore,
-    page_hash: hash_mod.Hash,
-    out: *std.ArrayList(index_mod.LeafEntry),
-) anyerror!void {
-    var page = try page_store.get(page_hash);
-    defer page.deinit(alloc);
-
-    switch (page) {
-        .leaf => |entries| {
-            for (entries.items) |entry| {
-                try out.append(alloc, .{
-                    .key = entry.key,
-                    .path = try alloc.dupe(u8, entry.path),
-                    .blob_hash = entry.blob_hash,
-                    .size = entry.size,
-                    .mode = entry.mode,
-                    .mtime = entry.mtime,
-                });
-            }
-        },
-        .internal => |children| {
-            for (children.items) |child| {
-                try collectSubtreeEntries(alloc, page_store, child.page_hash, out);
-            }
-        },
-    }
-}
-
-fn diffLeafEntries(
-    alloc: std.mem.Allocator,
-    store: *const object_mod.Store,
-    old_entries: []const index_mod.LeafEntry,
-    new_entries: []const index_mod.LeafEntry,
-    algo: Algorithm,
-    out: *std.ArrayList(FileDiff),
-    blobs: *std.ArrayList([]u8),
-) !void {
-    var old_i: usize = 0;
-    var new_i: usize = 0;
-    while (old_i < old_entries.len or new_i < new_entries.len) {
-        const cmp: std.math.Order = blk: {
-            if (old_i >= old_entries.len) break :blk .gt;
-            if (new_i >= new_entries.len) break :blk .lt;
-            break :blk compareLeafEntry(old_entries[old_i], new_entries[new_i]);
-        };
-
-        if (cmp == .eq) {
-            if (!std.mem.eql(u8, &old_entries[old_i].blob_hash, &new_entries[new_i].blob_hash)) {
-                try appendFileDiffFromHashes(
-                    alloc,
-                    store,
-                    new_entries[new_i].path,
-                    old_entries[old_i].blob_hash,
-                    new_entries[new_i].blob_hash,
-                    algo,
-                    out,
-                    blobs,
-                );
-            }
-            old_i += 1;
-            new_i += 1;
-        } else if (cmp == .lt) {
-            try appendFileDiffFromHashes(alloc, store, old_entries[old_i].path, old_entries[old_i].blob_hash, null, algo, out, blobs);
-            old_i += 1;
-        } else {
-            try appendFileDiffFromHashes(alloc, store, new_entries[new_i].path, null, new_entries[new_i].blob_hash, algo, out, blobs);
-            new_i += 1;
+    fn displayLineNum(self: Hunk) u32 {
+        for (self.deltas[self.start..self.end]) |d| {
+            if (d.op != .ins) return d.old_lineno;
         }
+        return self.deltas[self.start].new_lineno;
     }
+};
+
+const HunkIterator = struct {
+    deltas: []const LineDelta,
+    context: u32,
+    i: usize,
+
+    fn init(deltas: []const LineDelta, context: u32) HunkIterator {
+        return .{ .deltas = deltas, .context = context, .i = 0 };
+    }
+
+    fn next(self: *HunkIterator) ?Hunk {
+        while (self.i < self.deltas.len and self.deltas[self.i].op == .eq) self.i += 1;
+        if (self.i >= self.deltas.len) return null;
+
+        const start = if (self.i >= self.context) self.i - self.context else 0;
+        var hunk_end: usize = self.i;
+
+        while (hunk_end < self.deltas.len) {
+            if (self.deltas[hunk_end].op != .eq) {
+                hunk_end = @min(hunk_end + @as(usize, @intCast(self.context)) + 1, self.deltas.len);
+            } else {
+                var lookahead = hunk_end;
+                var eq_run: u32 = 0;
+                while (lookahead < self.deltas.len and self.deltas[lookahead].op == .eq) {
+                    lookahead += 1;
+                    eq_run += 1;
+                }
+                if (eq_run > self.context * 2 or lookahead >= self.deltas.len) {
+                    hunk_end = @min(hunk_end + @as(usize, @intCast(self.context)), self.deltas.len);
+                    break;
+                }
+                hunk_end = lookahead;
+            }
+        }
+
+        const result = Hunk{ .start = start, .end = hunk_end, .deltas = self.deltas };
+        self.i = hunk_end;
+        return result;
+    }
+};
+
+pub const DirGroup = struct {
+    dir: []const u8,
+    files: []*const FileDiff,
+};
+
+pub fn groupByDirectory(alloc: std.mem.Allocator, files: []*const FileDiff) ![]DirGroup {
+    var map = std.StringHashMap(std.ArrayList(*const FileDiff)).init(alloc);
+    defer {
+        var it = map.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(alloc);
+        map.deinit();
+    }
+
+    for (files) |fd| {
+        const dir = std.fs.path.dirname(fd.path) orelse ".";
+        const gop = try map.getOrPut(dir);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(alloc, fd);
+    }
+
+    var groups: std.ArrayList(DirGroup) = .empty;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        try groups.append(alloc, .{
+            .dir = entry.key_ptr.*,
+            .files = try entry.value_ptr.toOwnedSlice(alloc),
+        });
+    }
+    return groups.toOwnedSlice(alloc);
 }
 
-fn appendFileDiffFromHashes(
-    alloc: std.mem.Allocator,
-    store: *const object_mod.Store,
-    path: []const u8,
-    old_hash: ?hash_mod.Hash,
-    new_hash: ?hash_mod.Hash,
-    algo: Algorithm,
-    out: *std.ArrayList(FileDiff),
-    blobs: *std.ArrayList([]u8),
-) !void {
-    const old_src = if (old_hash) |hash| blk: {
-        const obj = try store.get(hash);
-        try blobs.append(alloc, obj.payload);
-        break :blk obj.payload;
-    } else "";
+pub const DiffSummary = struct {
+    files_changed: u32,
+    lines_added: u32,
+    lines_removed: u32,
+    words_added: u32,
+    words_removed: u32,
+};
 
-    const new_src = if (new_hash) |hash| blk: {
-        const obj = try store.get(hash);
-        try blobs.append(alloc, obj.payload);
-        break :blk obj.payload;
-    } else "";
-
-    if (std.mem.eql(u8, old_src, new_src)) return;
-    try out.append(alloc, try diffFileWith(alloc, path, old_src, new_src, algo));
+pub fn summarize(cd: *const CommitDiff) DiffSummary {
+    var s = DiffSummary{
+        .files_changed = @intCast(cd.files.len),
+        .lines_added = 0,
+        .lines_removed = 0,
+        .words_added = 0,
+        .words_removed = 0,
+    };
+    for (cd.files) |f| {
+        s.lines_added += f.lines_added;
+        s.lines_removed += f.lines_removed;
+        s.words_added += f.words_added;
+        s.words_removed += f.words_removed;
+    }
+    return s;
 }
 
-fn freeLeafEntries(alloc: std.mem.Allocator, entries: *std.ArrayList(index_mod.LeafEntry)) void {
-    for (entries.items) |*entry| alloc.free(entry.path);
-    entries.deinit(alloc);
-}
-
-fn leafEntryLessThan(_: void, lhs: index_mod.LeafEntry, rhs: index_mod.LeafEntry) bool {
-    return compareLeafEntry(lhs, rhs) == .lt;
-}
-
-fn compareLeafEntry(lhs: index_mod.LeafEntry, rhs: index_mod.LeafEntry) std.math.Order {
-    const key_order = comparePathKey(lhs.key, rhs.key);
-    if (key_order != .eq) return key_order;
-    return std.mem.order(u8, lhs.path, rhs.path);
-}
-
-fn comparePathKey(lhs: index_mod.PathKey, rhs: index_mod.PathKey) std.math.Order {
-    if (lhs < rhs) return .lt;
-    if (lhs > rhs) return .gt;
-    return .eq;
+pub fn fileStatus(fd: *const FileDiff) FileStatus {
+    var has_ins = false;
+    var has_del = false;
+    for (fd.line_deltas) |d| switch (d.op) {
+        .ins => has_ins = true,
+        .del => has_del = true,
+        .eq => {},
+    };
+    if (has_ins and has_del) return .modified;
+    if (has_ins) return .added;
+    if (has_del) return .deleted;
+    return .unchanged;
 }
 
 fn runLineDiff(
@@ -1415,307 +1260,6 @@ fn diffWords(alloc: std.mem.Allocator, line_deltas: []const LineDelta) ![]WordDe
     return out.toOwnedSlice(alloc);
 }
 
-pub fn renderCommit(writer: anytype, cd: *const CommitDiff, config: RenderConfig, alloc: std.mem.Allocator) !void {
-    var filtered: std.ArrayList(*const FileDiff) = .empty;
-    defer filtered.deinit(alloc);
-
-    for (cd.files) |*fd| {
-        const status = fileStatus(fd);
-        if (!config.filter.allows(status)) continue;
-        try filtered.append(alloc, fd);
-    }
-
-    if (config.group_by == .dirs) {
-        const groups = try groupByDirectory(alloc, filtered.items);
-        defer {
-            for (groups) |g| alloc.free(g.files);
-            alloc.free(groups);
-        }
-        for (groups) |g| {
-            try writer.print("{s}/\n", .{g.dir});
-            for (g.files) |fd| {
-                try writer.print("  {s}\n", .{std.fs.path.basename(fd.path)});
-            }
-            try writer.writeByte('\n');
-        }
-        return;
-    }
-
-    for (filtered.items) |fd| {
-        try renderFileDiff(writer, fd, config);
-    }
-}
-
-pub fn renderFileDiff(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
-    if (config.level == .file) {
-        const status = fileStatus(fd);
-        const sc = switch (status) {
-            .added => "A",
-            .deleted => "D",
-            .modified => "M",
-            .unchanged => "~",
-        };
-        try writer.print("{s} {s} (+{d} -{d})\n", .{ sc, fd.path, fd.lines_added, fd.lines_removed });
-        return;
-    }
-
-    if (config.level == .word) {
-        try renderWordHighlight(writer, fd);
-        return;
-    }
-
-    switch (config.format) {
-        .unified => try renderUnified(writer, fd, config),
-        .side_by_side => try renderSideBySide(writer, fd, config),
-        .blocks => try renderBlockOriented(writer, fd, config),
-        .ops => try renderOperations(writer, fd, config),
-        .summary => try renderSummary(writer, fd),
-    }
-}
-
-pub fn renderUnified(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
-    try writer.print("FILE  {s}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{fd.path});
-    if (fd.line_deltas.len == 0) return;
-
-    var it = HunkIterator.init(fd.line_deltas, config.contextLines());
-    while (it.next()) |hunk| {
-        const line_num = hunk.displayLineNum();
-        try writer.print("~ Line {d}\n", .{line_num});
-        for (fd.line_deltas[hunk.start..hunk.end]) |d| {
-            const prefix: []const u8 = switch (d.op) {
-                .eq => "  ",
-                .del => "- ",
-                .ins => "+ ",
-            };
-            try writer.print("{s}{s}\n", .{ prefix, d.content });
-        }
-        try writer.writeByte('\n');
-    }
-}
-
-fn renderSideBySide(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
-    const col_width = maxLineWidth(fd.line_deltas, @as(usize, @intCast(config.max_width)));
-    const sep = " │ ";
-
-    try writer.print("FILE  {s}\n", .{fd.path});
-    try writer.writeAll("│ Before");
-    padTo(writer, col_width, 6);
-    try writer.writeAll(sep);
-    try writer.writeAll("After");
-    padTo(writer, col_width, 5);
-    try writer.writeByte('\n');
-
-    const total_width = 1 + col_width + sep.len + col_width + 1;
-    for (0..total_width) |_| try writer.writeAll("─");
-    try writer.writeByte('\n');
-
-    for (fd.line_deltas) |d| {
-        const left = if (d.op == .ins) "" else d.content;
-        const right = if (d.op == .del) "" else d.content;
-        try writer.writeAll("│");
-        try writePadded(writer, left, col_width);
-        try writer.writeAll(sep);
-        try writePadded(writer, right, col_width);
-        try writer.writeByte('\n');
-    }
-    try writer.writeByte('\n');
-}
-
-fn renderBlockOriented(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
-    try writer.print("FILE: {s}\n", .{fd.path});
-    if (fd.line_deltas.len == 0) return;
-
-    var it = HunkIterator.init(fd.line_deltas, config.contextLines());
-    var change_number: usize = 1;
-    while (it.next()) |hunk| {
-        try writer.print("CHANGE #{d}\n", .{change_number});
-        try writeSectionDivider(writer, 32);
-        try writer.writeAll("BEFORE\n");
-        for (fd.line_deltas[hunk.start..hunk.end]) |d| if (d.op != .ins) try writer.print("{s}\n", .{d.content});
-        try writer.writeAll("AFTER\n");
-        for (fd.line_deltas[hunk.start..hunk.end]) |d| if (d.op != .del) try writer.print("{s}\n", .{d.content});
-        try writer.writeByte('\n');
-        change_number += 1;
-    }
-}
-
-fn renderOperations(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
-    try writer.print("FILE  {s}\n", .{fd.path});
-    try writer.print("STATUS: {s}\n\n", .{statusString(fileStatus(fd))});
-    if (fd.line_deltas.len == 0) return;
-
-    var it = HunkIterator.init(fd.line_deltas, config.contextLines());
-    while (it.next()) |hunk| {
-        const line_num = hunk.displayLineNum();
-        try writer.print("FROM line {d}\n", .{line_num});
-        for (fd.line_deltas[hunk.start..hunk.end]) |d| if (d.op != .ins) try writer.print("  {s}\n", .{d.content});
-        try writer.print("\nTO line {d}\n", .{line_num});
-        for (fd.line_deltas[hunk.start..hunk.end]) |d| if (d.op != .del) try writer.print("  {s}\n", .{d.content});
-        try writer.writeByte('\n');
-    }
-}
-
-fn renderSummary(writer: anytype, fd: *const FileDiff) !void {
-    const status = fileStatus(fd);
-    const sc = switch (status) {
-        .added => "A",
-        .deleted => "D",
-        .modified => "M",
-        .unchanged => "~",
-    };
-    try writer.print("{s} {s} (+{d} -{d})\n", .{ sc, fd.path, fd.lines_added, fd.lines_removed });
-}
-
-fn renderWordHighlight(writer: anytype, fd: *const FileDiff) !void {
-    try writer.print("WORD HIGHLIGHT: {s}\n", .{fd.path});
-    try renderWordDeltas(writer, fd.word_deltas);
-}
-
-pub fn renderWordDiff(writer: anytype, fd: *const FileDiff) !void {
-    try writer.print("WORD HIGHLIGHT: {s}\n", .{fd.path});
-    try renderWordDeltas(writer, fd.word_deltas);
-}
-
-fn renderWordDeltas(writer: anytype, word_deltas: []const WordDelta) !void {
-    var current_line: u32 = 0;
-    for (word_deltas) |d| {
-        if (d.lineno != current_line) {
-            if (current_line != 0) try writer.writeByte('\n');
-            try writer.print("Line {d}: ", .{d.lineno});
-            current_line = d.lineno;
-        }
-        switch (d.op) {
-            .eq => try writer.print("{s}", .{d.word}),
-            .ins => try writer.print("[+{s}+]", .{d.word}),
-            .del => try writer.print("[-{s}-]", .{d.word}),
-        }
-    }
-    if (current_line != 0) try writer.writeByte('\n');
-}
-
-const Hunk = struct {
-    start: usize,
-    end: usize,
-    deltas: []const LineDelta,
-
-    fn displayLineNum(self: Hunk) u32 {
-        for (self.deltas[self.start..self.end]) |d| {
-            if (d.op != .ins) return d.old_lineno;
-        }
-        return self.deltas[self.start].new_lineno;
-    }
-};
-
-const HunkIterator = struct {
-    deltas: []const LineDelta,
-    context: u32,
-    i: usize,
-
-    fn init(deltas: []const LineDelta, context: u32) HunkIterator {
-        return .{ .deltas = deltas, .context = context, .i = 0 };
-    }
-
-    fn next(self: *HunkIterator) ?Hunk {
-        while (self.i < self.deltas.len and self.deltas[self.i].op == .eq) self.i += 1;
-        if (self.i >= self.deltas.len) return null;
-
-        const start = if (self.i >= self.context) self.i - self.context else 0;
-        var hunk_end: usize = self.i;
-
-        while (hunk_end < self.deltas.len) {
-            if (self.deltas[hunk_end].op != .eq) {
-                hunk_end = @min(hunk_end + @as(usize, @intCast(self.context)) + 1, self.deltas.len);
-            } else {
-                var lookahead = hunk_end;
-                var eq_run: u32 = 0;
-                while (lookahead < self.deltas.len and self.deltas[lookahead].op == .eq) {
-                    lookahead += 1;
-                    eq_run += 1;
-                }
-                if (eq_run > self.context * 2 or lookahead >= self.deltas.len) {
-                    hunk_end = @min(hunk_end + @as(usize, @intCast(self.context)), self.deltas.len);
-                    break;
-                }
-                hunk_end = lookahead;
-            }
-        }
-
-        const result = Hunk{ .start = start, .end = hunk_end, .deltas = self.deltas };
-        self.i = hunk_end;
-        return result;
-    }
-};
-
-pub const DirGroup = struct {
-    dir: []const u8,
-    files: []*const FileDiff,
-};
-
-pub fn groupByDirectory(alloc: std.mem.Allocator, files: []*const FileDiff) ![]DirGroup {
-    var map = std.StringHashMap(std.ArrayList(*const FileDiff)).init(alloc);
-    defer {
-        var it = map.iterator();
-        while (it.next()) |entry| entry.value_ptr.deinit(alloc);
-        map.deinit();
-    }
-
-    for (files) |fd| {
-        const dir = std.fs.path.dirname(fd.path) orelse ".";
-        const gop = try map.getOrPut(dir);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        try gop.value_ptr.append(alloc, fd);
-    }
-
-    var groups: std.ArrayList(DirGroup) = .empty;
-    var it = map.iterator();
-    while (it.next()) |entry| {
-        try groups.append(alloc, .{
-            .dir = entry.key_ptr.*,
-            .files = try entry.value_ptr.toOwnedSlice(alloc),
-        });
-    }
-    return groups.toOwnedSlice(alloc);
-}
-
-pub const DiffSummary = struct {
-    files_changed: u32,
-    lines_added: u32,
-    lines_removed: u32,
-    words_added: u32,
-    words_removed: u32,
-};
-
-pub fn summarize(cd: *const CommitDiff) DiffSummary {
-    var s = DiffSummary{
-        .files_changed = @intCast(cd.files.len),
-        .lines_added = 0,
-        .lines_removed = 0,
-        .words_added = 0,
-        .words_removed = 0,
-    };
-    for (cd.files) |f| {
-        s.lines_added += f.lines_added;
-        s.lines_removed += f.lines_removed;
-        s.words_added += f.words_added;
-        s.words_removed += f.words_removed;
-    }
-    return s;
-}
-
-pub fn fileStatus(fd: *const FileDiff) FileStatus {
-    var has_ins = false;
-    var has_del = false;
-    for (fd.line_deltas) |d| switch (d.op) {
-        .ins => has_ins = true,
-        .del => has_del = true,
-        .eq => {},
-    };
-    if (has_ins and has_del) return .modified;
-    if (has_ins) return .added;
-    if (has_del) return .deleted;
-    return .unchanged;
-}
-
 fn splitLines(alloc: std.mem.Allocator, src: []const u8) ![][]const u8 {
     var lines: std.ArrayList([]const u8) = .empty;
     errdefer lines.deinit(alloc);
@@ -1799,47 +1343,6 @@ fn padTo(writer: anytype, width: usize, already_written: usize) void {
 fn writeSectionDivider(writer: anytype, width: usize) !void {
     for (0..width) |_| try writer.writeAll("━");
     try writer.writeByte('\n');
-}
-
-fn serializeLineDiffs(alloc: std.mem.Allocator, files: []const FileDiff) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    const w = buf.writer(alloc);
-
-    try w.writeInt(u32, @intCast(files.len), .little);
-    for (files) |f| {
-        try w.writeInt(u16, @intCast(f.path.len), .little);
-        try w.writeAll(f.path);
-        try w.writeInt(u32, @intCast(f.line_deltas.len), .little);
-        for (f.line_deltas) |d| {
-            try w.writeByte(@intFromEnum(d.op));
-            try w.writeInt(u32, d.old_lineno, .little);
-            try w.writeInt(u32, d.new_lineno, .little);
-            try w.writeInt(u16, @intCast(d.content.len), .little);
-            try w.writeAll(d.content);
-        }
-    }
-    return buf.toOwnedSlice(alloc);
-}
-
-fn serializeWordDiffs(alloc: std.mem.Allocator, files: []const FileDiff) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    const w = buf.writer(alloc);
-
-    try w.writeInt(u32, @intCast(files.len), .little);
-    for (files) |f| {
-        try w.writeInt(u16, @intCast(f.path.len), .little);
-        try w.writeAll(f.path);
-        try w.writeInt(u32, @intCast(f.word_deltas.len), .little);
-        for (f.word_deltas) |d| {
-            try w.writeByte(@intFromEnum(d.op));
-            try w.writeInt(u32, d.lineno, .little);
-            try w.writeInt(u16, @intCast(d.word.len), .little);
-            try w.writeAll(d.word);
-        }
-    }
-    return buf.toOwnedSlice(alloc);
 }
 
 test "splitLines basic" {
@@ -2009,93 +1512,6 @@ test "summarize aggregates across files" {
     try std.testing.expectEqual(@as(u32, 1), s.lines_removed);
 }
 
-test "diffIndexRoots reports modified files from Merkle pages" {
-    const alloc = std.testing.allocator;
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-
-    var objects_dir = try tmp_dir.dir.makeOpenPath(".nodus/objects", .{});
-    defer objects_dir.close();
-    var store = object_mod.Store{ .dir = objects_dir, .alloc = alloc };
-
-    const old_blob = try store.put(.blob, "old\n");
-    const new_blob = try store.put(.blob, "new\n");
-
-    const nodus_dir = try tmp_dir.dir.openDir(".nodus", .{});
-    var index = index_mod.Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
-    defer index.deinit();
-
-    try index.entries.append(alloc, .{
-        .path = try alloc.dupe(u8, "src/main.zig"),
-        .blob_hash = old_blob,
-        .size = 4,
-        .mode = 0o100644,
-        .mtime = 1,
-    });
-    try index.save();
-    const old_root = index.index_root;
-
-    index.entries.items[0].blob_hash = new_blob;
-    index.entries.items[0].mtime = 2;
-    try index.save();
-    const new_root = index.index_root;
-
-    var page_store = index_mod.PageStore{ .alloc = alloc, .dir = index.dir };
-    var cd = try diffIndexRoots(alloc, &store, &page_store, old_root, new_root, .histogram);
-    defer cd.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), cd.files.len);
-    try std.testing.expectEqualStrings("src/main.zig", cd.files[0].path);
-    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_added);
-    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_removed);
-}
-
-test "diffSnapshotRoots compares legacy tree root to Merkle index root" {
-    const alloc = std.testing.allocator;
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-
-    var objects_dir = try tmp_dir.dir.makeOpenPath(".nodus/objects", .{});
-    defer objects_dir.close();
-    var store = object_mod.Store{ .dir = objects_dir, .alloc = alloc };
-
-    const old_blob = try store.put(.blob, "old\n");
-    const new_blob = try store.put(.blob, "new\n");
-
-    const old_entries = [_]index_mod.Entry{
-        .{
-            .path = @constCast("src/main.zig"),
-            .blob_hash = old_blob,
-            .size = 4,
-            .mode = 0o100644,
-            .mtime = 1,
-        },
-    };
-    const legacy_tree_root = try tree_mod.writeFromIndex(alloc, &store, &old_entries);
-
-    const nodus_dir = try tmp_dir.dir.openDir(".nodus", .{});
-    var index = index_mod.Index{ .alloc = alloc, .dir = nodus_dir, .entries = .empty };
-    defer index.deinit();
-
-    try index.entries.append(alloc, .{
-        .path = try alloc.dupe(u8, "src/main.zig"),
-        .blob_hash = new_blob,
-        .size = 4,
-        .mode = 0o100644,
-        .mtime = 2,
-    });
-    try index.save();
-
-    var page_store = index_mod.PageStore{ .alloc = alloc, .dir = index.dir };
-    var cd = try diffSnapshotRoots(alloc, &store, &page_store, legacy_tree_root, index.index_root, .histogram);
-    defer cd.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), cd.files.len);
-    try std.testing.expectEqualStrings("src/main.zig", cd.files[0].path);
-    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_added);
-    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_removed);
-}
-
 test "ChangeFilter parse comma list" {
     const f = try ChangeFilter.parse("added,modified");
     try std.testing.expect(f.show_added);
@@ -2117,4 +1533,198 @@ test "groupByDirectory groups files" {
         alloc.free(groups);
     }
     try std.testing.expectEqual(@as(usize, 2), groups.len);
+}
+
+// ---------------------------------------------------------------------------
+// Merkle-root/commit diffing tests
+// ---------------------------------------------------------------------------
+
+const io = merk.io;
+const object_test_mod = object_mod;
+
+const FileSeed = struct { path: []const u8, content: []const u8 };
+
+fn buildRoot(
+    alloc: std.mem.Allocator,
+    page_store: *const merkle_mod.PageStore,
+    store: *const object_mod.Store,
+    seeds: []const FileSeed,
+) !Hash {
+    var entries: std.ArrayList(merkle_mod.Entry) = .empty;
+    defer {
+        for (entries.items) |*e| e.deinit(alloc);
+        entries.deinit(alloc);
+    }
+    for (seeds) |seed| {
+        const blob_hash = try store.put(.blob, seed.content);
+        try entries.append(alloc, .{
+            .path = try alloc.dupe(u8, seed.path),
+            .blob_hash = blob_hash,
+            .size = seed.content.len,
+            .mode = 0o100644,
+            .mtime = 1,
+        });
+    }
+    return merkle_mod.build(alloc, page_store, entries.items);
+}
+
+fn findFileDiff(cd: *const CommitDiff, path: []const u8) ?*const FileDiff {
+    for (cd.files) |*fd| {
+        if (std.mem.eql(u8, fd.path, path)) return fd;
+    }
+    return null;
+}
+
+test "diffSnapshotRoots reports modified, added, and removed files via merkle pruning" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
+    const page_store = merkle_mod.PageStore.init(alloc, tfs.fs(), "index/pages");
+
+    const old_root = try buildRoot(alloc, &page_store, &store, &.{
+        .{ .path = "a.txt", .content = "hello\nworld\n" },
+        .{ .path = "b.txt", .content = "keep me\n" },
+        .{ .path = "gone.txt", .content = "bye\n" },
+    });
+    const new_root = try buildRoot(alloc, &page_store, &store, &.{
+        .{ .path = "a.txt", .content = "hello\nearth\n" },
+        .{ .path = "b.txt", .content = "keep me\n" },
+        .{ .path = "new.txt", .content = "fresh\n" },
+    });
+
+    var cd = try diffSnapshotRoots(alloc, &store, &page_store, old_root, new_root, .histogram);
+    defer cd.deinit(alloc);
+
+    // b.txt is unchanged and never shows up at all — diffRoots pruned it
+    // without either side even being read.
+    try std.testing.expectEqual(@as(usize, 3), cd.files.len);
+
+    const a = findFileDiff(&cd, "a.txt") orelse return error.MissingFile;
+    try std.testing.expectEqual(@as(u32, 1), a.lines_added);
+    try std.testing.expectEqual(@as(u32, 1), a.lines_removed);
+
+    const gone = findFileDiff(&cd, "gone.txt") orelse return error.MissingFile;
+    try std.testing.expectEqual(@as(u32, 0), gone.lines_added);
+    try std.testing.expectEqual(@as(u32, 1), gone.lines_removed);
+
+    const new_file = findFileDiff(&cd, "new.txt") orelse return error.MissingFile;
+    try std.testing.expectEqual(@as(u32, 1), new_file.lines_added);
+    try std.testing.expectEqual(@as(u32, 0), new_file.lines_removed);
+}
+
+test "diffSnapshotRoots against a null old_root reports every entry as added" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
+    const page_store = merkle_mod.PageStore.init(alloc, tfs.fs(), "index/pages");
+
+    const new_root = try buildRoot(alloc, &page_store, &store, &.{
+        .{ .path = "a.txt", .content = "one\n" },
+        .{ .path = "b.txt", .content = "two\n" },
+    });
+
+    var cd = try diffSnapshotRoots(alloc, &store, &page_store, null, new_root, .histogram);
+    defer cd.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), cd.files.len);
+    for (cd.files) |fd| {
+        try std.testing.expectEqual(@as(u32, 1), fd.lines_added);
+        try std.testing.expectEqual(@as(u32, 0), fd.lines_removed);
+    }
+}
+
+test "diffCommits resolves commit hashes to snapshot roots before diffing" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
+    const page_store = merkle_mod.PageStore.init(alloc, tfs.fs(), "index/pages");
+
+    const root1 = try buildRoot(alloc, &page_store, &store, &.{.{ .path = "a.txt", .content = "v1\n" }});
+    var b1 = commit_mod.CommitBuilder.init(alloc, root1);
+    defer b1.deinit();
+    _ = b1.author("Dev", "dev@nodus.dev", 1);
+    _ = b1.intent(.feature);
+    _ = b1.title("first");
+    const c1 = try b1.write(&store);
+
+    const root2 = try buildRoot(alloc, &page_store, &store, &.{.{ .path = "a.txt", .content = "v2\n" }});
+    var b2 = commit_mod.CommitBuilder.init(alloc, root2);
+    defer b2.deinit();
+    _ = try b2.parent(c1);
+    _ = b2.author("Dev", "dev@nodus.dev", 2);
+    _ = b2.intent(.feature);
+    _ = b2.title("second");
+    const c2 = try b2.write(&store);
+
+    var cd = try diffCommits(alloc, &store, &page_store, c1, c2, .histogram);
+    defer cd.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), cd.files.len);
+    try std.testing.expectEqualStrings("a.txt", cd.files[0].path);
+    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_added);
+    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_removed);
+}
+
+test "diffCommitAgainstParent treats a root commit as a diff against the empty tree" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
+    const page_store = merkle_mod.PageStore.init(alloc, tfs.fs(), "index/pages");
+
+    const root1 = try buildRoot(alloc, &page_store, &store, &.{.{ .path = "a.txt", .content = "hello\n" }});
+    var b1 = commit_mod.CommitBuilder.init(alloc, root1);
+    defer b1.deinit();
+    _ = b1.author("Dev", "dev@nodus.dev", 1);
+    _ = b1.intent(.feature);
+    _ = b1.title("root");
+    const c1 = try b1.write(&store);
+
+    var cd = try diffCommitAgainstParent(alloc, &store, &page_store, c1, .histogram);
+    defer cd.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), cd.files.len);
+    try std.testing.expectEqualStrings("a.txt", cd.files[0].path);
+    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_added);
+    try std.testing.expectEqual(@as(u32, 0), cd.files[0].lines_removed);
+}
+
+test "diffCommitAgainstParent uses the first (mainline) parent's snapshot" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
+    const page_store = merkle_mod.PageStore.init(alloc, tfs.fs(), "index/pages");
+
+    const root1 = try buildRoot(alloc, &page_store, &store, &.{.{ .path = "a.txt", .content = "v1\n" }});
+    var b1 = commit_mod.CommitBuilder.init(alloc, root1);
+    defer b1.deinit();
+    _ = b1.author("Dev", "dev@nodus.dev", 1);
+    _ = b1.intent(.feature);
+    _ = b1.title("first");
+    const c1 = try b1.write(&store);
+
+    const root2 = try buildRoot(alloc, &page_store, &store, &.{.{ .path = "a.txt", .content = "v2\n" }});
+    var b2 = commit_mod.CommitBuilder.init(alloc, root2);
+    defer b2.deinit();
+    _ = try b2.parent(c1);
+    _ = b2.author("Dev", "dev@nodus.dev", 2);
+    _ = b2.intent(.feature);
+    _ = b2.title("second");
+    const c2 = try b2.write(&store);
+
+    var cd = try diffCommitAgainstParent(alloc, &store, &page_store, c2, .histogram);
+    defer cd.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), cd.files.len);
+    try std.testing.expectEqualStrings("a.txt", cd.files[0].path);
+    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_added);
+    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_removed);
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }
