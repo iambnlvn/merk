@@ -1459,6 +1459,81 @@ test "histogram handles repeated lines gracefully" {
     try std.testing.expectEqual(@as(u32, 0), fd.lines_removed);
 }
 
+test "histogram stays fast and correct on files dominated by repeated lines" {
+    const alloc = std.testing.allocator;
+
+    // Pathological input for the old O(N*M) scan: thousands of identical
+    // "}" and blank lines, which used to force a full old-range walk for
+    // every single new-range line. With position lists this should stay
+    // close to O(N+M) and still find the one real change.
+    var old_buf: std.ArrayList(u8) = .empty;
+    defer old_buf.deinit(alloc);
+    var new_buf: std.ArrayList(u8) = .empty;
+    defer new_buf.deinit(alloc);
+
+    const repeat_count = 8000;
+    for (0..repeat_count) |i| {
+        if (i % 2 == 0) {
+            try old_buf.appendSlice(alloc, "}\n");
+            try new_buf.appendSlice(alloc, "}\n");
+        } else {
+            try old_buf.appendSlice(alloc, "\n");
+            try new_buf.appendSlice(alloc, "\n");
+        }
+    }
+    // One unique, unambiguous change in the middle of all that noise.
+    try old_buf.appendSlice(alloc, "pub fn untouched() void {}\n");
+    try new_buf.appendSlice(alloc, "pub fn untouched() void {}\n");
+    try old_buf.appendSlice(alloc, "const old_value = 1;\n");
+    try new_buf.appendSlice(alloc, "const new_value = 2;\n");
+    for (0..repeat_count) |i| {
+        if (i % 2 == 0) {
+            try old_buf.appendSlice(alloc, "}\n");
+            try new_buf.appendSlice(alloc, "}\n");
+        } else {
+            try old_buf.appendSlice(alloc, "\n");
+            try new_buf.appendSlice(alloc, "\n");
+        }
+    }
+
+    var fd = try diffFileWith(alloc, "noisy.zig", old_buf.items, new_buf.items, .histogram);
+    defer fd.deinit(alloc);
+
+    // The only real change is the one line swap; everything else should
+    // have been matched away as context despite the massive repeat noise.
+    try std.testing.expectEqual(@as(u32, 1), fd.lines_added);
+    try std.testing.expectEqual(@as(u32, 1), fd.lines_removed);
+}
+
+test "histogram chain cap still falls back correctly when a line is maximally common" {
+    const alloc = std.testing.allocator;
+
+    // More occurrences of "}" than HISTOGRAM_MAX_CHAIN, with no other
+    // repeated lines to anchor on — exercises the overflow/skip path
+    // rather than the position-list path.
+    var old_buf: std.ArrayList(u8) = .empty;
+    defer old_buf.deinit(alloc);
+    var new_buf: std.ArrayList(u8) = .empty;
+    defer new_buf.deinit(alloc);
+
+    for (0..100) |_| {
+        try old_buf.appendSlice(alloc, "}\n");
+        try new_buf.appendSlice(alloc, "}\n");
+    }
+    try old_buf.appendSlice(alloc, "removed_only_line\n");
+    try new_buf.appendSlice(alloc, "added_only_line\n");
+    for (0..100) |_| {
+        try old_buf.appendSlice(alloc, "}\n");
+        try new_buf.appendSlice(alloc, "}\n");
+    }
+
+    var fd = try diffFileWith(alloc, "cap.zig", old_buf.items, new_buf.items, .histogram);
+    defer fd.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), fd.lines_added);
+    try std.testing.expectEqual(@as(u32, 1), fd.lines_removed);
+}
+
 test "all algos agree on net line delta" {
     const alloc = std.testing.allocator;
     const old =
