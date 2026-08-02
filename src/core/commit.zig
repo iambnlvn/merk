@@ -32,6 +32,12 @@ pub const snapshot = @import("./commit/snapshot.zig");
 pub const parent = @import("./commit/parent.zig");
 const ParentInfo = parent.ParentInfo;
 
+// Logical (change_id-keyed) dependency edges for stacked changes —
+// see `commit/dependency.zig`'s doc comment for why this is a distinct
+// concept from `parent`/`ParentInfo`'s physical (hash-keyed) ancestry.
+pub const dependency = @import("./commit/dependency.zig");
+const DependencyInfo = dependency.DependencyInfo;
+
 // `commit/signature.zig` is the *cryptographic* signature sidecar
 // (algorithm + bytes + key_id) attached to a commit hash after the fact
 // — a completely different concept from identity.zig's `SignatureInfo`/
@@ -48,6 +54,8 @@ pub const COMMIT_VERSION: u8 = 1;
 pub const ParentKind = parent.ParentKind;
 
 pub const MAX_PARENTS: u8 = parent.MAX_PARENTS;
+
+pub const MAX_DEPENDENCIES: u8 = dependency.MAX_DEPENDENCIES;
 
 pub const Intent = metadata.Intent;
 
@@ -70,6 +78,12 @@ const CommitInfo = struct {
     snapshot: Hash,
     parents: []const ParentInfo,
 
+    /// Logical "this change needs that change" edges for stacked
+    /// commits — keyed by `ChangeId`, not `Hash`. See
+    /// `commit/dependency.zig`'s doc comment for why these are kept
+    /// separate from `parents`.
+    dependencies: []const DependencyInfo = &.{},
+
     /// Author + committer. Callers who want the committer to mirror the
     /// author go through `CommitSignaturesInfo.soloAuthor`; callers with a
     /// genuinely distinct committer go through `.init` — see
@@ -81,6 +95,11 @@ const CommitInfo = struct {
 
     fn validate(self: @This()) !void {
         try parent.validate(self.parents);
+        try dependency.validate(self.dependencies);
+        for (self.dependencies) |d| {
+            if (std.mem.eql(u8, &d.change_id, &self.metadata.change_id))
+                return error.SelfDependency;
+        }
         try self.identity.validate();
         try self.metadata.validate();
         try self.message.validate();
@@ -93,6 +112,7 @@ pub const Commit = struct {
     hash: Hash,
     snapshot: Hash,
     parents: []ParentInfo,
+    dependencies: []DependencyInfo,
     identity: CommitSignatures,
     metadata: CommitMetadata,
     message: Message,
@@ -121,6 +141,18 @@ pub const Commit = struct {
         return std.mem.eql(u8, &self.metadata.change_id, &other.metadata.change_id);
     }
 
+    /// True when this commit declares a (logical) dependency on
+    /// `change_id`. Only checks this commit's own `dependencies` list —
+    /// resolving `change_id` to whatever commit it currently points at,
+    /// or walking a whole stack, is a `Repository`-level concern (see
+    /// `commit/dependency.zig`'s doc comment).
+    pub fn dependsOnChange(self: Commit, change_id: ChangeId) bool {
+        for (self.dependencies) |d| {
+            if (std.mem.eql(u8, &d.change_id, &change_id)) return true;
+        }
+        return false;
+    }
+
     /// Just the hashes, dropping `ParentKind` — for callers doing plain
     /// graph traversal (e.g. a log walker) that don't care why an edge
     /// exists, only that it does. Caller frees with `alloc.free`
@@ -132,6 +164,7 @@ pub const Commit = struct {
 
     pub fn deinit(self: *Commit, alloc: std.mem.Allocator) void {
         alloc.free(self.parents);
+        alloc.free(self.dependencies);
         self.identity.deinit(alloc);
         self.metadata.deinit(alloc);
         self.message.deinit(alloc);
@@ -160,6 +193,7 @@ fn writeCommit(
 
     try snapshot.serialize(info.snapshot, writer);
     try parent.serializeAll(info.parents, writer);
+    try dependency.serializeAll(info.dependencies, writer);
     try info.identity.serialize(writer);
     try info.metadata.serialize(writer);
     try info.message.serialize(writer);
@@ -194,6 +228,9 @@ pub fn read(
     const parents = try parent.deserializeAllAlloc(alloc, &reader);
     errdefer alloc.free(parents);
 
+    const dependencies = try dependency.deserializeAllAlloc(alloc, &reader);
+    errdefer alloc.free(dependencies);
+
     var commit_identity = try CommitSignatures.deserialize(alloc, &reader);
     errdefer commit_identity.deinit(alloc);
 
@@ -207,6 +244,7 @@ pub fn read(
         .hash = commit_hash,
         .snapshot = snapshot_root,
         .parents = parents,
+        .dependencies = dependencies,
         .identity = commit_identity,
         .metadata = deserialized_metadata,
         .message = deserialized_message,
@@ -321,6 +359,10 @@ pub const CommitRequest = struct {
     labels: []const []const u8 = &.{},
     trailers: []const TrailerInfo = &.{},
 
+    /// `change_id`s of the commits this stacked change depends on. See
+    /// `CommitBuilder.dependsOn`'s doc comment.
+    dependencies: []const ChangeId = &.{},
+
     /// Carry forward the `change_id` of the commit being amended,
     /// rebased, or cherry-picked from. Leave `null` for a genuinely new
     /// logical change — `CommitBuilder.build` will generate a fresh one.
@@ -377,6 +419,11 @@ pub const CommitRequest = struct {
 ///   _ = try b.parentWithKind(base_hash, .normal);
 ///   _ = try b.parentWithKind(other_branch_hash, .merge);
 ///
+/// A caller building one commit in a stack of dependent changes records
+/// the logical (not physical) dependency by `change_id`:
+///
+///   _ = try b.dependsOn(base_change.metadata.change_id);
+///
 /// A caller amending or rebasing a commit carries its `change_id`
 /// forward so the rewritten commit is still recognized as the same
 /// logical change:
@@ -389,6 +436,7 @@ pub const CommitBuilder = struct {
     alloc: std.mem.Allocator,
     snapshot_root: Hash,
     parents: std.ArrayListUnmanaged(ParentInfo) = .{},
+    dependencies: std.ArrayListUnmanaged(DependencyInfo) = .{},
 
     author_info: ?SignatureInfo = null,
     committer_info: ?SignatureInfo = null,
@@ -431,6 +479,7 @@ pub const CommitBuilder = struct {
 
     pub fn deinit(self: *CommitBuilder) void {
         self.parents.deinit(self.alloc);
+        self.dependencies.deinit(self.alloc);
         self.labels.deinit(self.alloc);
         self.trailers.deinit(self.alloc);
         self.* = undefined;
@@ -459,6 +508,26 @@ pub const CommitBuilder = struct {
     /// — e.g. a single commit that transplants several branch tips
     pub fn parentsWithKind(self: *CommitBuilder, hashes: []const Hash, kind: ParentKind) !*CommitBuilder {
         for (hashes) |h| _ = try self.parentWithKind(h, kind);
+        return self;
+    }
+
+    /// Declare a logical dependency on `change_id` — this commit is
+    /// part of a stack that requires whatever commit currently
+    /// represents that logical change. Unlike `.parent()`, this does
+    /// *not* need that change's current `Hash`: `change_id` stays valid
+    /// across amends/rebases of the depended-upon commit. See
+    /// `commit/dependency.zig`'s doc comment for the full rationale,
+    /// and note that resolving `change_id` to a commit, and detecting
+    /// dependency cycles across a whole stack, both happen outside this
+    /// builder (it only sees one commit's own dependency list).
+    pub fn dependsOn(self: *CommitBuilder, change_id: ChangeId) !*CommitBuilder {
+        try self.dependencies.append(self.alloc, .{ .change_id = change_id });
+        return self;
+    }
+
+    /// Add several dependencies at once
+    pub fn dependsOnMany(self: *CommitBuilder, change_ids: []const ChangeId) !*CommitBuilder {
+        for (change_ids) |cid| _ = try self.dependsOn(cid);
         return self;
     }
 
@@ -576,8 +645,8 @@ pub const CommitBuilder = struct {
 
     /// Populate a builder from a `CommitRequest` in one call: author,
     /// optional committer, intent, title, body, encoding, change_id,
-    /// labels, trailers — every setter this file knows how to call,
-    /// called correctly and in the right order (including the
+    /// labels, trailers, dependencies — every setter this file knows how
+    /// to call, called correctly and in the right order (including the
     /// committer/label/trailer defaulting rules documented on the
     /// individual setters above).
     ///
@@ -609,6 +678,7 @@ pub const CommitBuilder = struct {
         if (request.change_id) |cid| _ = self.changeId(cid);
         if (request.labels.len > 0) _ = try self.labelsFrom(request.labels);
         for (request.trailers) |t| _ = try self.trailer(t.key, t.value);
+        if (request.dependencies.len > 0) _ = try self.dependsOnMany(request.dependencies);
         return self;
     }
 
@@ -627,6 +697,7 @@ pub const CommitBuilder = struct {
         return .{
             .snapshot = self.snapshot_root,
             .parents = self.parents.items,
+            .dependencies = self.dependencies.items,
             .identity = if (self.committer_info) |committer_info|
                 CommitSignaturesInfo.init(author_info, committer_info)
             else
@@ -1237,4 +1308,122 @@ test "commit is non-deterministic across calls when change_id is left to auto-ge
     const h1 = try make_commit(&store, alloc, snapshot_hash);
     const h2 = try make_commit(&store, alloc, snapshot_hash);
     try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
+}
+
+test "commit with dependencies round-trips via write/read" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    const base_change_id: ChangeId = [_]u8{0x01} ** 16;
+    const other_change_id: ChangeId = [_]u8{0x02} ** 16;
+
+    var b = CommitBuilder.init(alloc, snapshot_hash);
+    defer b.deinit();
+    _ = try b.dependsOnMany(&.{ base_change_id, other_change_id });
+    _ = b.author("Ada Lovelace", "ada@merk.dev", 1_000);
+    _ = b.intent(.feature);
+    _ = b.title("second commit in a stack");
+    const commit_hash = try b.write(&store);
+
+    var c = try read(alloc, &store, commit_hash);
+    defer c.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), c.dependencies.len);
+    try std.testing.expect(c.dependsOnChange(base_change_id));
+    try std.testing.expect(c.dependsOnChange(other_change_id));
+    try std.testing.expect(!c.dependsOnChange([_]u8{0xFF} ** 16));
+
+    try std.testing.expect(c.isRoot());
+}
+
+test "a commit with no dependencies round-trips an empty list, not null" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    var b = CommitBuilder.init(alloc, snapshot_hash);
+    defer b.deinit();
+    _ = b.author("Ada Lovelace", "ada@merk.dev", 1_000);
+    _ = b.intent(.feature);
+    _ = b.title("no dependencies");
+    const commit_hash = try b.write(&store);
+
+    var c = try read(alloc, &store, commit_hash);
+    defer c.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), c.dependencies.len);
+}
+
+test "CommitBuilder rejects a commit that depends on its own change_id" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    const self_change_id: ChangeId = [_]u8{0x09} ** 16;
+
+    var b = CommitBuilder.init(alloc, snapshot_hash);
+    defer b.deinit();
+    _ = b.changeId(self_change_id);
+    _ = try b.dependsOn(self_change_id);
+    _ = b.author("Ada Lovelace", "ada@merk.dev", 1_000);
+    _ = b.intent(.feature);
+    _ = b.title("oops");
+
+    try std.testing.expectError(error.SelfDependency, b.write(&store));
+}
+
+test "CommitBuilder rejects a duplicate dependency" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    const cid: ChangeId = [_]u8{0x0A} ** 16;
+
+    var b = CommitBuilder.init(alloc, snapshot_hash);
+    defer b.deinit();
+    _ = try b.dependsOn(cid);
+    _ = try b.dependsOn(cid);
+    _ = b.author("Ada Lovelace", "ada@merk.dev", 1_000);
+    _ = b.intent(.feature);
+    _ = b.title("oops");
+
+    try std.testing.expectError(error.DuplicateDependency, b.write(&store));
+}
+
+test "CommitRequest.dependencies is threaded through applyRequest" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    const dep_a: ChangeId = [_]u8{0x0B} ** 16;
+    const dep_b: ChangeId = [_]u8{0x0C} ** 16;
+
+    var b = try CommitBuilder.fromRequest(alloc, snapshot_hash, .{
+        .author_name = "Ada Lovelace",
+        .author_email = "ada@merk.dev",
+        .author_timestamp_ms = 1_000,
+        .intent = .feature,
+        .title = "stacked change",
+        .dependencies = &.{ dep_a, dep_b },
+    });
+    defer b.deinit();
+    const commit_hash = try b.write(&store);
+
+    var c = try read(alloc, &store, commit_hash);
+    defer c.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), c.dependencies.len);
+    try std.testing.expect(c.dependsOnChange(dep_a));
+    try std.testing.expect(c.dependsOnChange(dep_b));
 }
