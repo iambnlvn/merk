@@ -6,10 +6,7 @@ const metadata = @import("./metadata.zig");
 const ChangeId = metadata.ChangeId;
 
 /// Cap on how many logical dependencies a single commit can declare.
-/// Mirrors `parent.MAX_PARENTS` in spirit: not a load-bearing limit for
-/// realistic stacks, just a sanity bound so a corrupt or hostile object
-/// can't force an unbounded allocation on read
-pub const MAX_DEPENDENCIES: u8 = 32;
+pub const MAX_DEPENDENCIES: u8 = 255;
 
 /// A logical "this change needs that change" edge, for stacked commits.
 ///
@@ -61,17 +58,19 @@ pub fn validate(deps: []const DependencyInfo) DependencyError!void {
 pub fn serializeAll(deps: []const DependencyInfo, writer: anytype) !void {
     try validate(deps);
 
-    try writer.writeByte(@intCast(deps.len));
+    try wire.writeCount(u8, writer, deps.len);
     for (deps) |d| {
         try writer.writeAll(&d.change_id);
     }
 }
 
+/// Caller frees the result with `alloc.free`. No per-element frees are
+/// needed — `DependencyInfo` is a fixed-size value with no owned
+/// sub-allocations, unlike e.g. `Person` or a `[][]u8` label list.
 pub fn deserializeAllAlloc(alloc: std.mem.Allocator, reader: anytype) ![]DependencyInfo {
-    const count = try reader.takeByte();
-    if (count > MAX_DEPENDENCIES) return error.TooManyDependencies;
+    const len = try wire.readCount(u8, reader);
 
-    const deps = try alloc.alloc(DependencyInfo, count);
+    const deps = try alloc.alloc(DependencyInfo, len);
     errdefer alloc.free(deps);
 
     for (deps) |*d| {
@@ -84,28 +83,28 @@ pub fn deserializeAllAlloc(alloc: std.mem.Allocator, reader: anytype) ![]Depende
     return deps;
 }
 
-test "validate rejects more than MAX_DEPENDENCIES entries" {
+test "validate rejects more than MAX_DEPENDENCIES, accepts exactly MAX_DEPENDENCIES" {
     const alloc = std.testing.allocator;
-    const deps = try alloc.alloc(DependencyInfo, MAX_DEPENDENCIES + 1);
-    defer alloc.free(deps);
-    for (deps, 0..) |*d, i| d.* = .{ .change_id = [_]u8{@intCast(i % 256)} ** 16 };
 
-    try std.testing.expectError(error.TooManyDependencies, validate(deps));
+    // Same length check fires regardless of content, so a repeated
+    // change_id is fine here — unlike the "accepts exactly the cap"
+    // case below, which needs distinct ids or the duplicate check
+    // would fire first.
+    const too_many = try alloc.alloc(DependencyInfo, 256);
+    defer alloc.free(too_many);
+    @memset(too_many, DependencyInfo{ .change_id = [_]u8{0} ** 16 });
+    try std.testing.expectError(error.TooManyDependencies, validate(too_many));
+
+    const max = try alloc.alloc(DependencyInfo, MAX_DEPENDENCIES);
+    defer alloc.free(max);
+    for (max, 0..) |*d, i| d.* = DependencyInfo{ .change_id = [_]u8{@intCast(i % 256)} ** 16 };
+    try validate(max);
 }
 
 test "validate rejects a duplicate change_id" {
     const cid: ChangeId = [_]u8{0x11} ** 16;
     const deps = [_]DependencyInfo{ .init(cid), .init(cid) };
     try std.testing.expectError(error.DuplicateDependency, validate(&deps));
-}
-
-test "validate accepts distinct change_ids under the cap" {
-    const deps = [_]DependencyInfo{
-        .init([_]u8{0x01} ** 16),
-        .init([_]u8{0x02} ** 16),
-        .init([_]u8{0x03} ** 16),
-    };
-    try validate(&deps);
 }
 
 test "serializeAll/deserializeAllAlloc round-trip several dependencies" {
@@ -161,14 +160,6 @@ test "serializeAll rejects a duplicate before writing anything" {
     defer buf.deinit(alloc);
     try std.testing.expectError(error.DuplicateDependency, serializeAll(&deps, buf.writer(alloc)));
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);
-}
-
-test "deserializeAllAlloc rejects a corrupt over-cap count without allocating" {
-    const alloc = std.testing.allocator;
-    const bytes = [_]u8{MAX_DEPENDENCIES + 1};
-    var mock_reader = MockReader{ .buffer = &bytes };
-
-    try std.testing.expectError(error.TooManyDependencies, deserializeAllAlloc(alloc, &mock_reader));
 }
 
 test "DependencyInfo.eql compares change_id only" {
