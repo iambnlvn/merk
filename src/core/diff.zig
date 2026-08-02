@@ -35,6 +35,7 @@
 //              Degrades to Myers when the histogram finds nothing useful
 //
 
+//!NOTE: AI was used here extensively for tests, i reviewed all the tests
 const std = @import("std");
 
 pub const Op = enum(u8) {
@@ -778,6 +779,17 @@ fn myersDiff(
     defer alloc.free(v);
     @memset(v, 0);
 
+    // Snapshot for round d is taken BEFORE round d writes to v, i.e. it
+    // captures the frontier as of round d-1. Backtracking from round d
+    // reads prev_k = k ± 1 where |k| <= d, so |prev_k| can reach d+1 —
+    // one slot past what a [-d, d] window covers. Window each snapshot
+    // as [-(d+1), d+1] instead: the extra boundary entries at ±(d+1) are
+    // provably always 0 (round d only ever writes entries with |k| <= d,
+    // so nothing before round d could have touched k = ±(d+1)), so they
+    // cost nothing to fill in without reading v — this is Myers' own
+    // v[1]=0 bootstrap convention, made explicit instead of relying on
+    // v's original oversized allocation to supply it implicitly. Total
+    // trace memory is still O(D²), just with a +2 per step, not O(D·(N+M)).
     var trace: std.ArrayList([]isize) = .empty;
     defer {
         for (trace.items) |snap| alloc.free(snap);
@@ -788,8 +800,19 @@ fn myersDiff(
 
     outer: for (0..max_d + 1) |d_usize| {
         const d: isize = @intCast(d_usize);
-        const snap = try alloc.dupe(isize, v);
+
+        const snap_len = 2 * d_usize + 3;
+        const local_offset = d + 1;
+        const snap = try alloc.alloc(isize, snap_len);
         errdefer alloc.free(snap);
+        for (0..snap_len) |i| {
+            const k_local: isize = @as(isize, @intCast(i)) - local_offset;
+            const vi = k_local + offset;
+            snap[i] = if (vi >= 0 and vi < @as(isize, @intCast(v_len)))
+                v[@intCast(vi)]
+            else
+                0;
+        }
         try trace.append(alloc, snap);
 
         var k: isize = -d;
@@ -818,23 +841,18 @@ fn myersDiff(
 
     while (d >= 0) : (d -= 1) {
         const snap = trace.items[@intCast(d)];
+        const local_offset = d + 1; // must match the capture side above
         const k = x - y;
-        const ki: usize = @intCast(k + offset);
+        const ki: usize = @intCast(k + local_offset);
 
         const prev_k: isize = if (k == -d or (k != d and snap[ki - 1] < snap[ki + 1]))
             k + 1
         else
             k - 1;
 
-        const prev_x = snap[@intCast(prev_k + offset)];
+        const prev_x = snap[@intCast(prev_k + local_offset)];
         const prev_y = prev_x - prev_k;
 
-        // Walk back the snake: any number of matching steps, bounded by
-        // actual line equality AND the prev_x/prev_y target.
-        //  A single d-step's snake can be longer than
-        // one line, and the gap to prev_x/prev_y is not guaranteed to be
-        // diagonal once the snake is peeled off, so we check content here
-        // rather than assuming geometry
         while (x > prev_x and y > prev_y and
             eqFn(old[old_lo + @as(usize, @intCast(x - 1))], new[new_lo + @as(usize, @intCast(y - 1))]))
         {
@@ -1630,10 +1648,6 @@ test "groupByDirectory groups files" {
     try std.testing.expectEqual(@as(usize, 2), groups.len);
 }
 
-// ---------------------------------------------------------------------------
-// Merkle-root/commit diffing tests
-// ---------------------------------------------------------------------------
-
 const io = merk.io;
 const object_test_mod = object_mod;
 
@@ -1820,6 +1834,83 @@ test "diffCommitAgainstParent uses the first (mainline) parent's snapshot" {
     try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_removed);
 }
 
+test "myers backtrack bootstrap: single-line total replacement (forces d=0 boundary read)" {
+    const alloc = std.testing.allocator;
+    // N=M=1, completely different — backtrack must read the round-0
+    // sentinel (prev_k = ±1 against a window that only "owns" k=0).
+    // This is the exact shape that panics without the widened window.
+    var fd = try diffFileWith(alloc, "one.txt", "old line\n", "new line\n", .myers);
+    defer fd.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), fd.lines_added);
+    try std.testing.expectEqual(@as(u32, 1), fd.lines_removed);
+}
+
+test "myers backtrack bootstrap: pure insertion and pure deletion at d=1" {
+    const alloc = std.testing.allocator;
+    inline for (.{
+        .{ .old = "a\n", .new = "a\nb\n", .added = 1, .removed = 0 },
+        .{ .old = "a\nb\n", .new = "a\n", .added = 0, .removed = 1 },
+    }) |case| {
+        var fd = try diffFileWith(alloc, "x.txt", case.old, case.new, .myers);
+        defer fd.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, case.added), fd.lines_added);
+        try std.testing.expectEqual(@as(u32, case.removed), fd.lines_removed);
+    }
+}
+
+test "myers windowed trace stays correct on large file with small edit distance" {
+    const alloc = std.testing.allocator;
+    var old_buf: std.ArrayList(u8) = .empty;
+    defer old_buf.deinit(alloc);
+    var new_buf: std.ArrayList(u8) = .empty;
+    defer new_buf.deinit(alloc);
+
+    for (0..3000) |i| {
+        try old_buf.writer(alloc).print("line {d}\n", .{i});
+        try new_buf.writer(alloc).print("line {d}\n", .{i});
+    }
+    try old_buf.appendSlice(alloc, "const old_only_a = 1;\n");
+    try old_buf.appendSlice(alloc, "const old_only_b = 2;\n");
+    try new_buf.appendSlice(alloc, "const new_only_a = 1;\n");
+    for (3000..6000) |i| {
+        try old_buf.writer(alloc).print("tail {d}\n", .{i});
+        try new_buf.writer(alloc).print("tail {d}\n", .{i});
+    }
+
+    var fd = try diffFileWith(alloc, "big.zig", old_buf.items, new_buf.items, .myers);
+    defer fd.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), fd.lines_added);
+    try std.testing.expectEqual(@as(u32, 2), fd.lines_removed);
+}
+
+test "myers windowed trace handles fully disjoint content (high edit distance)" {
+    const alloc = std.testing.allocator;
+    const old = "a\nb\nc\nd\ne\n";
+    const new = "v\nw\nx\ny\nz\n";
+    var fd = try diffFileWith(alloc, "disjoint.txt", old, new, .myers);
+    defer fd.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 5), fd.lines_added);
+    try std.testing.expectEqual(@as(u32, 5), fd.lines_removed);
+}
+
+test "myers windowed trace correct for word-level diffs (T = WordDelta)" {
+    const alloc = std.testing.allocator;
+    const old = "the quick brown fox jumps over the lazy dog\n";
+    const new = "the quick red fox jumps over the sleepy dog\n";
+
+    var fd = try diffFileWith(alloc, "words.txt", old, new, .myers);
+    defer fd.deinit(alloc);
+
+    var words_added: u32 = 0;
+    var words_removed: u32 = 0;
+    for (fd.word_deltas) |wd| switch (wd.op) {
+        .ins => words_added += 1,
+        .del => words_removed += 1,
+        .eq => {},
+    };
+    try std.testing.expectEqual(@as(u32, 2), words_added);
+    try std.testing.expectEqual(@as(u32, 2), words_removed);
+}
 test {
     std.testing.refAllDecls(@This());
 }
