@@ -152,10 +152,21 @@ pub fn build(b: *std.Build) void {
         optimize,
         mod,
     );
+
+    const diff_step = addModuleTest(
+        b,
+        "test-diff",
+        "Run diff unit tests",
+        "src/core/diff.zig",
+        target,
+        optimize,
+        mod,
+    );
     test_step.dependOn(refs_step);
     test_step.dependOn(focus_step);
     test_step.dependOn(obj_step);
     test_step.dependOn(commit_step);
     test_step.dependOn(index_step);
     test_step.dependOn(history_step);
+    test_step.dependOn(diff_step);
 }
