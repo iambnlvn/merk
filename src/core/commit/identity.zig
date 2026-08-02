@@ -202,7 +202,10 @@ pub const Timezone = union(enum) {
     /// `.unknown`, this returns `null` rather than inventing a fake UTC offset.
     /// The caller supplies a 5-byte buffer whose backing slice is returned.
     pub fn format(self: Timezone, buf: *[5]u8) ?[]const u8 {
-        if (self == .unknown) return null;
+        switch (self) {
+            .unknown => return null,
+            else => {},
+        }
 
         const m = self.minutes();
         const sign: u8 = if (m < 0) '-' else '+';
@@ -210,9 +213,11 @@ pub const Timezone = union(enum) {
         const hours = abs_minutes / 60;
         const mins = abs_minutes % 60;
 
-        buf[0] = sign;
-        _ = std.fmt.bufPrint(buf[1..5], "{d:0>2}{d:0>2}", .{ hours, mins }) catch unreachable;
-        return buf[0..5];
+        // {c} prints the ASCII character.
+        // {d:0>2} pads the integers with zeros to a width of 2.
+        _ = std.fmt.bufPrint(buf, "{c}{d:0>2}{d:0>2}", .{ sign, hours, mins }) catch unreachable;
+
+        return buf;
     }
 
     /// Parse a git/RFC 2822-style timezone string such as `+0530` or `-0500`
