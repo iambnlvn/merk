@@ -233,8 +233,13 @@ pub const Timezone = union(enum) {
             else => return error.InvalidTimezoneFormat,
         };
 
-        const hours = std.fmt.parseInt(i16, text[1..3], 10) catch return error.InvalidTimezoneFormat;
-        const mins = std.fmt.parseInt(i16, text[3..5], 10) catch return error.InvalidTimezoneFormat;
+        for (text[1..5]) |c| {
+            if (c < '0' or c > '9') return error.InvalidTimezoneFormat;
+        }
+
+        const hours: i16 = (text[1] - '0') * 10 + (text[2] - '0');
+        const mins: i16 = (text[3] - '0') * 10 + (text[4] - '0');
+
         if (mins >= 60) return error.InvalidTimezoneFormat;
 
         return Timezone.init(sign * (hours * 60 + mins));
@@ -790,4 +795,38 @@ test "CommitSignatures round-trips a genuinely unknown committer timezone" {
 
     var tz_buf: [5]u8 = undefined;
     try std.testing.expectEqual(@as(?[]const u8, null), sigs.committer.formattedTimezone(&tz_buf));
+}
+
+test "benchmark timezone parsing: parseInt vs manual ASCII" {
+    const iterations: usize = 1_000_000;
+    const sample = "+0530";
+
+    // benchmark std.fmt.parseInt approach
+    var timer = try std.time.Timer.start();
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        // Simulating the old parse logic inline for the benchmark
+        const sign: i16 = if (sample[0] == '+') 1 else -1;
+        const hours = std.fmt.parseInt(i16, sample[1..3], 10) catch unreachable;
+        const mins = std.fmt.parseInt(i16, sample[3..5], 10) catch unreachable;
+        _ = sign * (hours * 60 + mins);
+    }
+    const elapsed_parseint = timer.read();
+
+    // Benchmark manual ASCII arithmetic approach
+    timer.reset();
+    i = 0;
+    while (i < iterations) : (i += 1) {
+        const sign: i16 = if (sample[0] == '+') 1 else -1;
+        const hours: i16 = (sample[1] - '0') * 10 + (sample[2] - '0');
+        const mins: i16 = (sample[3] - '0') * 10 + (sample[4] - '0');
+        _ = sign * (hours * 60 + mins);
+    }
+    const elapsed_manual = timer.read();
+
+    std.debug.print("\n--- Timezone Parsing Benchmark ({d} iterations) ---\n", .{iterations});
+    std.debug.print("std.fmt.parseInt : {d} ns total ({d} ns/op)\n", .{ elapsed_parseint, elapsed_parseint / iterations });
+    std.debug.print("Manual ASCII     : {d} ns total ({d} ns/op)\n", .{ elapsed_manual, elapsed_manual / iterations });
+
+    try std.testing.expect(elapsed_manual < elapsed_parseint);
 }
