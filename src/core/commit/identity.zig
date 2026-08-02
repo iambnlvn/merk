@@ -18,13 +18,89 @@ pub const IdentityError = error{
     /// `tz_offset_minutes` outside +/-1440 (a full day either way) —
     /// generous on purpose (real-world offsets top out around -12:00/
     /// +14:00) since this only needs to catch corrupt/garbage values,
-    /// not enforce the IANA tz database.
+    /// not enforce the IANA tz database. Also returned by `parseTzOffset`
+    /// for malformed "+HHMM"/"-HHMM" text.
     InvalidTimezoneOffset,
 };
+
+const illegal_name_chars = [_]u8{ '\n', '\r', '<', '>', '\x00' };
+const illegal_email_chars = [_]u8{ ' ', '\t', '\n', '\r', '<', '>', '\x00' };
+
+/// Magnitude bound for `tz_offset_minutes`, in either direction — see
+/// `IdentityError.InvalidTimezoneOffset` for why this is deliberately
+/// generous rather than IANA-accurate.
+pub const max_tz_offset_minutes: i16 = 1440;
+
+fn validateTzOffset(tz_offset_minutes: i16) IdentityError!void {
+    if (tz_offset_minutes < -max_tz_offset_minutes or tz_offset_minutes > max_tz_offset_minutes)
+        return error.InvalidTimezoneOffset;
+}
+
+/// Format a UTC offset the way git/RFC 2822 dates do: sign + zero-padded
+/// HHMM, e.g. `-300` -> "-0500", `330` -> "+0530", `0` -> "+0000".
+/// `buf` must be at least 5 bytes; the returned slice aliases it.
+pub fn formatTzOffset(tz_offset_minutes: i16, buf: *[5]u8) []const u8 {
+    const sign: u8 = if (tz_offset_minutes < 0) '-' else '+';
+    const abs_minutes: u16 = @intCast(@abs(tz_offset_minutes));
+    const hours = abs_minutes / 60;
+    const mins = abs_minutes % 60;
+
+    buf[0] = sign;
+    _ = std.fmt.bufPrint(buf[1..5], "{d:0>2}{d:0>2}", .{ hours, mins }) catch unreachable;
+    return buf[0..5];
+}
+
+/// Parse a git/RFC 2822-style UTC offset ("+0530", "-0500") back into
+/// minutes east of UTC. Rejects anything not exactly 5 bytes
+/// (sign + 2-digit hours + 2-digit minutes), a minutes field >= 60, or a
+/// result outside `validateTzOffset`'s bounds.
+pub fn parseTzOffset(text: []const u8) IdentityError!i16 {
+    if (text.len != 5) return error.InvalidTimezoneOffset;
+
+    const sign: i16 = switch (text[0]) {
+        '+' => 1,
+        '-' => -1,
+        else => return error.InvalidTimezoneOffset,
+    };
+
+    const hours = std.fmt.parseInt(i16, text[1..3], 10) catch return error.InvalidTimezoneOffset;
+    const mins = std.fmt.parseInt(i16, text[3..5], 10) catch return error.InvalidTimezoneOffset;
+    if (mins >= 60) return error.InvalidTimezoneOffset;
+
+    const total = sign * (hours * 60 + mins);
+    try validateTzOffset(total);
+    return total;
+}
 
 pub const IdentityInfo = struct {
     name: []const u8,
     email: []const u8,
+
+    pub fn validate(self: IdentityInfo) IdentityError!void {
+        const trimmed_name = std.mem.trim(u8, self.name, " \t\r\n");
+        const trimmed_email = std.mem.trim(u8, self.email, " \t\r\n");
+
+        if (trimmed_name.len == 0) return error.EmptyName;
+        if (trimmed_email.len == 0) return error.EmptyEmail;
+
+        if (trimmed_name.len > std.math.maxInt(u16)) return error.NameTooLong;
+        if (trimmed_email.len > std.math.maxInt(u16)) return error.EmailTooLong;
+
+        if (std.mem.indexOfAny(u8, trimmed_name, &illegal_name_chars) != null)
+            return error.NameContainsIllegalCharacters;
+
+        if (std.mem.indexOfAny(u8, trimmed_email, &illegal_email_chars) != null)
+            return error.EmailContainsIllegalCharacters;
+
+        const at_idx = std.mem.indexOfScalar(u8, trimmed_email, '@') orelse
+            return error.MissingEmailAtSign;
+
+        if (at_idx == 0 or at_idx == trimmed_email.len - 1)
+            return error.InvalidEmailBounds;
+
+        if (std.mem.indexOfScalar(u8, trimmed_email[at_idx + 1 ..], '@') != null)
+            return error.EmailContainsIllegalCharacters;
+    }
 
     /// Trimmed name/email, computed once so `serialize` and any future
     /// caller don't each re-derive it
@@ -35,56 +111,14 @@ pub const IdentityInfo = struct {
         };
     }
 
-    pub fn validateTrimmed(name: []const u8, email: []const u8) IdentityError!void {
-        if (name.len == 0) return error.EmptyName;
-        if (email.len == 0) return error.EmptyEmail;
-
-        if (name.len > std.math.maxInt(u16)) return error.NameTooLong;
-        if (email.len > std.math.maxInt(u16)) return error.EmailTooLong;
-
-        // Single pass: Name validation
-        for (name) |c| {
-            switch (c) {
-                '\n', '\r', '<', '>', '\x00' => return error.NameContainsIllegalCharacters,
-                else => {},
-            }
-        }
-
-        // Single pass: Email validation & @ counting
-        var at_count: usize = 0;
-        for (email, 0..) |c, i| {
-            switch (c) {
-                ' ', '\t', '\n', '\r', '<', '>', '\x00' => return error.EmailContainsIllegalCharacters,
-                '@' => {
-                    if (i == 0 or i == email.len - 1) return error.InvalidEmailBounds;
-                    at_count += 1;
-                },
-                else => {},
-            }
-        }
-
-        if (at_count == 0) return error.MissingEmailAtSign;
-        if (at_count > 1) return error.EmailContainsIllegalCharacters;
-    }
-
-    pub fn validate(self: IdentityInfo) IdentityError!void {
-        const t = self.trimmed();
-        return validateTrimmed(t.name, t.email);
-    }
     pub fn serialize(self: IdentityInfo, writer: anytype) !void {
+        try self.validate();
+
         const t = self.trimmed();
-
-        // Validates the already-trimmed strings
-        try validateTrimmed(t.name, t.email);
-
         try wire.writeBytes(u16, writer, t.name);
         try wire.writeBytes(u16, writer, t.email);
     }
 };
-
-fn validateTzOffset(tz_offset_minutes: i16) IdentityError!void {
-    if (tz_offset_minutes < -1440 or tz_offset_minutes > 1440) return error.InvalidTimezoneOffset;
-}
 
 // TimestampedIdentityInfo — IdentityInfo + an explicit wall-clock timestamp
 // and the UTC offset that timestamp was recorded in.
@@ -137,6 +171,12 @@ pub const TimestampedIdentityInfo = struct {
         };
     }
 
+    /// This offset formatted git-style ("+0530", "-0500"). `buf` must be
+    /// at least 5 bytes; the returned slice aliases it.
+    pub fn formattedTzOffset(self: TimestampedIdentityInfo, buf: *[5]u8) []const u8 {
+        return formatTzOffset(self.tz_offset_minutes, buf);
+    }
+
     pub fn serialize(self: TimestampedIdentityInfo, writer: anytype) !void {
         try self.validate();
 
@@ -178,6 +218,13 @@ pub const Identity = struct {
             .timestamp_ms = t.timestamp_ms,
             .tz_offset_minutes = t.tz_offset_minutes,
         };
+    }
+
+    /// This identity's timestamp offset formatted git-style ("+0530",
+    /// "-0500"). `buf` must be at least 5 bytes; the returned slice
+    /// aliases it.
+    pub fn formattedTzOffset(self: Identity, buf: *[5]u8) []const u8 {
+        return formatTzOffset(self.tz_offset_minutes, buf);
     }
 
     pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !Identity {
@@ -224,13 +271,22 @@ pub const CommitIdentityInfo = struct {
         if (self.committer) |c| try c.validate();
     }
 
+    /// The committer that will actually be serialized: `committer` if one
+    /// was supplied, otherwise `author`. Pulled out as its own accessor —
+    /// rather than left as an inline `orelse` only `serialize` could see —
+    /// so any other caller needing "who's the effective committer here"
+    /// (a CLI `--committer` override check, a future commit-building
+    /// helper, etc.) derives it the same way `serialize` does, instead of
+    /// re-deriving the same default and risking it drifting out of sync.
+    pub fn effectiveCommitter(self: CommitIdentityInfo) TimestampedIdentityInfo {
+        return self.committer orelse self.author;
+    }
+
     pub fn serialize(self: CommitIdentityInfo, writer: anytype) !void {
         try self.validate();
 
         try self.author.serialize(writer);
-
-        const effective_committer = self.committer orelse self.author;
-        try effective_committer.serialize(writer);
+        try self.effectiveCommitter().serialize(writer);
     }
 };
 
@@ -250,11 +306,11 @@ pub const CommitIdentity = struct {
     }
 
     pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !CommitIdentity {
-        const author = try Identity.deserialize(alloc, reader);
-        errdefer @constCast(&author).deinit(alloc);
+        var author = try Identity.deserialize(alloc, reader);
+        errdefer author.deinit(alloc);
 
-        const committer = try Identity.deserialize(alloc, reader);
-        errdefer @constCast(&committer).deinit(alloc);
+        var committer = try Identity.deserialize(alloc, reader);
+        errdefer committer.deinit(alloc);
 
         return .{ .author = author, .committer = committer };
     }
@@ -389,6 +445,36 @@ test "TimestampedIdentityInfo serialization includes timestamp and tz offset" {
     try std.testing.expectEqual(@as(i16, -300), tz);
 }
 
+test "formatTzOffset produces git-style +HHMM/-HHMM" {
+    var buf: [5]u8 = undefined;
+
+    try std.testing.expectEqualStrings("+0000", formatTzOffset(0, &buf));
+    try std.testing.expectEqualStrings("-0500", formatTzOffset(-300, &buf));
+    try std.testing.expectEqualStrings("+0530", formatTzOffset(330, &buf));
+    try std.testing.expectEqualStrings("+1400", formatTzOffset(840, &buf));
+    try std.testing.expectEqualStrings("-1200", formatTzOffset(-720, &buf));
+}
+
+test "parseTzOffset inverts formatTzOffset" {
+    const samples = [_]i16{ 0, -300, 330, 840, -720, 60, -60, 1440, -1440 };
+    var buf: [5]u8 = undefined;
+
+    for (samples) |mins| {
+        const text = formatTzOffset(mins, &buf);
+        const parsed = try parseTzOffset(text);
+        try std.testing.expectEqual(mins, parsed);
+    }
+}
+
+test "parseTzOffset rejects malformed input" {
+    try std.testing.expectError(error.InvalidTimezoneOffset, parseTzOffset("530"));
+    try std.testing.expectError(error.InvalidTimezoneOffset, parseTzOffset("+053"));
+    try std.testing.expectError(error.InvalidTimezoneOffset, parseTzOffset("053000"));
+    try std.testing.expectError(error.InvalidTimezoneOffset, parseTzOffset("*0530"));
+    try std.testing.expectError(error.InvalidTimezoneOffset, parseTzOffset("+0X30"));
+    try std.testing.expectError(error.InvalidTimezoneOffset, parseTzOffset("+0560")); // minutes >= 60
+}
+
 test "Identity initDupe - timestamp auto-fill, tz offset passthrough" {
     const alloc = std.testing.allocator;
     const before = std.time.milliTimestamp();
@@ -427,6 +513,9 @@ test "Identity deserialization round-trip" {
     try std.testing.expectEqualStrings("user@email.com", id.email);
     try std.testing.expectEqual(@as(i64, 99_999), id.timestamp_ms);
     try std.testing.expectEqual(@as(i16, 330), id.tz_offset_minutes);
+
+    var tz_buf: [5]u8 = undefined;
+    try std.testing.expectEqualStrings("+0530", id.formattedTzOffset(&tz_buf));
 }
 
 test "Identity deserialize rejects an out-of-range tz offset" {
@@ -454,6 +543,9 @@ test "CommitIdentityInfo - committer defaults to author" {
         },
         // committer intentionally omitted
     };
+
+    // effectiveCommitter() mirrors author before serialization even happens
+    try std.testing.expectEqualStrings("Bruce Wayne", info.effectiveCommitter().name);
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
@@ -487,6 +579,9 @@ test "CommitIdentityInfo - distinct committer with its own tz offset" {
             .tz_offset_minutes = 0, // UTC
         },
     };
+
+    // effectiveCommitter() returns the explicit committer, not the author
+    try std.testing.expectEqualStrings("Nodus Bot", info.effectiveCommitter().name);
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
