@@ -24,7 +24,12 @@ pub const snapshot = @import("./commit/snapshot.zig");
 pub const parent = @import("./commit/parent.zig");
 const ParentInfo = parent.ParentInfo;
 
+pub const signature = @import("./commit/signature.zig");
+const SignatureInfo = signature.SignatureInfo;
+const Signature = signature.Signature;
+
 pub const COMMIT_MAGIC = 0x4E_4F_44_55;
+
 pub const COMMIT_VERSION: u8 = 1;
 
 pub const ParentKind = parent.ParentKind;
@@ -34,6 +39,13 @@ pub const MAX_PARENTS: u8 = parent.MAX_PARENTS;
 pub const Intent = metadata.Intent;
 
 pub const TrailerInfo = message.TrailerInfo;
+
+pub const Encoding = message.Encoding;
+
+pub const ChangeId = metadata.ChangeId;
+pub const generateChangeId = metadata.generateChangeId;
+
+pub const SignatureAlgorithm = signature.SignatureAlgorithm;
 
 /// Internal, assembled representation of a commit-to-be. Not exported:
 /// `CommitBuilder` is the only supported way to produce one, so nothing
@@ -83,6 +95,15 @@ pub const Commit = struct {
     /// single non-`.normal` parent, e.g. `.cherry_pick`, isn't a merge)
     pub fn isMerge(self: Commit) bool {
         return self.parents.len > 1;
+    }
+
+    /// True when `self` and `other` are different snapshots of the same
+    /// evolving logical change (same `change_id`) — e.g. before and
+    /// after a rebase or `commit --amend` — even though their hashes
+    /// (and possibly everything else) differ. See `ChangeId`'s doc
+    /// comment in `commit/metadata.zig`.
+    pub fn isSameChange(self: Commit, other: Commit) bool {
+        return std.mem.eql(u8, &self.metadata.change_id, &other.metadata.change_id);
     }
 
     /// Just the hashes, dropping `ParentKind` — for callers doing plain
@@ -177,6 +198,83 @@ pub fn read(
     };
 }
 
+/// Signatures live *outside* the content-addressed commit object, on
+/// purpose: a signature signs the commit's hash, so embedding it inside
+/// the bytes that hash is computed over is a chicken-and-egg problem
+/// (either the signature isn't over the final hash, or the hash isn't
+/// stable). Storing it as a sidecar keyed by the commit hash it signs
+/// means:
+///   - `Commit.hash` never changes because a commit got signed,
+///     re-signed, or countersigned by a second key,
+///   - an unsigned commit costs nothing (no sidecar file at all),
+///
+/// merk does not verify signatures — this is storage and retrieval
+/// only. Verifying `sig.bytes` against `sig.key_id` for a given
+/// `commit_hash` is the caller's job (a CLI command, CI policy, ...).
+pub const CommitSignatureStore = struct {
+    alloc: std.mem.Allocator,
+    fs: io.FileSystem,
+    /// Directory signature sidecar files live under, e.g.
+    /// "merk/history/signatures".
+    signatures_dir: []const u8,
+
+    pub fn init(alloc: std.mem.Allocator, fs: io.FileSystem, signatures_dir: []const u8) CommitSignatureStore {
+        return .{ .alloc = alloc, .fs = fs, .signatures_dir = signatures_dir };
+    }
+
+    /// Attach (or replace) the signature for `commit_hash`. Doesn't
+    /// check that `commit_hash` actually exists in the object store —
+    pub fn attach(self: CommitSignatureStore, commit_hash: Hash, sig: SignatureInfo) !void {
+        try sig.validate();
+
+        var buf = std.Io.Writer.Allocating.init(self.alloc);
+        defer buf.deinit();
+        try sig.serialize(&buf.writer);
+
+        const path = try self.sigPath(commit_hash);
+        defer self.alloc.free(path);
+        try self.fs.writeFile(self.alloc, path, buf.written());
+    }
+
+    /// The signature attached to `commit_hash`, or `null` if it isn't
+    /// signed. Caller frees with `.deinit(alloc)`
+    pub fn get(self: CommitSignatureStore, commit_hash: Hash) !?Signature {
+        const path = try self.sigPath(commit_hash);
+        defer self.alloc.free(path);
+
+        const bytes = (try self.fs.readFile(self.alloc, path)) orelse return null;
+        defer self.alloc.free(bytes);
+
+        var reader = std.Io.Reader.fixed(bytes);
+        return try Signature.deserialize(self.alloc, &reader);
+    }
+
+    /// Remove a signature, if present. Not an error if `commit_hash`
+    /// was never signed
+    pub fn remove(self: CommitSignatureStore, commit_hash: Hash) !void {
+        const path = try self.sigPath(commit_hash);
+        defer self.alloc.free(path);
+        self.fs.deleteFile(path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+
+    /// Sharded by the commit hash itself. Unlike `PathHistory` (which
+    /// hashes an arbitrary path first), `commit_hash` is already a
+    /// uniformly distributed content hash, so no extra hashing step is
+    /// needed to get good directory fan-out
+    fn sigPath(self: CommitSignatureStore, commit_hash: Hash) ![]u8 {
+        var hex_buf: [64]u8 = undefined;
+        const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{commit_hash}) catch unreachable;
+
+        if (self.signatures_dir.len == 0) {
+            return std.fmt.allocPrint(self.alloc, "{s}/{s}/{s}", .{ hex[0..2], hex[2..4], hex });
+        }
+        return std.fmt.allocPrint(self.alloc, "{s}/{s}/{s}/{s}", .{ self.signatures_dir, hex[0..2], hex[2..4], hex });
+    }
+};
+
 /// Everything needed to populate a builder for an ordinary commit,
 /// independent of where the snapshot and parents come from. Callers
 /// that resolve those themselves (e.g. `Repository`, reading HEAD and
@@ -188,14 +286,30 @@ pub const CommitRequest = struct {
     author_name: []const u8,
     author_email: []const u8,
     author_timestamp_ms: i64,
+    /// Minutes east of UTC the author's timestamp was recorded in.
+    /// Defaults to 0 (UTC)
+    author_tz_offset_minutes: i16 = 0,
+
     committer_name: ?[]const u8 = null,
     committer_email: ?[]const u8 = null,
     committer_timestamp_ms: ?i64 = null,
+    /// Defaults to `author_tz_offset_minutes` when a committer is
+    /// supplied but its own offset isn't,  mirrors the existing
+    /// name/email/timestamp defaulting
+    committer_tz_offset_minutes: ?i16 = null,
+
     intent: Intent,
     title: []const u8,
     body: []const u8 = "",
+    /// Character encoding of `title`/`body`. Defaults to UTF-8.
+    encoding: Encoding = .utf8,
     labels: []const []const u8 = &.{},
     trailers: []const TrailerInfo = &.{},
+
+    /// Carry forward the `change_id` of the commit being amended,
+    /// rebased, or cherry-picked from. Leave `null` for a genuinely new
+    /// logical change — `CommitBuilder.build` will generate a fresh one.
+    change_id: ?ChangeId = null,
 };
 
 /// Builder for assembling and writing a commit. This is the only
@@ -214,6 +328,9 @@ pub const CommitRequest = struct {
 ///   - Sensible defaults: committer mirrors author when not set, and the
 ///     commit metadata timestamp mirrors the author timestamp when not set.
 ///     Parents default to `.normal` kind when added via `.parent()`.
+///     `change_id` defaults to a fresh random id when not set via
+///     `.changeId()` — see `ChangeId`'s doc comment for when to instead
+///     carry one forward.
 ///   - The builder owns its own scratch allocations (parents/labels/trailers)
 ///     so callers never juggle intermediate slices themselves. Call
 ///     `.deinit()` when done, whether or not `.write()` succeeded.
@@ -244,6 +361,15 @@ pub const CommitRequest = struct {
 ///
 ///   _ = try b.parentWithKind(base_hash, .normal);
 ///   _ = try b.parentWithKind(other_branch_hash, .merge);
+///
+/// A caller amending or rebasing a commit carries its `change_id`
+/// forward so the rewritten commit is still recognized as the same
+/// logical change:
+///
+///   _ = b.changeId(original.metadata.change_id);
+///
+/// Signing a commit happens *after* `.write()`, against the returned
+/// hash, via `CommitSignatureStore` — see its doc comment.
 pub const CommitBuilder = struct {
     alloc: std.mem.Allocator,
     snapshot_root: Hash,
@@ -254,10 +380,12 @@ pub const CommitBuilder = struct {
 
     commit_intent: ?Intent = null,
     metadata_timestamp_ms: ?i64 = null,
+    change_id_override: ?ChangeId = null,
     labels: std.ArrayListUnmanaged([]const u8) = .{},
 
     title_text: ?[]const u8 = null,
     body_text: []const u8 = "",
+    msg_encoding: Encoding = .utf8,
     trailers: std.ArrayListUnmanaged(TrailerInfo) = .{},
 
     /// `snapshot_root` is the root hash of whatever content-addressed
@@ -319,19 +447,54 @@ pub const CommitBuilder = struct {
         return self;
     }
 
+    /// Author identity with an implicit UTC (`+00:00`) timestamp. Use
+    /// `.authorWithTz` to record a non-UTC local offset.
     pub fn author(self: *CommitBuilder, name: []const u8, email: []const u8, timestamp_ms: i64) *CommitBuilder {
-        self.author_info = .{ .name = name, .email = email, .timestamp_ms = timestamp_ms };
+        return self.authorWithTz(name, email, timestamp_ms, 0);
+    }
+
+    /// Author identity plus the UTC offset (minutes) `timestamp_ms` was
+    /// recorded in — e.g. `-300` for someone committing from US Eastern
+    pub fn authorWithTz(
+        self: *CommitBuilder,
+        name: []const u8,
+        email: []const u8,
+        timestamp_ms: i64,
+        tz_offset_minutes: i16,
+    ) *CommitBuilder {
+        self.author_info = .{
+            .name = name,
+            .email = email,
+            .timestamp_ms = timestamp_ms,
+            .tz_offset_minutes = tz_offset_minutes,
+        };
         return self;
     }
 
     /// Optional. When not called, the committer defaults to the author
-    /// (same person, same timestamp) — matching the existing serialize-time
-    /// behavior documented on the commit's identity.
+    /// (same person, same timestamp, same tz offset) — matching the
+    /// existing serialize-time behavior documented on the commit's
+    /// identity. Implicit UTC timestamp; use `.committerWithTz` for a
+    /// non-UTC local offset.
     pub fn committer(self: *CommitBuilder, name: []const u8, email: []const u8, timestamp_ms: i64) *CommitBuilder {
+        return self.committerWithTz(name, email, timestamp_ms, 0);
+    }
+
+    /// Committer identity plus the UTC offset (minutes) `timestamp_ms`
+    /// was recorded in — e.g. for a CI bot or a cherry-pick applied
+    /// somewhere other than where the change was authored.
+    pub fn committerWithTz(
+        self: *CommitBuilder,
+        name: []const u8,
+        email: []const u8,
+        timestamp_ms: i64,
+        tz_offset_minutes: i16,
+    ) *CommitBuilder {
         self.committer_info = .{
             .name = name,
             .email = email,
             .timestamp_ms = timestamp_ms,
+            .tz_offset_minutes = tz_offset_minutes,
         };
         return self;
     }
@@ -344,6 +507,16 @@ pub const CommitBuilder = struct {
     /// Optional. Defaults to the author's timestamp when not set.
     pub fn timestamp(self: *CommitBuilder, timestamp_ms: i64) *CommitBuilder {
         self.metadata_timestamp_ms = timestamp_ms;
+        return self;
+    }
+
+    /// Carry forward a persistent `change_id`, e.g. when amending,
+    /// rebasing, or cherry-picking a commit that should still be
+    /// recognized as the same logical change. Omit this call for a
+    /// brand-new change — `build()` generates a fresh random one.
+    /// See `ChangeId`'s doc comment in `commit/metadata.zig`.
+    pub fn changeId(self: *CommitBuilder, id: ChangeId) *CommitBuilder {
+        self.change_id_override = id;
         return self;
     }
 
@@ -367,16 +540,23 @@ pub const CommitBuilder = struct {
         return self;
     }
 
+    /// Optional. Defaults to UTF-8.
+    pub fn encoding(self: *CommitBuilder, value: Encoding) *CommitBuilder {
+        self.msg_encoding = value;
+        return self;
+    }
+
     pub fn trailer(self: *CommitBuilder, key: []const u8, value: []const u8) !*CommitBuilder {
         try self.trailers.append(self.alloc, .{ .key = key, .value = value });
         return self;
     }
 
     /// Populate a builder from a `CommitRequest` in one call: author,
-    /// optional committer, intent, title, body, labels, trailers — every
-    /// setter this file knows how to call, called correctly and in the
-    /// right order (including the committer/label/trailer defaulting
-    /// rules documented on the individual setters above).
+    /// optional committer, intent, title, body, encoding, change_id,
+    /// labels, trailers — every setter this file knows how to call,
+    /// called correctly and in the right order (including the
+    /// committer/label/trailer defaulting rules documented on the
+    /// individual setters above).
     ///
     /// This exists so that callers assembling a commit from an
     /// options-style struct (`Repository.commit`, a CLI command, ...)
@@ -385,17 +565,25 @@ pub const CommitBuilder = struct {
     /// resolution is specific to them. Prefer `CommitBuilder.fromRequest`
     /// when the snapshot root is already resolved at construction time
     pub fn applyRequest(self: *CommitBuilder, request: CommitRequest) !*CommitBuilder {
-        _ = self.author(request.author_name, request.author_email, request.author_timestamp_ms);
+        _ = self.authorWithTz(
+            request.author_name,
+            request.author_email,
+            request.author_timestamp_ms,
+            request.author_tz_offset_minutes,
+        );
         if (request.committer_name) |name| {
-            _ = self.committer(
+            _ = self.committerWithTz(
                 name,
                 request.committer_email orelse request.author_email,
                 request.committer_timestamp_ms orelse request.author_timestamp_ms,
+                request.committer_tz_offset_minutes orelse request.author_tz_offset_minutes,
             );
         }
         _ = self.intent(request.intent);
         _ = self.title(request.title);
         _ = self.body(request.body);
+        _ = self.encoding(request.encoding);
+        if (request.change_id) |cid| _ = self.changeId(cid);
         if (request.labels.len > 0) _ = try self.labelsFrom(request.labels);
         for (request.trailers) |t| _ = try self.trailer(t.key, t.value);
         return self;
@@ -411,6 +599,7 @@ pub const CommitBuilder = struct {
         const title_text = self.title_text orelse return error.MissingTitle;
         const commit_intent = self.commit_intent orelse return error.MissingIntent;
         const meta_ts = self.metadata_timestamp_ms orelse author_info.timestamp_ms;
+        const change_id = self.change_id_override orelse metadata.generateChangeId();
 
         return .{
             .snapshot = self.snapshot_root,
@@ -420,6 +609,7 @@ pub const CommitBuilder = struct {
                 .committer = self.committer_info,
             },
             .metadata = .{
+                .change_id = change_id,
                 .timestamp_ms = meta_ts,
                 .intent = commit_intent,
                 .labels = self.labels.items,
@@ -427,12 +617,18 @@ pub const CommitBuilder = struct {
             .message = .{
                 .title = title_text,
                 .body = self.body_text,
+                .encoding = self.msg_encoding,
                 .trailers = self.trailers.items,
             },
         };
     }
 
-    /// Assemble and persist the commit.
+    /// Assemble and persist the commit. Note: a `change_id` is generated
+    /// fresh (randomly) on every call unless `.changeId()` was used, so
+    /// two otherwise-identical builders will *not* produce the same hash
+    /// unless they're both given the same explicit `change_id` — this is
+    /// intentional (each is a genuinely new logical change unless told
+    /// otherwise).
     pub fn write(self: *const CommitBuilder, store: *const Store) !Hash {
         const info = try self.build();
         return writeCommit(self.alloc, store, info);
@@ -468,7 +664,7 @@ test "CommitBuilder.applyRequest populates author, committer default, and traile
     defer b.deinit();
     _ = try b.applyRequest(.{
         .author_name = "Ada Lovelace",
-        .author_email = "ada@nodus.dev",
+        .author_email = "ada@merk.dev",
         .author_timestamp_ms = 1_000,
         .intent = .feature,
         .title = "via applyRequest",
@@ -499,7 +695,7 @@ test "CommitBuilder.fromRequest is equivalent to init + applyRequest" {
 
     var b = try CommitBuilder.fromRequest(alloc, snapshot_hash, .{
         .author_name = "Grace Hopper",
-        .author_email = "grace@nodus.dev",
+        .author_email = "grace@merk.dev",
         .author_timestamp_ms = 2_000,
         .intent = .docs,
         .title = "via fromRequest",
@@ -548,6 +744,7 @@ test "commit write and read round-trip" {
     try std.testing.expectEqualStrings("Bruce Wayne", c.identity.author.name);
     try std.testing.expectEqualStrings("bruce@wayne.corp", c.identity.author.email);
     try std.testing.expectEqual(@as(i64, 1_700_000_000_000), c.identity.author.timestamp_ms);
+    try std.testing.expectEqual(@as(i16, 0), c.identity.author.tz_offset_minutes);
 
     try std.testing.expectEqualStrings("Bruce Wayne", c.identity.committer.name);
     try std.testing.expect(c.identity.isAuthorCommitter());
@@ -557,6 +754,7 @@ test "commit write and read round-trip" {
         "Create the initial repository structure.",
         c.message.body,
     );
+    try std.testing.expectEqual(Encoding.utf8, c.message.encoding);
 
     try std.testing.expectEqual(@as(usize, 2), c.message.trailers.len);
     try std.testing.expectEqualStrings("reviewed-by", c.message.trailers[0].key);
@@ -577,7 +775,7 @@ test "commit with explicit committer" {
     var b = CommitBuilder.init(alloc, snapshot_hash);
     defer b.deinit();
     _ = b.author("Ada Lovelace", "ada@lab.net", 1_000);
-    _ = b.committer("Nodus Bot", "bot@nodus.dev", 2_000);
+    _ = b.committer("merk Bot", "bot@merk.dev", 2_000);
     _ = b.intent(.chore);
     _ = b.timestamp(1);
     _ = b.title("cherry-pick: port auth fix");
@@ -588,38 +786,182 @@ test "commit with explicit committer" {
     defer c.deinit(alloc);
 
     try std.testing.expectEqualStrings("Ada Lovelace", c.identity.author.name);
-    try std.testing.expectEqualStrings("Nodus Bot", c.identity.committer.name);
+    try std.testing.expectEqualStrings("merk Bot", c.identity.committer.name);
     try std.testing.expectEqual(@as(i64, 1_000), c.identity.author.timestamp_ms);
     try std.testing.expectEqual(@as(i64, 2_000), c.identity.committer.timestamp_ms);
     try std.testing.expect(!c.identity.isAuthorCommitter());
 }
 
-test "commit is deterministic for same inputs" {
+test "author/committer with distinct timezone offsets round-trips" {
     const alloc = std.testing.allocator;
-
     var tfs = io.TestFs.init(alloc);
     defer tfs.deinit();
     const store = Store.init(alloc, tfs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
-    const make_commit = struct {
-        fn f(s: *const Store, a: std.mem.Allocator, sh: Hash) !Hash {
-            var b = CommitBuilder.init(a, sh);
-            defer b.deinit();
-            _ = b.author("Test User", "test@nodus.dev", 42);
-            _ = b.intent(.feature);
-            _ = try b.label("core");
-            _ = try b.label("storage");
-            _ = b.title("msg");
-            _ = b.body("deterministic commit");
-            _ = try b.trailer("closes", "#7");
-            return b.write(s);
-        }
-    }.f;
+    var b = CommitBuilder.init(alloc, snapshot_hash);
+    defer b.deinit();
+    _ = b.authorWithTz("Dev A", "a@merk.dev", 1_000, -300); // US Eastern
+    _ = b.committerWithTz("CI Bot", "ci@merk.dev", 1_500, 0); // UTC
+    _ = b.intent(.ci);
+    _ = b.title("apply patch via bot");
 
-    const h1 = try make_commit(&store, alloc, snapshot_hash);
-    const h2 = try make_commit(&store, alloc, snapshot_hash);
-    try std.testing.expectEqualSlices(u8, &h1, &h2);
+    const commit_hash = try b.write(&store);
+
+    var c = try read(alloc, &store, commit_hash);
+    defer c.deinit(alloc);
+
+    try std.testing.expectEqual(@as(i16, -300), c.identity.author.tz_offset_minutes);
+    try std.testing.expectEqual(@as(i16, 0), c.identity.committer.tz_offset_minutes);
+}
+
+test "change_id is generated when unset, and carried forward across a rebase-like rewrite" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    var b1 = CommitBuilder.init(alloc, snapshot_hash);
+    defer b1.deinit();
+    _ = b1.author("Dev A", "a@merk.dev", 1_000);
+    _ = b1.intent(.feature);
+    _ = b1.title("original commit");
+    const original_hash = try b1.write(&store);
+
+    var original = try read(alloc, &store, original_hash);
+    defer original.deinit(alloc);
+
+    // Simulate a rebase: same logical change, new parent/timestamp/hash.
+    var b2 = CommitBuilder.init(alloc, snapshot_hash);
+    defer b2.deinit();
+    _ = b2.author("Dev A", "a@merk.dev", 2_000);
+    _ = b2.intent(.feature);
+    _ = b2.title("original commit");
+    _ = b2.changeId(original.metadata.change_id);
+    const rebased_hash = try b2.write(&store);
+
+    var rebased = try read(alloc, &store, rebased_hash);
+    defer rebased.deinit(alloc);
+
+    try std.testing.expect(!std.mem.eql(u8, &original_hash, &rebased_hash));
+    try std.testing.expect(original.isSameChange(rebased));
+
+    // An unrelated commit gets its own, different change_id.
+    var b3 = CommitBuilder.init(alloc, snapshot_hash);
+    defer b3.deinit();
+    _ = b3.author("Dev B", "b@merk.dev", 3_000);
+    _ = b3.intent(.fix);
+    _ = b3.title("unrelated commit");
+    const unrelated_hash = try b3.write(&store);
+
+    var unrelated = try read(alloc, &store, unrelated_hash);
+    defer unrelated.deinit(alloc);
+
+    try std.testing.expect(!original.isSameChange(unrelated));
+}
+
+test "encoding tag round-trips through write and read" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    var b = CommitBuilder.init(alloc, snapshot_hash);
+    defer b.deinit();
+    _ = b.author("Legacy Importer", "import@merk.dev", 1_000);
+    _ = b.intent(.chore);
+    _ = b.title("import from legacy system");
+    _ = b.encoding(.latin1);
+
+    const commit_hash = try b.write(&store);
+
+    var c = try read(alloc, &store, commit_hash);
+    defer c.deinit(alloc);
+
+    try std.testing.expectEqual(Encoding.latin1, c.message.encoding);
+}
+
+test "CommitSignatureStore: unsigned commit has no signature, attach/get/remove round-trip" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const sig_store = CommitSignatureStore.init(alloc, tfs.fs(), "signatures");
+
+    const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
+    var b = CommitBuilder.init(alloc, snapshot_hash);
+    defer b.deinit();
+    _ = b.author("Dev A", "a@merk.dev", 1_000);
+    _ = b.intent(.security);
+    _ = b.title("harden auth path");
+    const commit_hash = try b.write(&store);
+
+    // Unsigned by default.
+    try std.testing.expectEqual(@as(?Signature, null), try sig_store.get(commit_hash));
+
+    // The commit's hash is exactly what gets signed — attach doesn't
+    // touch or require re-deriving anything from the commit object.
+    try sig_store.attach(commit_hash, .{
+        .algorithm = .ssh_ed25519,
+        .bytes = "fake-signature-over-commit-hash",
+        .key_id = "SHA256:abc123",
+    });
+
+    var sig = (try sig_store.get(commit_hash)).?;
+    defer sig.deinit(alloc);
+    try std.testing.expectEqual(SignatureAlgorithm.ssh_ed25519, sig.algorithm);
+    try std.testing.expectEqualStrings("SHA256:abc123", sig.key_id);
+
+    // Re-signing (e.g. a second signer) replaces, doesn't append
+    try sig_store.attach(commit_hash, .{
+        .algorithm = .pgp_rsa,
+        .bytes = "a-different-signature",
+        .key_id = "0xDEADBEEF",
+    });
+    var resigned = (try sig_store.get(commit_hash)).?;
+    defer resigned.deinit(alloc);
+    try std.testing.expectEqual(SignatureAlgorithm.pgp_rsa, resigned.algorithm);
+
+    try sig_store.remove(commit_hash);
+    try std.testing.expectEqual(@as(?Signature, null), try sig_store.get(commit_hash));
+}
+
+test "signing a commit does not change its hash" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const sig_store = CommitSignatureStore.init(alloc, tfs.fs(), "signatures");
+    const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    var b = CommitBuilder.init(alloc, snapshot_hash);
+    defer b.deinit();
+    _ = b.author("Dev A", "a@merk.dev", 1_000);
+    _ = b.intent(.security);
+    _ = b.title("signed commit");
+    _ = b.changeId([_]u8{0x11} ** 16);
+    const hash_before = try b.write(&store);
+
+    try sig_store.attach(hash_before, .{
+        .algorithm = .ssh_ed25519,
+        .bytes = "sig-bytes",
+        .key_id = "key-1",
+    });
+
+    // Re-deriving the exact same commit content (same explicit
+    // change_id) yields the exact same hash, signature or not — the
+    // signature was never an input to it.
+    var b2 = CommitBuilder.init(alloc, snapshot_hash);
+    defer b2.deinit();
+    _ = b2.author("Dev A", "a@merk.dev", 1_000);
+    _ = b2.intent(.security);
+    _ = b2.title("signed commit");
+    _ = b2.changeId([_]u8{0x11} ** 16);
+    const hash_again = try b2.write(&store);
+
+    try std.testing.expectEqualSlices(u8, &hash_before, &hash_again);
 }
 
 test "wrong object type returns error" {
@@ -640,7 +982,7 @@ test "commit with a normal parent" {
 
     var root_b = CommitBuilder.init(alloc, snapshot_hash);
     defer root_b.deinit();
-    _ = root_b.author("Alan Turing", "alan@nodus.dev", 1_000);
+    _ = root_b.author("Alan Turing", "alan@merk.dev", 1_000);
     _ = root_b.intent(.feature);
     _ = root_b.title("root");
     const parent_hash = try root_b.write(&store);
@@ -648,7 +990,7 @@ test "commit with a normal parent" {
     var child_b = CommitBuilder.init(alloc, snapshot_hash);
     defer child_b.deinit();
     _ = try child_b.parent(parent_hash);
-    _ = child_b.author("Alan Turing", "alan@nodus.dev", 2_000);
+    _ = child_b.author("Alan Turing", "alan@merk.dev", 2_000);
     _ = child_b.intent(.feature);
     _ = child_b.title("second");
     _ = try child_b.trailer("cherry-picked", "abc1234");
@@ -676,14 +1018,14 @@ test "commit records why a parent edge exists: merge and cherry-pick" {
     const store = Store.init(alloc, tfs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
-    const base_hash = try testCommit(alloc, &store, snapshot_hash, "Dev A", "a@nodus.dev", 1, "base");
-    const branch_hash = try testCommit(alloc, &store, snapshot_hash, "Dev B", "b@nodus.dev", 2, "branch");
+    const base_hash = try testCommit(alloc, &store, snapshot_hash, "Dev A", "a@merk.dev", 1, "base");
+    const branch_hash = try testCommit(alloc, &store, snapshot_hash, "Dev B", "b@merk.dev", 2, "branch");
 
     var merge_b = CommitBuilder.init(alloc, snapshot_hash);
     defer merge_b.deinit();
     _ = try merge_b.parentWithKind(base_hash, .normal);
     _ = try merge_b.parentWithKind(branch_hash, .merge);
-    _ = merge_b.author("Dev C", "c@nodus.dev", 3);
+    _ = merge_b.author("Dev C", "c@merk.dev", 3);
     _ = merge_b.intent(.chore);
     _ = merge_b.title("merge branch");
     const merge_hash = try merge_b.write(&store);
@@ -706,14 +1048,14 @@ test "parentsWithKind adds several parents sharing one kind" {
     const store = Store.init(alloc, tfs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
-    const a_hash = try testCommit(alloc, &store, snapshot_hash, "Dev A", "a@nodus.dev", 1, "a");
-    const b_hash = try testCommit(alloc, &store, snapshot_hash, "Dev B", "b@nodus.dev", 2, "b");
-    const c_hash = try testCommit(alloc, &store, snapshot_hash, "Dev C", "c@nodus.dev", 3, "c");
+    const a_hash = try testCommit(alloc, &store, snapshot_hash, "Dev A", "a@merk.dev", 1, "a");
+    const b_hash = try testCommit(alloc, &store, snapshot_hash, "Dev B", "b@merk.dev", 2, "b");
+    const c_hash = try testCommit(alloc, &store, snapshot_hash, "Dev C", "c@merk.dev", 3, "c");
 
     var octopus_b = CommitBuilder.init(alloc, snapshot_hash);
     defer octopus_b.deinit();
     _ = try octopus_b.parentsWithKind(&.{ a_hash, b_hash, c_hash }, .merge);
-    _ = octopus_b.author("Dev D", "d@nodus.dev", 4);
+    _ = octopus_b.author("Dev D", "d@merk.dev", 4);
     _ = octopus_b.intent(.chore);
     _ = octopus_b.title("octopus merge");
     const octopus_hash = try octopus_b.write(&store);
@@ -739,7 +1081,7 @@ test "CommitBuilder rejects a commit with an unset (zero) snapshot" {
 
     var b = CommitBuilder.init(alloc, hash_mod.zero_hash);
     defer b.deinit();
-    _ = b.author("No Snapshot", "nosnap@nodus.dev", 1);
+    _ = b.author("No Snapshot", "nosnap@merk.dev", 1);
     _ = b.intent(.chore);
     _ = b.title("no snapshot");
 
@@ -772,7 +1114,7 @@ test "CommitBuilder rejects a commit with no title" {
 
     var b = CommitBuilder.init(alloc, snapshot_hash);
     defer b.deinit();
-    _ = b.author("No Title", "notitle@nodus.dev", 1);
+    _ = b.author("No Title", "notitle@merk.dev", 1);
     _ = b.intent(.chore);
 
     try std.testing.expectError(error.MissingTitle, b.write(&store));
@@ -788,8 +1130,63 @@ test "CommitBuilder rejects a commit with no intent" {
 
     var b = CommitBuilder.init(alloc, snapshot_hash);
     defer b.deinit();
-    _ = b.author("No Intent", "nointent@nodus.dev", 1);
+    _ = b.author("No Intent", "nointent@merk.dev", 1);
     _ = b.title("no intent");
 
     try std.testing.expectError(error.MissingIntent, b.write(&store));
+}
+
+test "commit is deterministic given the same explicit change_id" {
+    const alloc = std.testing.allocator;
+
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    const fixed_change_id: ChangeId = [_]u8{0x42} ** 16;
+
+    const make_commit = struct {
+        fn f(s: *const Store, a: std.mem.Allocator, sh: Hash, cid: ChangeId) !Hash {
+            var b = CommitBuilder.init(a, sh);
+            defer b.deinit();
+            _ = b.author("Test User", "test@merk.dev", 42);
+            _ = b.intent(.feature);
+            _ = try b.label("core");
+            _ = try b.label("storage");
+            _ = b.title("msg");
+            _ = b.body("deterministic commit");
+            _ = try b.trailer("closes", "#7");
+            _ = b.changeId(cid);
+            return b.write(s);
+        }
+    }.f;
+
+    const h1 = try make_commit(&store, alloc, snapshot_hash, fixed_change_id);
+    const h2 = try make_commit(&store, alloc, snapshot_hash, fixed_change_id);
+    try std.testing.expectEqualSlices(u8, &h1, &h2);
+}
+
+test "commit is non-deterministic across calls when change_id is left to auto-generate" {
+    const alloc = std.testing.allocator;
+
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    const make_commit = struct {
+        fn f(s: *const Store, a: std.mem.Allocator, sh: Hash) !Hash {
+            var b = CommitBuilder.init(a, sh);
+            defer b.deinit();
+            _ = b.author("Test User", "test@merk.dev", 42);
+            _ = b.intent(.feature);
+            _ = b.title("msg");
+            return b.write(s);
+        }
+    }.f;
+
+    const h1 = try make_commit(&store, alloc, snapshot_hash);
+    const h2 = try make_commit(&store, alloc, snapshot_hash);
+    try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
 }
