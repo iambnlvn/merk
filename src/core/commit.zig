@@ -7,9 +7,11 @@ const Hash = hash_mod.Hash;
 const Store = object.Store;
 
 pub const identity = @import("./commit/identity.zig");
-const CommitIdentityInfo = identity.CommitIdentityInfo;
-const CommitIdentity = identity.CommitIdentity;
-const TimestampedIdentityInfo = identity.TimestampedIdentityInfo;
+const CommitSignaturesInfo = identity.CommitSignaturesInfo;
+const CommitSignatures = identity.CommitSignatures;
+const SignatureInfo = identity.SignatureInfo;
+const PersonInfo = identity.PersonInfo;
+const Timezone = identity.Timezone;
 
 pub const message = @import("./commit/message.zig");
 const Message = message.Message;
@@ -25,8 +27,8 @@ pub const parent = @import("./commit/parent.zig");
 const ParentInfo = parent.ParentInfo;
 
 pub const signature = @import("./commit/signature.zig");
-const SignatureInfo = signature.SignatureInfo;
-const Signature = signature.Signature;
+const CryptoSignatureInfo = signature.SignatureInfo;
+const CryptoSignature = signature.Signature;
 
 pub const COMMIT_MAGIC = 0x4E_4F_44_55;
 
@@ -57,9 +59,11 @@ const CommitInfo = struct {
     snapshot: Hash,
     parents: []const ParentInfo,
 
-    /// Author + optional committer. When committer is null it defaults to
-    /// the author (same person, same timestamp) at serialisation time
-    identity: CommitIdentityInfo,
+    /// Author + committer. Callers who want the committer to mirror the
+    /// author go through `CommitSignaturesInfo.soloAuthor`; callers with a
+    /// genuinely distinct committer go through `.init` — see
+    /// `CommitBuilder.build` below, which picks between the two.
+    identity: CommitSignaturesInfo,
 
     metadata: CommitMetadataInfo = .{},
     message: MessageInfo,
@@ -78,7 +82,7 @@ pub const Commit = struct {
     hash: Hash,
     snapshot: Hash,
     parents: []ParentInfo,
-    identity: CommitIdentity,
+    identity: CommitSignatures,
     metadata: CommitMetadata,
     message: Message,
 
@@ -179,7 +183,7 @@ pub fn read(
     const parents = try parent.deserializeAllAlloc(alloc, &reader);
     errdefer alloc.free(parents);
 
-    var commit_identity = try CommitIdentity.deserialize(alloc, &reader);
+    var commit_identity = try CommitSignatures.deserialize(alloc, &reader);
     errdefer commit_identity.deinit(alloc);
 
     var deserialized_metadata = try CommitMetadataInfo.deserialize(alloc, &reader);
@@ -224,7 +228,7 @@ pub const CommitSignatureStore = struct {
 
     /// Attach (or replace) the signature for `commit_hash`. Doesn't
     /// check that `commit_hash` actually exists in the object store —
-    pub fn attach(self: CommitSignatureStore, commit_hash: Hash, sig: SignatureInfo) !void {
+    pub fn attach(self: CommitSignatureStore, commit_hash: Hash, sig: CryptoSignatureInfo) !void {
         try sig.validate();
 
         var buf = std.Io.Writer.Allocating.init(self.alloc);
@@ -238,7 +242,7 @@ pub const CommitSignatureStore = struct {
 
     /// The signature attached to `commit_hash`, or `null` if it isn't
     /// signed. Caller frees with `.deinit(alloc)`
-    pub fn get(self: CommitSignatureStore, commit_hash: Hash) !?Signature {
+    pub fn get(self: CommitSignatureStore, commit_hash: Hash) !?CryptoSignature {
         const path = try self.sigPath(commit_hash);
         defer self.alloc.free(path);
 
@@ -246,7 +250,7 @@ pub const CommitSignatureStore = struct {
         defer self.alloc.free(bytes);
 
         var reader = std.Io.Reader.fixed(bytes);
-        return try Signature.deserialize(self.alloc, &reader);
+        return try CryptoSignature.deserialize(self.alloc, &reader);
     }
 
     /// Remove a signature, if present. Not an error if `commit_hash`
@@ -375,8 +379,8 @@ pub const CommitBuilder = struct {
     snapshot_root: Hash,
     parents: std.ArrayListUnmanaged(ParentInfo) = .{},
 
-    author_info: ?TimestampedIdentityInfo = null,
-    committer_info: ?TimestampedIdentityInfo = null,
+    author_info: ?SignatureInfo = null,
+    committer_info: ?SignatureInfo = null,
 
     commit_intent: ?Intent = null,
     metadata_timestamp_ms: ?i64 = null,
@@ -463,10 +467,9 @@ pub const CommitBuilder = struct {
         tz_offset_minutes: i16,
     ) *CommitBuilder {
         self.author_info = .{
-            .name = name,
-            .email = email,
-            .timestamp_ms = timestamp_ms,
-            .tz_offset_minutes = tz_offset_minutes,
+            .person = PersonInfo.init(name, email),
+            .timestamp = .{ .value = timestamp_ms },
+            .timezone = .{ .offset = tz_offset_minutes },
         };
         return self;
     }
@@ -491,10 +494,9 @@ pub const CommitBuilder = struct {
         tz_offset_minutes: i16,
     ) *CommitBuilder {
         self.committer_info = .{
-            .name = name,
-            .email = email,
-            .timestamp_ms = timestamp_ms,
-            .tz_offset_minutes = tz_offset_minutes,
+            .person = PersonInfo.init(name, email),
+            .timestamp = .{ .value = timestamp_ms },
+            .timezone = .{ .offset = tz_offset_minutes },
         };
         return self;
     }
@@ -598,16 +600,16 @@ pub const CommitBuilder = struct {
         const author_info = self.author_info orelse return error.MissingAuthor;
         const title_text = self.title_text orelse return error.MissingTitle;
         const commit_intent = self.commit_intent orelse return error.MissingIntent;
-        const meta_ts = self.metadata_timestamp_ms orelse author_info.timestamp_ms;
+        const meta_ts = self.metadata_timestamp_ms orelse author_info.timestamp.resolve();
         const change_id = self.change_id_override orelse metadata.generateChangeId();
 
         return .{
             .snapshot = self.snapshot_root,
             .parents = self.parents.items,
-            .identity = .{
-                .author = author_info,
-                .committer = self.committer_info,
-            },
+            .identity = if (self.committer_info) |committer_info|
+                CommitSignaturesInfo.init(author_info, committer_info)
+            else
+                CommitSignaturesInfo.soloAuthor(author_info),
             .metadata = .{
                 .change_id = change_id,
                 .timestamp_ms = meta_ts,
@@ -677,7 +679,7 @@ test "CommitBuilder.applyRequest populates author, committer default, and traile
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
 
-    try std.testing.expectEqualStrings("Ada Lovelace", c.identity.author.name);
+    try std.testing.expectEqualStrings("Ada Lovelace", c.identity.author.person.name);
     try std.testing.expect(c.identity.isAuthorCommitter());
     try std.testing.expectEqualStrings("via applyRequest", c.message.title);
     try std.testing.expectEqualStrings("#5", c.message.trailer("closes").?);
@@ -707,7 +709,7 @@ test "CommitBuilder.fromRequest is equivalent to init + applyRequest" {
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
 
-    try std.testing.expectEqualStrings("Grace Hopper", c.identity.author.name);
+    try std.testing.expectEqualStrings("Grace Hopper", c.identity.author.person.name);
     try std.testing.expectEqualStrings("via fromRequest", c.message.title);
     try std.testing.expect(c.isRoot());
     try std.testing.expect(!c.isMerge());
@@ -741,12 +743,12 @@ test "commit write and read round-trip" {
     try std.testing.expectEqualSlices(u8, &snapshot_hash, &c.snapshot);
     try std.testing.expectEqual(@as(usize, 0), c.parents.len);
 
-    try std.testing.expectEqualStrings("Bruce Wayne", c.identity.author.name);
-    try std.testing.expectEqualStrings("bruce@wayne.corp", c.identity.author.email);
+    try std.testing.expectEqualStrings("Bruce Wayne", c.identity.author.person.name);
+    try std.testing.expectEqualStrings("bruce@wayne.corp", c.identity.author.person.email);
     try std.testing.expectEqual(@as(i64, 1_700_000_000_000), c.identity.author.timestamp_ms);
-    try std.testing.expectEqual(@as(i16, 0), c.identity.author.tz_offset_minutes);
+    try std.testing.expectEqual(@as(i16, 0), c.identity.author.timezone.minutes());
 
-    try std.testing.expectEqualStrings("Bruce Wayne", c.identity.committer.name);
+    try std.testing.expectEqualStrings("Bruce Wayne", c.identity.committer.person.name);
     try std.testing.expect(c.identity.isAuthorCommitter());
 
     try std.testing.expectEqualStrings("Initial commit", c.message.title);
@@ -785,8 +787,8 @@ test "commit with explicit committer" {
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
 
-    try std.testing.expectEqualStrings("Ada Lovelace", c.identity.author.name);
-    try std.testing.expectEqualStrings("merk Bot", c.identity.committer.name);
+    try std.testing.expectEqualStrings("Ada Lovelace", c.identity.author.person.name);
+    try std.testing.expectEqualStrings("merk Bot", c.identity.committer.person.name);
     try std.testing.expectEqual(@as(i64, 1_000), c.identity.author.timestamp_ms);
     try std.testing.expectEqual(@as(i64, 2_000), c.identity.committer.timestamp_ms);
     try std.testing.expect(!c.identity.isAuthorCommitter());
@@ -811,8 +813,8 @@ test "author/committer with distinct timezone offsets round-trips" {
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
 
-    try std.testing.expectEqual(@as(i16, -300), c.identity.author.tz_offset_minutes);
-    try std.testing.expectEqual(@as(i16, 0), c.identity.committer.tz_offset_minutes);
+    try std.testing.expectEqual(@as(i16, -300), c.identity.author.timezone.minutes());
+    try std.testing.expectEqual(@as(i16, 0), c.identity.committer.timezone.minutes());
 }
 
 test "change_id is generated when unset, and carried forward across a rebase-like rewrite" {
@@ -899,7 +901,7 @@ test "CommitSignatureStore: unsigned commit has no signature, attach/get/remove 
     const commit_hash = try b.write(&store);
 
     // Unsigned by default.
-    try std.testing.expectEqual(@as(?Signature, null), try sig_store.get(commit_hash));
+    try std.testing.expectEqual(@as(?CryptoSignature, null), try sig_store.get(commit_hash));
 
     // The commit's hash is exactly what gets signed — attach doesn't
     // touch or require re-deriving anything from the commit object.
@@ -925,7 +927,7 @@ test "CommitSignatureStore: unsigned commit has no signature, attach/get/remove 
     try std.testing.expectEqual(SignatureAlgorithm.pgp_rsa, resigned.algorithm);
 
     try sig_store.remove(commit_hash);
-    try std.testing.expectEqual(@as(?Signature, null), try sig_store.get(commit_hash));
+    try std.testing.expectEqual(@as(?CryptoSignature, null), try sig_store.get(commit_hash));
 }
 
 test "signing a commit does not change its hash" {
