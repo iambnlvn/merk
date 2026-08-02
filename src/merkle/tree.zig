@@ -3,7 +3,7 @@ const hash_mod = @import("../crypto/crypto.zig").hash;
 const node = @import("node.zig");
 const entry_mod = @import("entry.zig");
 const page_store_mod = @import("page_store.zig");
-const io = @import("merk").io;
+const io = @import("../storage/io.zig");
 
 const Hash = hash_mod.Hash;
 const Entry = entry_mod.Entry;
