@@ -53,13 +53,16 @@ pub const PersonInfo = struct {
     }
 
     pub fn validate(self: PersonInfo) PersonError!void {
+        if (self.name.len == 0) return error.EmptyName;
+        if (self.email.len == 0) return error.EmptyEmail;
+
+        if (self.name.len > std.math.maxInt(u16)) return error.NameTooLong;
+        if (self.email.len > std.math.maxInt(u16)) return error.EmailTooLong;
+
         const t = self.trimmed();
 
         if (t.name.len == 0) return error.EmptyName;
         if (t.email.len == 0) return error.EmptyEmail;
-
-        if (t.name.len > std.math.maxInt(u16)) return error.NameTooLong;
-        if (t.email.len > std.math.maxInt(u16)) return error.EmailTooLong;
 
         if (std.mem.indexOfAny(u8, t.name, &illegal_name_chars) != null)
             return error.NameContainsIllegalCharacters;
@@ -70,11 +73,18 @@ pub const PersonInfo = struct {
         const at_idx = std.mem.indexOfScalar(u8, t.email, '@') orelse
             return error.MissingEmailAtSign;
 
+        // Ensure local part exists and domain part exists
         if (at_idx == 0 or at_idx == t.email.len - 1)
             return error.InvalidEmailBounds;
 
-        if (std.mem.indexOfScalar(u8, t.email[at_idx + 1 ..], '@') != null)
+        // Ensure there is no second '@' and no consecutive dots or empty domain labels right after
+        const domain = t.email[at_idx + 1 ..];
+        if (std.mem.indexOfScalar(u8, domain, '@') != null)
             return error.EmailContainsIllegalCharacters;
+
+        // Optional hardening: ensure domain contains at least one dot for a valid TLD structure
+        if (std.mem.indexOfScalar(u8, domain, '.') == null)
+            return error.InvalidEmailBounds;
     }
 
     /// Trimmed name/email, computed once so `serialize` and `Signature`'s
@@ -824,9 +834,9 @@ test "benchmark timezone parsing: parseInt vs manual ASCII" {
     }
     const elapsed_manual = timer.read();
 
-    std.debug.print("\n--- Timezone Parsing Benchmark ({d} iterations) ---\n", .{iterations});
-    std.debug.print("std.fmt.parseInt : {d} ns total ({d} ns/op)\n", .{ elapsed_parseint, elapsed_parseint / iterations });
-    std.debug.print("Manual ASCII     : {d} ns total ({d} ns/op)\n", .{ elapsed_manual, elapsed_manual / iterations });
+    // std.debug.print("\n--- Timezone Parsing Benchmark ({d} iterations) ---\n", .{iterations});
+    // std.debug.print("std.fmt.parseInt : {d} ns total ({d} ns/op)\n", .{ elapsed_parseint, elapsed_parseint / iterations });
+    // std.debug.print("Manual ASCII     : {d} ns total ({d} ns/op)\n", .{ elapsed_manual, elapsed_manual / iterations });
 
     try std.testing.expect(elapsed_manual < elapsed_parseint);
 }
