@@ -6,6 +6,12 @@ const object = @import("./object/object.zig");
 const Hash = hash_mod.Hash;
 const Store = object.Store;
 
+// Author/committer identity now lives in the shared identity.zig module
+// rather than a commit-local one. Its `SignatureInfo`/`Signature` types
+// (a person + timestamp + timezone) are what `CommitIdentityInfo` /
+// `CommitIdentity` used to be — renamed to `CommitSignaturesInfo` /
+// `CommitSignatures` on that side to make clear they pair an author and
+// a committer, not just one signer.
 pub const identity = @import("./commit/identity.zig");
 const CommitSignaturesInfo = identity.CommitSignaturesInfo;
 const CommitSignatures = identity.CommitSignatures;
@@ -26,6 +32,11 @@ pub const snapshot = @import("./commit/snapshot.zig");
 pub const parent = @import("./commit/parent.zig");
 const ParentInfo = parent.ParentInfo;
 
+// `commit/signature.zig` is the *cryptographic* signature sidecar
+// (algorithm + bytes + key_id) attached to a commit hash after the fact
+// — a completely different concept from identity.zig's `SignatureInfo`/
+// `Signature` (who authored/committed, and when). Bound under `Crypto*`
+// names here so the two don't collide.
 pub const signature = @import("./commit/signature.zig");
 const CryptoSignatureInfo = signature.SignatureInfo;
 const CryptoSignature = signature.Signature;
@@ -453,23 +464,30 @@ pub const CommitBuilder = struct {
 
     /// Author identity with an implicit UTC (`+00:00`) timestamp. Use
     /// `.authorWithTz` to record a non-UTC local offset.
+    ///
+    /// Infallible: a zero offset always resolves to `Timezone.utc` and
+    /// can never fail the range check `.authorWithTz` performs, so this
+    /// convenience wrapper never needs `try`.
     pub fn author(self: *CommitBuilder, name: []const u8, email: []const u8, timestamp_ms: i64) *CommitBuilder {
-        return self.authorWithTz(name, email, timestamp_ms, 0);
+        return self.authorWithTz(name, email, timestamp_ms, 0) catch unreachable;
     }
 
     /// Author identity plus the UTC offset (minutes) `timestamp_ms` was
-    /// recorded in — e.g. `-300` for someone committing from US Eastern
+    /// recorded in — e.g. `-300` for someone committing from US Eastern.
+    /// Fails with `error.InvalidTimezoneOffset` if `tz_offset_minutes`
+    /// falls outside the civil range `Timezone` accepts (see
+    /// `identity.Timezone.min_offset_minutes` / `.max_offset_minutes`).
     pub fn authorWithTz(
         self: *CommitBuilder,
         name: []const u8,
         email: []const u8,
         timestamp_ms: i64,
         tz_offset_minutes: i16,
-    ) *CommitBuilder {
+    ) !*CommitBuilder {
         self.author_info = .{
             .person = PersonInfo.init(name, email),
             .timestamp = .{ .value = timestamp_ms },
-            .timezone = .{ .offset = tz_offset_minutes },
+            .timezone = try Timezone.init(tz_offset_minutes),
         };
         return self;
     }
@@ -479,24 +497,27 @@ pub const CommitBuilder = struct {
     /// existing serialize-time behavior documented on the commit's
     /// identity. Implicit UTC timestamp; use `.committerWithTz` for a
     /// non-UTC local offset.
+    ///
+    /// Infallible for the same reason `.author` is — see its doc comment.
     pub fn committer(self: *CommitBuilder, name: []const u8, email: []const u8, timestamp_ms: i64) *CommitBuilder {
-        return self.committerWithTz(name, email, timestamp_ms, 0);
+        return self.committerWithTz(name, email, timestamp_ms, 0) catch unreachable;
     }
 
     /// Committer identity plus the UTC offset (minutes) `timestamp_ms`
     /// was recorded in — e.g. for a CI bot or a cherry-pick applied
-    /// somewhere other than where the change was authored.
+    /// somewhere other than where the change was authored. Fails the
+    /// same way `.authorWithTz` does for an out-of-range offset.
     pub fn committerWithTz(
         self: *CommitBuilder,
         name: []const u8,
         email: []const u8,
         timestamp_ms: i64,
         tz_offset_minutes: i16,
-    ) *CommitBuilder {
+    ) !*CommitBuilder {
         self.committer_info = .{
             .person = PersonInfo.init(name, email),
             .timestamp = .{ .value = timestamp_ms },
-            .timezone = .{ .offset = tz_offset_minutes },
+            .timezone = try Timezone.init(tz_offset_minutes),
         };
         return self;
     }
@@ -567,14 +588,14 @@ pub const CommitBuilder = struct {
     /// resolution is specific to them. Prefer `CommitBuilder.fromRequest`
     /// when the snapshot root is already resolved at construction time
     pub fn applyRequest(self: *CommitBuilder, request: CommitRequest) !*CommitBuilder {
-        _ = self.authorWithTz(
+        _ = try self.authorWithTz(
             request.author_name,
             request.author_email,
             request.author_timestamp_ms,
             request.author_tz_offset_minutes,
         );
         if (request.committer_name) |name| {
-            _ = self.committerWithTz(
+            _ = try self.committerWithTz(
                 name,
                 request.committer_email orelse request.author_email,
                 request.committer_timestamp_ms orelse request.author_timestamp_ms,
@@ -803,8 +824,8 @@ test "author/committer with distinct timezone offsets round-trips" {
 
     var b = CommitBuilder.init(alloc, snapshot_hash);
     defer b.deinit();
-    _ = b.authorWithTz("Dev A", "a@merk.dev", 1_000, -300); // US Eastern
-    _ = b.committerWithTz("CI Bot", "ci@merk.dev", 1_500, 0); // UTC
+    _ = try b.authorWithTz("Dev A", "a@merk.dev", 1_000, -300); // US Eastern
+    _ = try b.committerWithTz("CI Bot", "ci@merk.dev", 1_500, 0); // UTC
     _ = b.intent(.ci);
     _ = b.title("apply patch via bot");
 
@@ -815,6 +836,31 @@ test "author/committer with distinct timezone offsets round-trips" {
 
     try std.testing.expectEqual(@as(i16, -300), c.identity.author.timezone.minutes());
     try std.testing.expectEqual(@as(i16, 0), c.identity.committer.timezone.minutes());
+}
+
+test "authorWithTz/committerWithTz reject a tz offset outside the civil range" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+    const store = Store.init(alloc, tfs.fs(), "objects");
+    const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
+
+    var b = CommitBuilder.init(alloc, snapshot_hash);
+    defer b.deinit();
+
+    // +18:00 isn't a real UTC offset — Timezone's civil range tops out
+    // at +14:00 (Kiribati). This used to be silently accepted and only
+    // surface (if at all) when something downstream tried to format it.
+    try std.testing.expectError(
+        error.InvalidTimezoneOffset,
+        b.authorWithTz("Dev A", "a@merk.dev", 1_000, 18 * 60),
+    );
+
+    _ = b.author("Dev A", "a@merk.dev", 1_000);
+    try std.testing.expectError(
+        error.InvalidTimezoneOffset,
+        b.committerWithTz("Dev B", "b@merk.dev", 1_000, -13 * 60),
+    );
 }
 
 test "change_id is generated when unset, and carried forward across a rebase-like rewrite" {
