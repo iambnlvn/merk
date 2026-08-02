@@ -1136,6 +1136,8 @@ const Region = struct {
     len: usize,
 };
 
+const HISTOGRAM_MAX_CHAIN: usize = 64;
+
 fn histogramFindRegion(
     alloc: std.mem.Allocator,
     old: []const []const u8,
@@ -1145,26 +1147,44 @@ fn histogramFindRegion(
     new_lo: usize,
     new_hi: usize,
 ) !?Region {
-    var freq_map = std.StringHashMap(u32).init(alloc);
-    defer freq_map.deinit();
+    // A line whose chain exceeds HISTOGRAM_MAX_CHAIN is capped: we still
+    // count occurrences (so it's correctly deprioritized/skipped below)
+    // but we stop recording positions for it, since a line that common
+    // is never going to win as an anchor and walking its full position
+    // list would reintroduce the O(N·M) blowup this replaces
+    var positions = std.StringHashMap(std.ArrayList(usize)).init(alloc);
+    defer {
+        var it = positions.valueIterator();
+        while (it.next()) |list| list.deinit(alloc);
+        positions.deinit();
+    }
+    var overflowed = std.StringHashMap(void).init(alloc);
+    defer overflowed.deinit();
 
     for (old_lo..old_hi) |i| {
-        const gop = try freq_map.getOrPut(old[i]);
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* += 1;
+        if (overflowed.contains(old[i])) continue;
+        const gop = try positions.getOrPut(old[i]);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        if (gop.value_ptr.items.len >= HISTOGRAM_MAX_CHAIN) {
+            gop.value_ptr.deinit(alloc);
+            _ = positions.remove(old[i]);
+            try overflowed.put(old[i], {});
+            continue;
+        }
+        try gop.value_ptr.append(alloc, i);
     }
 
     var best: ?Region = null;
-    var best_freq: u32 = std.math.maxInt(u32);
+    var best_freq: usize = std.math.maxInt(usize);
     var best_len: usize = 0;
 
     for (new_lo..new_hi) |nj| {
-        const freq = freq_map.get(new[nj]) orelse continue;
+        if (overflowed.contains(new[nj])) continue;
+        const list = positions.getPtr(new[nj]) orelse continue;
+        const freq = list.items.len;
         if (freq > best_freq) continue;
 
-        for (old_lo..old_hi) |oi| {
-            if (!lineEq(old[oi], new[nj])) continue;
-
+        for (list.items) |oi| {
             var back: usize = 0;
             while (oi >= old_lo + back + 1 and
                 nj >= new_lo + back + 1 and
