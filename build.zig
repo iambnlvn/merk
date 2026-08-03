@@ -308,10 +308,13 @@ pub fn build(b: *std.Build) void {
     const diff_render_step = addModuleTest(b, "test-diff-render", "Run diff render unit tests", "src/core/diff/diff_render.zig", target, optimize, mod);
 
     const diff_step = b.step("test-diff", "Run all diff module tests");
+    const repo_step = addModuleTest(b, "test-repo", "Run repo unit tests", "src/core/repository.zig", target, optimize, mod);
+
     diff_step.dependOn(diff_algorithms_step);
     diff_step.dependOn(diff_snapshot_step);
     diff_step.dependOn(diff_render_step);
     test_step.dependOn(diff_step);
+    test_step.dependOn(repo_step);
 }
 
 /// Helper function to loop through a slice of test suites, register individual steps,
