@@ -1,5 +1,7 @@
 const std = @import("std");
-const nodus = @import("nodus");
+const merk = @import("merk");
+
+const repo_context = @import("repo_context.zig");
 
 const cli = @import("../cli/command.zig");
 const Command = cli.Command;
@@ -7,10 +9,12 @@ const Invocation = cli.Invocation;
 const Context = cli.Context;
 
 pub fn run(ctx: Context, inv: *Invocation) !void {
-    var index = try nodus.index.Index.init(inv.alloc, ctx.repo_root);
-    defer index.deinit();
+    _ = inv;
 
-    try index.load();
+    const opened = try repo_context.open(ctx);
+    defer opened.deinit(ctx.alloc);
+
+    const index = &opened.repo.index;
 
     if (index.entries.items.len == 0) {
         std.debug.print("index empty\n", .{});
@@ -18,8 +22,8 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     }
 
     for (index.entries.items) |entry| {
-        const state = try index.stateOf(ctx.repo_root, entry);
-        const short = nodus.hash.shortHex(entry.blob_hash);
+        const state = try index.stateOf(opened.repo.root, entry);
+        const short = merk.crypto.hash.shortHex(entry.blob_hash);
 
         std.debug.print(
             "{s: <8} {s} {s}\n",
