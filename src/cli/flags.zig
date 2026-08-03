@@ -7,21 +7,22 @@ pub fn parseEnum(comptime T: type, raw: []const u8) ?T {
 }
 
 pub fn parseBool(raw: []const u8) ?bool {
-    if (std.mem.eql(u8, raw, "1") or
-        std.ascii.eqlIgnoreCase(raw, "true") or
-        std.ascii.eqlIgnoreCase(raw, "yes") or
-        std.ascii.eqlIgnoreCase(raw, "on")) return true;
+    const true_values = .{ "1", "true", "yes", "on" };
+    const false_values = .{ "0", "false", "no", "off" };
 
-    if (std.mem.eql(u8, raw, "0") or
-        std.ascii.eqlIgnoreCase(raw, "false") or
-        std.ascii.eqlIgnoreCase(raw, "no") or
-        std.ascii.eqlIgnoreCase(raw, "off")) return false;
+    inline for (true_values) |val| {
+        if (std.ascii.eqlIgnoreCase(raw, val)) return true;
+    }
+
+    inline for (false_values) |val| {
+        if (std.ascii.eqlIgnoreCase(raw, val)) return false;
+    }
 
     return null;
 }
 
 pub fn parseUnsigned(comptime T: type, raw: []const u8) ?T {
-    return std.fmt.parseInt(T, raw, 10) catch null;
+    return std.fmt.parseUnsigned(T, raw, 10) catch null;
 }
 
 pub fn parseInt(comptime T: type, raw: []const u8) ?T {
