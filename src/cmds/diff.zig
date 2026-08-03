@@ -1,6 +1,10 @@
 const std = @import("std");
-const nodus = @import("nodus");
-const diff = nodus.diff;
+const merk = @import("merk");
+const diff_mod = @import("../core/diff.zig");
+const diff_algorithms = diff_mod.diff_algorithms;
+const diff_snapshot = diff_mod.diff_snapshot;
+const diff_render = diff_mod.diff_render;
+const repo_context = @import("repo_context.zig");
 const cli = @import("../cli/command.zig");
 const Command = cli.Command;
 const Flag = cli.Flag;
@@ -18,8 +22,8 @@ const ColorMode = enum {
 
 const Profile = enum { review, ci, debug };
 
-fn parseFormat(s: []const u8) ?diff.Format {
-    const map = std.StaticStringMap(diff.Format).initComptime(.{
+fn parseFormat(s: []const u8) ?diff_render.Format {
+    const map = std.StaticStringMap(diff_render.Format).initComptime(.{
         .{ "unified", .unified },
         .{ "side-by-side", .side_by_side },
         .{ "blocks", .blocks },
@@ -29,8 +33,8 @@ fn parseFormat(s: []const u8) ?diff.Format {
     return map.get(s);
 }
 
-fn parseLevel(s: []const u8) ?diff.Level {
-    const map = std.StaticStringMap(diff.Level).initComptime(.{
+fn parseLevel(s: []const u8) ?diff_render.Level {
+    const map = std.StaticStringMap(diff_render.Level).initComptime(.{
         .{ "file", .file },
         .{ "hunk", .hunk },
         .{ "line", .line },
@@ -39,7 +43,7 @@ fn parseLevel(s: []const u8) ?diff.Level {
     return map.get(s);
 }
 
-fn parseContext(s: []const u8) ?diff.Context {
+fn parseContext(s: []const u8) ?diff_render.Context {
     if (std.mem.eql(u8, s, "minimal")) return .minimal;
     if (std.mem.eql(u8, s, "normal")) return .normal;
     if (std.mem.eql(u8, s, "full")) return .full;
@@ -47,8 +51,8 @@ fn parseContext(s: []const u8) ?diff.Context {
     return .{ .exact = n };
 }
 
-fn parseGroupBy(s: []const u8) ?diff.GroupBy {
-    const map = std.StaticStringMap(diff.GroupBy).initComptime(.{
+fn parseGroupBy(s: []const u8) ?diff_render.GroupBy {
+    const map = std.StaticStringMap(diff_render.GroupBy).initComptime(.{
         .{ "none", .none },
         .{ "files", .files },
         .{ "dirs", .dirs },
@@ -56,8 +60,8 @@ fn parseGroupBy(s: []const u8) ?diff.GroupBy {
     return map.get(s);
 }
 
-fn parseAlgorithm(s: []const u8) ?diff.Algorithm {
-    const map = std.StaticStringMap(diff.Algorithm).initComptime(.{
+fn parseAlgorithm(s: []const u8) ?diff_algorithms.Algorithm {
+    const map = std.StaticStringMap(diff_algorithms.Algorithm).initComptime(.{
         .{ "myers", .myers },
         .{ "patience", .patience },
         .{ "histogram", .histogram },
@@ -82,7 +86,7 @@ fn resolveColor(mode: ColorMode, stdout_is_tty: bool) bool {
     };
 }
 
-fn applyProfile(p: Profile, config: *diff.RenderConfig) void {
+fn applyProfile(p: Profile, config: *diff_render.RenderConfig) void {
     switch (p) {
         .review => {
             config.format = .side_by_side;
@@ -101,7 +105,7 @@ fn applyProfile(p: Profile, config: *diff.RenderConfig) void {
 }
 
 pub fn run(ctx: Context, inv: *Invocation) !void {
-    var config = diff.RenderConfig{};
+    var config = diff_render.RenderConfig{};
     var color_mode: ColorMode = .auto;
 
     if (inv.flags.string("format")) |v|
@@ -146,7 +150,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         config.filter = .{ .show_added = false, .show_deleted = false, .show_modified = true };
 
     if (inv.flags.string("show")) |v|
-        config.filter = diff.ChangeFilter.parse(v) catch {
+        config.filter = diff_render.ChangeFilter.parse(v) catch {
             std.debug.print("error: invalid --show value '{s}'\n", .{v});
             return error.InvalidChangeFilter;
         };
@@ -182,7 +186,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
             const trimmed = std.mem.trim(u8, part, " \t");
             if (trimmed.len == 0) continue;
 
-            nodus.hash.parseHexPrefix(trimmed) catch {
+            merk.crypto.hash.parseHexPrefix(trimmed) catch {
                 std.debug.print("error: invalid --rev '{s}' (expected 8-64 hex chars)\n", .{trimmed});
                 return error.InvalidRev;
             };
@@ -213,21 +217,21 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
     const paths = inv.positional.items;
 
-    var store = try nodus.object.Store.init(inv.alloc, ctx.repo_root);
-    defer store.deinit();
+    const opened = try repo_context.open(ctx);
+    defer opened.deinit(ctx.alloc);
 
-    var nodus_dir = try std.fs.cwd().openDir(".nodus", .{});
-    defer nodus_dir.close();
-    var page_store = nodus.index.PageStore{ .alloc = inv.alloc, .dir = nodus_dir };
-
-    // Resolve rev strings (full or short hashes) to actual Hash objects
-    var revs: std.ArrayListUnmanaged(nodus.hash.Hash) = .empty;
+    // Resolve rev strings (full or short hashes) to actual Hash objects.
+    // --rev refers to *commits* (see the flag help text), so these are
+    // commit hashes, not snapshot/index-tree roots — that distinction
+    // matters below, since diff_snapshot's commit-level helpers resolve
+    // a commit to its snapshot root themselves.
+    var revs: std.ArrayListUnmanaged(merk.crypto.hash.Hash) = .empty;
     defer revs.deinit(inv.alloc);
 
     for (rev_strs.items) |rev_str| {
-        const h = nodus.hash.fromHex(rev_str) catch {
+        const h = merk.crypto.hash.fromHex(rev_str) catch {
             // Not a full hash: resolve the short hash prefix against the object store
-            const resolved = store.resolveHashPrefix(rev_str) catch |e| {
+            const resolved = opened.repo.store.resolveHashPrefix(rev_str) catch |e| {
                 switch (e) {
                     error.Ambiguous => std.debug.print("error: ambiguous --rev '{s}' (matches multiple objects)\n", .{rev_str}),
                     error.NotFound => std.debug.print("error: --rev '{s}' not found\n", .{rev_str}),
@@ -246,17 +250,17 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     const writer = &stdout_writer.interface;
 
     if (revs.items.len > 0) {
-        var cd: diff.CommitDiff = if (revs.items.len == 1)
-            try diff.diffCommitAgainstParentFromIndexRoot(inv.alloc, &store, &page_store, revs.items[0], config.algorithm)
+        var cd: diff_algorithms.CommitDiff = if (revs.items.len == 1)
+            try diff_snapshot.diffCommitAgainstParent(inv.alloc, &opened.repo.store, &opened.repo.page_store, revs.items[0], config.algorithm)
         else
-            try diff.diffCommitsFromIndexRoots(inv.alloc, &store, &page_store, revs.items[0], revs.items[1], config.algorithm);
+            try diff_snapshot.diffCommits(inv.alloc, &opened.repo.store, &opened.repo.page_store, revs.items[0], revs.items[1], config.algorithm);
         defer cd.deinit(inv.alloc);
 
-        var visible: std.ArrayListUnmanaged(*const diff.FileDiff) = .empty;
+        var visible: std.ArrayListUnmanaged(*const diff_algorithms.FileDiff) = .empty;
         defer visible.deinit(inv.alloc);
 
         for (cd.files) |*fd| {
-            if (!config.filter.allows(diff.fileStatus(fd))) continue;
+            if (!config.filter.allows(diff_render.fileStatus(fd))) continue;
 
             if (paths.len > 0) {
                 const included = for (paths) |p| {
@@ -271,7 +275,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         if (visible.items.len == 0) return;
 
         if (config.group_by == .dirs) {
-            const groups = try diff.groupByDirectory(inv.alloc, visible.items);
+            const groups = try diff_render.groupByDirectory(inv.alloc, visible.items);
             defer {
                 for (groups) |g| inv.alloc.free(g.files);
                 inv.alloc.free(groups);
@@ -284,21 +288,20 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
             }
         } else {
             for (visible.items) |fd|
-                try diff.renderFileDiff(writer, fd, config);
+                try diff_render.renderFileDiff(writer, fd, config);
         }
 
         try writer.flush();
         return;
     }
 
-    // No --rev given: existing working-tree-vs-index behavior, unchanged
-    var index = try nodus.index.Index.init(inv.alloc, ctx.repo_root);
-    defer index.deinit();
-    try index.load();
+    // No --rev given: existing working-tree-vs-index behavior, unchanged.
+    // Index was already loaded by Repository.open.
+    const index = &opened.repo.index;
 
     const cwd = std.fs.cwd();
 
-    var file_diffs: std.ArrayListUnmanaged(diff.FileDiff) = .empty;
+    var file_diffs: std.ArrayListUnmanaged(diff_algorithms.FileDiff) = .empty;
     var source_buffers: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
         for (file_diffs.items) |*fd| fd.deinit(inv.alloc);
@@ -308,20 +311,20 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     }
 
     for (index.entries.items) |entry| {
-        const state = try index.stateOf(ctx.repo_root, entry);
+        const state = try index.stateOf(opened.repo.root, entry);
         if (state == .clean) continue;
 
-        const obj = try store.get(entry.blob_hash);
+        const obj = try opened.repo.store.get(entry.blob_hash);
         try source_buffers.append(inv.alloc, obj.payload);
 
-        var fd: diff.FileDiff = if (state == .deleted)
-            try diff.diffFileWith(inv.alloc, entry.path, obj.payload, "", config.algorithm)
+        var fd: diff_algorithms.FileDiff = if (state == .deleted)
+            try diff_algorithms.diffFileWith(inv.alloc, entry.path, obj.payload, "", config.algorithm)
         else blk: {
             var file = try cwd.openFile(entry.path, .{});
             defer file.close();
             const new_src = try file.readToEndAlloc(inv.alloc, 64 * 1024 * 1024);
             try source_buffers.append(inv.alloc, new_src);
-            break :blk try diff.diffFileWith(inv.alloc, entry.path, obj.payload, new_src, config.algorithm);
+            break :blk try diff_algorithms.diffFileWith(inv.alloc, entry.path, obj.payload, new_src, config.algorithm);
         };
 
         if (fd.line_deltas.len != 0) {
@@ -333,11 +336,11 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
     if (file_diffs.items.len == 0) return;
 
-    var visible: std.ArrayListUnmanaged(*const diff.FileDiff) = .empty;
+    var visible: std.ArrayListUnmanaged(*const diff_algorithms.FileDiff) = .empty;
     defer visible.deinit(inv.alloc);
 
     for (file_diffs.items) |*fd| {
-        if (!config.filter.allows(diff.fileStatus(fd))) continue;
+        if (!config.filter.allows(diff_render.fileStatus(fd))) continue;
 
         if (paths.len > 0) {
             const included = for (paths) |p| {
@@ -352,7 +355,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     if (visible.items.len == 0) return;
 
     if (config.group_by == .dirs) {
-        const groups = try diff.groupByDirectory(inv.alloc, visible.items);
+        const groups = try diff_render.groupByDirectory(inv.alloc, visible.items);
         defer {
             for (groups) |g| inv.alloc.free(g.files);
             inv.alloc.free(groups);
@@ -365,7 +368,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         }
     } else {
         for (visible.items) |fd|
-            try diff.renderFileDiff(writer, fd, config);
+            try diff_render.renderFileDiff(writer, fd, config);
     }
 
     try writer.flush();
