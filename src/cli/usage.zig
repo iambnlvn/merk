@@ -1,27 +1,33 @@
 const std = @import("std");
 const registry = @import("registry.zig");
 
-pub fn print() void {
-    var stderr_buf: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
-    const w = &stderr_writer.interface;
-
+pub fn print(w: *std.Io.Writer) void {
     w.writeAll(
-        \\usage:
-        \\  nodus <command> [options] [args]
+        \\merk — a content-addressed version control system
         \\
-        \\commands:
+        \\Usage
+        \\  merk <command> [options] [arguments]
+        \\
+        \\Common commands
         \\
     ) catch return;
 
     for (registry.commands) |cmd| {
-        w.print("  {s: <14} {s}\n", .{ cmd.name, cmd.description }) catch return;
+        w.print("  {s:<16} {s}\n", .{ cmd.name, cmd.description }) catch return;
     }
 
     w.writeAll(
         \\
-        \\Run `nodus <command> --help` for command-specific options.
+        \\Examples
+        \\  merk init
+        \\  merk snapshot --all
+        \\  merk commit -m "Initial import"
+        \\  merk history
+        \\  merk status
         \\
+        \\merk 0.1.0
+        \\
+        \\Run `merk help <command>` for detailed documentation.
     ) catch return;
 
     w.flush() catch {};
