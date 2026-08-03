@@ -267,7 +267,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    b.installArtifact(exe);
+    const install_exe = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{
+        .custom = "../dist",
+    } } });
+
+    b.getInstallStep().dependOn(&install_exe.step);
 
     // Run application step
     const run_step = b.step("run", "Run the app");
