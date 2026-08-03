@@ -1,17 +1,20 @@
 const std = @import("std");
-const nodus = @import("nodus");
+const merk = @import("merk");
 
 const cli = @import("../cli/command.zig");
 const flags = @import("../cli/flags.zig");
 const Command = cli.Command;
 const Invocation = cli.Invocation;
 
-const commit_mod = nodus.commit;
-const Intent = commit_mod.commitMetadata.Intent;
-const TrailerInfo = commit_mod.message.TrailerInfo;
-const TimestampedIdentityInfo = commit_mod.identity.TimestampedIdentityInfo;
+const repo_context = @import("repo_context.zig");
+const commit_mod = @import("../core/commit.zig");
+const metadata_mod = @import("../core/commit/metadata.zig");
+const message_mod = @import("../core/commit/message.zig");
 
-const refs = nodus.refs;
+const Intent = metadata_mod.Intent;
+const IntentTag = metadata_mod.IntentTag;
+const TrailerInfo = message_mod.TrailerInfo;
+const CommitRequest = commit_mod.CommitRequest;
 
 const context = @import("../cli/context.zig");
 const Context = context.Context;
@@ -49,6 +52,24 @@ fn parseTimestamp(raw: []const u8) ?i64 {
     }
 
     return null;
+}
+
+fn parseIntent(raw: []const u8) Intent {
+    const tag = std.meta.stringToEnum(IntentTag, raw) orelse return Intent.initCustom(raw);
+    return switch (tag) {
+        .feature => .feature,
+        .fix => .fix,
+        .refactor => .refactor,
+        .docs => .docs,
+        .@"test" => .@"test",
+        .performance => .performance,
+        .security => .security,
+        .build => .build,
+        .ci => .ci,
+        .release => .release,
+        .chore => .chore,
+        .custom => Intent.initCustom(raw),
+    };
 }
 
 /// Scan the body for git-style trailers at the tail.
@@ -147,23 +168,15 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     }
 
     const intent_raw = inv.flags.string("intent") orelse "feature";
-    const intent = flags.parseEnum(Intent, intent_raw) orelse {
-        std.debug.print(
-            "error: unknown intent '{s}'. valid values: " ++
-                "feature, fix, refactor, docs, test, performance, " ++
-                "security, build, ci, release, chore\n",
-            .{intent_raw},
-        );
-        return error.UnknownIntent;
-    };
+    const intent = parseIntent(intent_raw);
 
     const author_name = inv.flags.string("author") orelse
-        std.posix.getenv("NODUS_AUTHOR_NAME") orelse
+        std.posix.getenv("merk_AUTHOR_NAME") orelse
         std.posix.getenv("USER") orelse
         "unknown";
 
     const author_email = inv.flags.string("author-email") orelse
-        std.posix.getenv("NODUS_AUTHOR_EMAIL") orelse
+        std.posix.getenv("merk_AUTHOR_EMAIL") orelse
         "unknown@local";
 
     const author_date: i64 = blk: {
@@ -177,31 +190,24 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         };
     };
 
-    const committer: ?TimestampedIdentityInfo = blk: {
-        const cn = inv.flags.string("committer") orelse inv.flags.string("committer-name");
-        const ce = inv.flags.string("committer-email");
-        const cd_raw = inv.flags.string("committer-date");
+    // Committer fields, only if the caller actually passed one of the
+    // --committer* flags — otherwise CommitRequest mirrors committer from
+    // author (same "committer defaults to author" behavior the old code
+    // had, just resolved by the request layer now instead of here).
+    const committer_name = inv.flags.string("committer") orelse inv.flags.string("committer-name");
+    const committer_email = inv.flags.string("committer-email");
+    const committer_date_raw = inv.flags.string("committer-date");
 
-        // If none of the committer flags are present, leave as null (= mirrors author).
-        if (cn == null and ce == null and cd_raw == null) break :blk null;
-
-        const committer_date: i64 = if (cd_raw) |raw|
-            parseTimestamp(raw) orelse {
-                std.debug.print(
-                    "error: cannot parse committer-date '{s}' — use Unix-ms or YYYY-MM-DD\n",
-                    .{raw},
-                );
-                return error.BadDate;
-            }
-        else
-            0;
-
-        break :blk TimestampedIdentityInfo{
-            .name = cn orelse author_name,
-            .email = ce orelse author_email,
-            .timestamp_ms = committer_date,
-        };
-    };
+    const committer_timestamp_ms: ?i64 = if (committer_date_raw) |raw|
+        parseTimestamp(raw) orelse {
+            std.debug.print(
+                "error: cannot parse committer-date '{s}' — use Unix-ms or YYYY-MM-DD\n",
+                .{raw},
+            );
+            return error.BadDate;
+        }
+    else
+        null;
 
     const label_raw = inv.flags.string("label");
 
@@ -279,86 +285,57 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         }
     }
 
-    var store = try nodus.object.Store.init(inv.alloc, ctx.repo_root);
-    defer store.deinit();
+    const opened = try repo_context.open(ctx);
+    defer opened.deinit(ctx.alloc);
 
-    var index = try nodus.index.Index.init(inv.alloc, ctx.repo_root);
-    defer index.deinit();
-
-    try index.load();
-
-    if (index.entries.items.len == 0) {
-        std.debug.print("error: nothing to commit (index is empty — run `nodus add <path>` first)\n", .{});
+    if (opened.repo.index.entries.items.len == 0) {
+        std.debug.print("error: nothing to commit (index is empty — run `merk add <path>` first)\n", .{});
         return error.NothingToCommit;
     }
 
-    var nodus_dir = try std.fs.cwd().openDir(".nodus", .{});
-    defer nodus_dir.close();
-
-    const maybe_head = try refs.resolveHead(inv.alloc, nodus_dir);
-    const parents: []const nodus.hash.Hash = if (maybe_head) |h| &.{h} else &.{};
-
-    try index.save();
-    const index_root = index.index_root;
-
+    // Same "staged tree identical to HEAD" guard the old code had. History
+    // may also independently reject a no-op commit (per project notes,
+    // duplicate-commit detection was added at that layer) — this check
+    // just gets a friendlier, specific message out before that happens.
+    const maybe_head = try opened.repo.ref_store.readTrack(opened.repo.current_track);
     if (maybe_head) |head_hash| {
-        var parent_c = try commit_mod.read(inv.alloc, &store, head_hash);
+        var parent_c = try commit_mod.read(inv.alloc, &opened.repo.store, head_hash);
         defer parent_c.deinit(inv.alloc);
 
-        if (std.mem.eql(u8, &parent_c.snapshot.tree, &index_root)) {
+        if (std.mem.eql(u8, &parent_c.snapshot, &opened.repo.index.index_root)) {
             std.debug.print(
-                "error: nothing to commit — staged tree is identical to HEAD (stage changes with `nodus add` first)\n",
+                "error: nothing to commit — staged tree is identical to HEAD (stage changes with `merk add` first)\n",
                 .{},
             );
             return error.NothingToCommit;
         }
     }
 
-    const commit_hash = try commit_mod.write(
-        inv.alloc,
-        &store,
-        .{
-            .snapshot = .{
-                .tree = index_root,
-                .parents = parents,
-            },
-            .identity = .{
-                .author = .{
-                    .name = author_name,
-                    .email = author_email,
-                    .timestamp_ms = author_date,
-                },
-                .committer = committer,
-            },
-            .metadata = .{
-                .timestamp_ms = 0,
-                .intent = intent,
-                .labels = label_list.items,
-            },
-            .message = .{
-                .title = title_raw,
-                .body = body,
-                .trailers = trailer_list.items,
-            },
-        },
-    );
-    const branch = try refs.headBranch(inv.alloc, nodus_dir) orelse blk: {
-        try refs.writeHeadRef(nodus_dir, "main");
-        break :blk try inv.alloc.dupe(u8, "main");
-    };
-    defer inv.alloc.free(branch);
+    const commit_hash = try opened.repo.commit(.{
+        .author_name = author_name,
+        .author_email = author_email,
+        .author_timestamp_ms = author_date,
+        .committer_name = committer_name,
+        .committer_email = committer_email,
+        .committer_timestamp_ms = committer_timestamp_ms,
+        .intent = intent,
+        .title = title_raw,
+        .body = body,
+        .trailers = trailer_list.items,
+        .labels = label_list.items,
+    });
 
-    try refs.updateRef(inv.alloc, nodus_dir, branch, commit_hash);
-    const short = nodus.hash.shortHex(commit_hash);
+    const track_name = opened.repo.current_track.raw;
+    const short = merk.crypto.hash.shortHex(commit_hash);
 
     std.debug.print("✓ Commit created\n\n", .{});
 
     std.debug.print("  Hash      {s}\n", .{short});
-    std.debug.print("  Branch    {s}\n", .{branch});
-    if (parents.len == 0) {
+    std.debug.print("  Track     {s}\n", .{track_name});
+    if (maybe_head == null) {
         std.debug.print("  Type      root commit\n", .{});
     }
-    std.debug.print("  Intent    {s}\n", .{@tagName(intent)});
+    std.debug.print("  Intent    {s}\n", .{intent.name()});
 
     std.debug.print("\n  Message\n", .{});
     std.debug.print("    {s}\n", .{title_raw});
@@ -371,9 +348,12 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     std.debug.print("\n  Author\n", .{});
     std.debug.print("    {s} <{s}>\n", .{ author_name, author_email });
 
-    if (committer) |c| {
+    if (committer_name != null or committer_email != null or committer_timestamp_ms != null) {
         std.debug.print("\n  Committer\n", .{});
-        std.debug.print("    {s} <{s}>\n", .{ c.name, c.email });
+        std.debug.print("    {s} <{s}>\n", .{
+            committer_name orelse author_name,
+            committer_email orelse author_email,
+        });
     }
 
     if (label_list.items.len > 0) {
@@ -392,8 +372,8 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
     std.debug.print("\n  Changes\n", .{});
     std.debug.print("    {} staged file{s}\n", .{
-        index.entries.items.len,
-        if (index.entries.items.len == 1) "" else "s",
+        opened.repo.index.entries.items.len,
+        if (opened.repo.index.entries.items.len == 1) "" else "s",
     });
 }
 
@@ -434,7 +414,7 @@ pub const command = Command{
             .long = "intent",
             .kind = .value,
             .value_name = "intent",
-            .help = "feature|fix|refactor|docs|test|performance|security|build|ci|release|chore  (default: feature)",
+            .help = "feature|fix|refactor|docs|test|performance|security|build|ci|release|chore, or any custom name",
         },
         .{
             .short = 'l',
@@ -448,13 +428,13 @@ pub const command = Command{
             .long = "author",
             .kind = .value,
             .value_name = "name",
-            .help = "author name  ($NODUS_AUTHOR_NAME / $USER fallback)",
+            .help = "author name  ($merk_AUTHOR_NAME / $USER fallback)",
         },
         .{
             .long = "author-email",
             .kind = .value,
             .value_name = "addr",
-            .help = "author email  ($NODUS_AUTHOR_EMAIL fallback)",
+            .help = "author email  ($merk_AUTHOR_EMAIL fallback)",
         },
         .{
             .long = "author-date",
