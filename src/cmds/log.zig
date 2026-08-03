@@ -1,6 +1,9 @@
 const std = @import("std");
-const nodus = @import("nodus");
-const refs = nodus.refs;
+const merk = @import("merk");
+
+const repo_context = @import("repo_context.zig");
+const commit_mod = @import("../core/commit.zig");
+
 const cli = @import("../cli/command.zig");
 const Command = cli.Command;
 const Invocation = cli.Invocation;
@@ -38,49 +41,35 @@ fn formatCommitSummary(
 }
 
 pub fn run(ctx: Context, inv: *Invocation) !void {
-    var store = try nodus.object.Store.init(inv.alloc, ctx.repo_root);
-    defer store.deinit();
+    const opened = try repo_context.open(ctx);
+    defer opened.deinit(ctx.alloc);
 
-    var nodus_dir = try std.fs.cwd().openDir(".nodus", .{});
-    defer nodus_dir.close();
-
-    const head = try refs.resolveHead(inv.alloc, nodus_dir) orelse {
+    var walk = (try opened.repo.log(.all)) orelse {
         std.debug.print("error: no commits yet\n", .{});
         return error.NoCommits;
     };
-
-    var seen = std.AutoHashMap(nodus.hash.Hash, void).init(inv.alloc);
-    defer seen.deinit();
-
-    var stack = std.ArrayList(nodus.hash.Hash).empty;
-    defer stack.deinit(inv.alloc);
-    try stack.append(inv.alloc, head);
+    defer walk.deinit();
 
     var stdout_buf: [8192]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
     const writer = &stdout_writer.interface;
 
-    while (stack.items.len > 0) {
-        const current_hash = stack.pop() orelse continue;
-        if (seen.contains(current_hash)) continue;
-
-        try seen.put(current_hash, {});
-
-        var commit = try nodus.commit.read(inv.alloc, &store, current_hash);
+    while (try walk.next()) |current_hash| {
+        var commit = try commit_mod.read(inv.alloc, &opened.repo.store, current_hash);
         defer commit.deinit(inv.alloc);
 
-        const hash_hex = try nodus.hash.toHex(inv.alloc, current_hash);
+        const hash_hex = try merk.crypto.hash.toHex(inv.alloc, current_hash);
         defer inv.alloc.free(hash_hex);
 
         const author = try std.fmt.allocPrint(inv.alloc, "{s} <{s}>", .{
-            commit.identity.author.name,
-            commit.identity.author.email,
+            commit.identity.author.person.name,
+            commit.identity.author.person.name,
         });
         defer inv.alloc.free(author);
 
         const committer = try std.fmt.allocPrint(inv.alloc, "{s} <{s}>", .{
-            commit.identity.committer.name,
-            commit.identity.committer.email,
+            commit.identity.committer.person.name,
+            commit.identity.committer.person.email,
         });
         defer inv.alloc.free(committer);
 
@@ -89,8 +78,8 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
         var parent_hexes = std.ArrayList([]u8).empty;
         defer parent_hexes.deinit(inv.alloc);
-        for (commit.snapshot.parents) |parent| {
-            const parent_hex = try nodus.hash.toHex(inv.alloc, parent);
+        for (commit.parents) |parent| {
+            const parent_hex = try merk.crypto.hash.toHex(inv.alloc, parent.hash);
             errdefer inv.alloc.free(parent_hex);
             try parent_hexes.append(inv.alloc, parent_hex);
         }
@@ -98,7 +87,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
         const summary = try formatCommitSummary(
             inv.alloc,
-            hash_hex,
+            hash_hex, // maybe this should be short hex but the user may want the full hex
             author,
             committer,
             message,
@@ -108,10 +97,6 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
         try writer.writeAll(summary);
         try writer.writeByte('\n');
-
-        for (commit.snapshot.parents) |parent| {
-            try stack.append(inv.alloc, parent);
-        }
     }
 
     try writer.flush();
