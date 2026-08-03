@@ -111,7 +111,7 @@ pub const Command = struct {
     run: *const fn (ctx: Context, inv: *Invocation) anyerror!void,
 
     pub fn printHelp(self: Command, writer: anytype) !void {
-        try writer.print("usage: nodus {s}", .{self.name});
+        try writer.print("usage: merk {s}", .{self.name});
         if (self.usage.len > 0) try writer.print(" {s}", .{self.usage});
         try writer.writeByte('\n');
 

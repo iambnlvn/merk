@@ -7,64 +7,67 @@ const Repository = repository_mod.Repository;
 const cli = @import("../cli/command.zig");
 const Context = cli.Context;
 
-/// `Repository` stores the `io.FileSystem` interface it's given —
-/// `{ ptr, vtable }` — inside itself and every sub-component (`Store`,
-/// `Index`, `PageStore`, `ReferenceStore`). That `ptr` has to keep
-/// pointing at a live `RealFs`, so the `RealFs` must outlive the
-/// `Repository` built from it. Bundling them together here is what
-/// makes that lifetime obvious at the call site instead of implicit.
-pub const OpenedRepo = struct {
-    repo: *Repository,
+/// Everything a repo-touching command needs to open, use, and tear down
+/// a `Repository` — bundled behind one call instead of two loosely
+/// coupled pieces (`real_fs` and an opened-repo handle) a caller had to
+/// declare separately and wire together by hand.
+///
+/// `Repository` embeds the `io.FileSystem` interface built from
+/// `real_fs.fs()` — `{ ptr, vtable }` pointing back at `real_fs` itself —
+/// and holds onto it for as long as `Repository` lives. `real_fs` is
+/// therefore heap-allocated here (not stored inline in `Opened`), so the
+/// `Opened` value itself is free to be returned, copied, or moved without
+/// invalidating that pointer.
+///
+/// Usage (matches every command in cmds/):
+///
+///     const opened = try repo_context.open(ctx);
+///     defer opened.deinit(ctx.alloc);
+///     try opened.repo.add(inv.positional.items);
+pub const Opened = struct {
     real_fs: *merk.io.RealFs,
+    repo: *Repository,
 
-    pub fn deinit(self: OpenedRepo, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: Opened, alloc: std.mem.Allocator) void {
         self.repo.deinit();
         alloc.destroy(self.real_fs);
     }
 };
 
-/// Opens `<repo_root>/.merk` as a `RealFs` and hands it to
-/// `Repository.open`. Every command that touches repo state goes
-/// through this — one copy of the fd/lifetime handling instead of one
-/// per command file.
+/// Opens `<repo_root>/.merk` and hands it to `Repository.open`.
 ///
-/// NOTE: doesn't close the `.merk` dir handle — `Repository`/`RealFs`
+/// NOTE: doesn't close the `.merk` dir handle — `Repository`/`real_fs`
 /// hold it for the command's whole run, and the process exits shortly
 /// after, so the OS reclaims the fd. Worth revisiting if commands ever
 /// start opening more than one repo per process.
-pub fn open(ctx: Context) !OpenedRepo {
+pub fn open(ctx: Context) !Opened {
     var root_dir = try std.fs.cwd().openDir(ctx.repo_root, .{});
     defer root_dir.close();
 
     const control_dir = root_dir.openDir(".merk", .{}) catch |err| switch (err) {
         error.FileNotFound => {
-            std.debug.print("error: not a merk repository (no .merk directory found)\n", .{});
+            ctx.err.print("error: not a merk repository (no .merk directory found)\n", .{}) catch {};
             return err;
         },
         else => return err,
     };
 
-    // Heap-allocated on purpose: `real_fs.fs()` embeds `&real_fs.*` into
-    // the `io.FileSystem` value that `Repository` (and everything it
-    // owns) copies around and holds onto long after this function
-    // returns. A stack-local `RealFs` here reproduces the exact
-    // dangling-pointer bug `add`'s crash surfaced — this time it'd show
-    // up wherever a later command happened to touch `fs` first.
     const real_fs = try ctx.alloc.create(merk.io.RealFs);
     errdefer ctx.alloc.destroy(real_fs);
     real_fs.* = merk.io.RealFs.init(control_dir);
 
     const repo = Repository.open(ctx.alloc, real_fs.fs(), ctx.repo_root) catch |err| switch (err) {
         error.NotARepository => {
-            std.debug.print("error: not a merk repository (.merk exists but has no Focus yet)\n", .{});
+            ctx.err.print("error: not a merk repository (.merk exists but has no Focus yet)\n", .{}) catch {};
             return err;
         },
         error.DetachedFocus => {
-            std.debug.print("error: Focus is detached; this command needs a track checked out\n", .{});
+            ctx.err.print("error: Focus is detached; this command needs a track checked out\n", .{}) catch {};
             return err;
         },
         else => return err,
     };
+    errdefer repo.deinit();
 
-    return .{ .repo = repo, .real_fs = real_fs };
+    return .{ .real_fs = real_fs, .repo = repo };
 }
