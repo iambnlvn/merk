@@ -12,14 +12,18 @@ const Context = cli.Context;
 const SnapshotAction = enum {
     added,
     updated,
+
+    fn label(self: SnapshotAction) []const u8 {
+        return switch (self) {
+            .added => "add",
+            .updated => "update",
+        };
+    }
 };
 
 pub fn run(ctx: Context, inv: *Invocation) !void {
     if (inv.positional.items.len == 0) {
-        try ctx.err.writeAll(
-            \\error: expected at least one path
-            \\
-        );
+        try ctx.err.writeAll("error: expected at least one path\n\n");
         command.printHelp(ctx.err) catch {};
         return error.MissingPath;
     }
@@ -35,42 +39,33 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
     for (inv.positional.items) |path| {
         const gop = try seen.getOrPut(inv.alloc, path);
-        if (!gop.found_existing) {
-            try paths.append(inv.alloc, path);
-        }
+        if (!gop.found_existing) try paths.append(inv.alloc, path);
     }
 
     const opened = try repo_context.open(ctx);
     defer opened.deinit(ctx.alloc);
 
-    // Validate every path before updating the snapshot.
+    // Validate every path before touching the snapshot at all, so a bad
+    // path later in the list doesn't leave earlier ones half-applied.
     var bad = false;
 
     for (paths.items) |path| {
         if (std.fs.path.isAbsolute(path)) {
-            try ctx.err.print(
-                "error: path '{s}' must be relative to the repository root\n",
-                .{path},
-            );
+            try ctx.err.print("error: path '{s}' must be relative to the repository root\n", .{path});
             bad = true;
             continue;
         }
 
         var escapes = false;
         var it = std.mem.splitScalar(u8, path, '/');
-
         while (it.next()) |segment| {
             if (std.mem.eql(u8, segment, "..")) {
                 escapes = true;
                 break;
             }
         }
-
         if (escapes) {
-            try ctx.err.print(
-                "error: path '{s}' resolves outside the repository\n",
-                .{path},
-            );
+            try ctx.err.print("error: path '{s}' resolves outside the repository\n", .{path});
             bad = true;
             continue;
         }
@@ -80,10 +75,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
         const stat = std.fs.cwd().statFile(full_path) catch |err| switch (err) {
             error.FileNotFound => {
-                try ctx.err.print(
-                    "error: path '{s}' does not exist\n",
-                    .{path},
-                );
+                try ctx.err.print("error: path '{s}' does not exist\n", .{path});
                 bad = true;
                 continue;
             },
@@ -91,48 +83,25 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         };
 
         if (stat.kind == .directory) {
-            try ctx.err.print(
-                "error: directories are not supported yet: '{s}'\n",
-                .{path},
-            );
+            try ctx.err.print("error: directories are not supported yet: '{s}'\n", .{path});
             bad = true;
         }
     }
 
-    if (bad)
-        return error.InvalidPath;
+    if (bad) return error.InvalidPath;
 
-    if (dry_run) {
-        for (paths.items) |path| {
-            try ctx.out.print(
-                "Would update snapshot: {s}\n",
-                .{path},
-            );
-        }
-        return;
-    }
-
+    // Figure out add-vs-update up front so dry-run and the real run report
+    // identical, accurate labels instead of the dry-run path guessing blind.
     var actions = try inv.alloc.alloc(SnapshotAction, paths.items.len);
     defer inv.alloc.free(actions);
 
     for (paths.items, 0..) |path, i| {
-        actions[i] = if (opened.repo.index.lookup(path) == null)
-            .added
-        else
-            .updated;
+        actions[i] = if (opened.repo.index.lookup(path) == null) .added else .updated;
     }
 
     if (dry_run) {
         for (paths.items, 0..) |path, i| {
-            const action = switch (actions[i]) {
-                .added => "Would add",
-                .updated => "Would update",
-            };
-
-            try ctx.out.print(
-                "{s:<12} {s}\n",
-                .{ action, path },
-            );
+            try ctx.out.print("would {s:<8} {s}\n", .{ actions[i].label(), path });
         }
         return;
     }
@@ -144,6 +113,7 @@ pub const command = Command{
     .name = "snapshot",
     .description = "Update the pending snapshot with one or more paths.",
     .usage = "[options] <path>...",
+    .category = .snapshot,
     .flags = &.{
         .{
             .short = 'n',
