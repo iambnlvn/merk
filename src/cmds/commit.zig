@@ -157,13 +157,13 @@ fn extractBodyTrailers(
 
 pub fn run(ctx: Context, inv: *Invocation) !void {
     const title_raw = inv.flags.string("message") orelse {
-        std.debug.print("error: commit message is required (-m <message>)\n", .{});
-        command.printHelpToStderr();
+        try ctx.err.print("error: commit message is required (-m <message>)\n", .{});
+        command.printHelp(ctx.err) catch {};
         return error.MissingMessage;
     };
 
     if (std.mem.trim(u8, title_raw, " \t").len == 0) {
-        std.debug.print("error: commit message must not be empty\n", .{});
+        try ctx.err.print("error: commit message must not be empty\n", .{});
         return error.EmptyMessage;
     }
 
@@ -182,7 +182,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     const author_date: i64 = blk: {
         const raw = inv.flags.string("date") orelse inv.flags.string("author-date") orelse break :blk 0;
         break :blk parseTimestamp(raw) orelse {
-            std.debug.print(
+            try ctx.err.print(
                 "error: cannot parse date '{s}' — use Unix-ms or YYYY-MM-DD\n",
                 .{raw},
             );
@@ -200,7 +200,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
     const committer_timestamp_ms: ?i64 = if (committer_date_raw) |raw|
         parseTimestamp(raw) orelse {
-            std.debug.print(
+            try ctx.err.print(
                 "error: cannot parse committer-date '{s}' — use Unix-ms or YYYY-MM-DD\n",
                 .{raw},
             );
@@ -258,7 +258,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
             if (trimmed.len == 0) continue;
 
             const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse {
-                std.debug.print(
+                try ctx.err.print(
                     "error: trailer '{s}' must be in key=value form\n",
                     .{trimmed},
                 );
@@ -274,7 +274,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
             };
 
             trailer.validate() catch |err| {
-                std.debug.print(
+                try ctx.err.print(
                     "error: invalid trailer '{s}': {s}\n",
                     .{ trimmed, @errorName(err) },
                 );
@@ -289,7 +289,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     defer opened.deinit(ctx.alloc);
 
     if (opened.repo.index.entries.items.len == 0) {
-        std.debug.print("error: nothing to commit (index is empty — run `merk add <path>` first)\n", .{});
+        try ctx.err.print("error: nothing to commit (index is empty — run `merk add <path>` first)\n", .{});
         return error.NothingToCommit;
     }
 
@@ -303,7 +303,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         defer parent_c.deinit(inv.alloc);
 
         if (std.mem.eql(u8, &parent_c.snapshot, &opened.repo.index.index_root)) {
-            std.debug.print(
+            try ctx.err.print(
                 "error: nothing to commit — staged tree is identical to HEAD (stage changes with `merk add` first)\n",
                 .{},
             );
@@ -328,50 +328,50 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     const track_name = opened.repo.current_track.raw;
     const short = merk.crypto.hash.shortHex(commit_hash);
 
-    std.debug.print("✓ Commit created\n\n", .{});
+    try ctx.out.print("✓ Commit created\n\n", .{});
 
-    std.debug.print("  Hash      {s}\n", .{short});
-    std.debug.print("  Track     {s}\n", .{track_name});
+    try ctx.out.print("  Hash      {s}\n", .{short});
+    try ctx.out.print("  Track     {s}\n", .{track_name});
     if (maybe_head == null) {
-        std.debug.print("  Type      root commit\n", .{});
+        try ctx.out.print("  Type      root commit\n", .{});
     }
-    std.debug.print("  Intent    {s}\n", .{intent.name()});
+    try ctx.out.print("  Intent    {s}\n", .{intent.name()});
 
-    std.debug.print("\n  Message\n", .{});
-    std.debug.print("    {s}\n", .{title_raw});
+    try ctx.out.print("\n  Message\n", .{});
+    try ctx.out.print("    {s}\n", .{title_raw});
 
     if (body.len > 0) {
-        std.debug.print("\n  Description\n", .{});
-        std.debug.print("    {s}\n", .{body});
+        try ctx.out.print("\n  Description\n", .{});
+        try ctx.out.print("    {s}\n", .{body});
     }
 
-    std.debug.print("\n  Author\n", .{});
-    std.debug.print("    {s} <{s}>\n", .{ author_name, author_email });
+    try ctx.out.print("\n  Author\n", .{});
+    try ctx.out.print("    {s} <{s}>\n", .{ author_name, author_email });
 
     if (committer_name != null or committer_email != null or committer_timestamp_ms != null) {
-        std.debug.print("\n  Committer\n", .{});
-        std.debug.print("    {s} <{s}>\n", .{
+        try ctx.out.print("\n  Committer\n", .{});
+        try ctx.out.print("    {s} <{s}>\n", .{
             committer_name orelse author_name,
             committer_email orelse author_email,
         });
     }
 
     if (label_list.items.len > 0) {
-        std.debug.print("\n  Labels\n", .{});
+        try ctx.out.print("\n  Labels\n", .{});
         for (label_list.items) |label| {
-            std.debug.print("    • {s}\n", .{label});
+            try ctx.out.print("    • {s}\n", .{label});
         }
     }
 
     if (trailer_list.items.len > 0) {
-        std.debug.print("\n  Trailers\n", .{});
+        try ctx.out.print("\n  Trailers\n", .{});
         for (trailer_list.items) |t| {
-            std.debug.print("    {s}: {s}\n", .{ t.key, t.value });
+            try ctx.out.print("    {s}: {s}\n", .{ t.key, t.value });
         }
     }
 
-    std.debug.print("\n  Changes\n", .{});
-    std.debug.print("    {} staged file{s}\n", .{
+    try ctx.out.print("\n  Changes\n", .{});
+    try ctx.out.print("    {} staged file{s}\n", .{
         opened.repo.index.entries.items.len,
         if (opened.repo.index.entries.items.len == 1) "" else "s",
     });
