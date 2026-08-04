@@ -110,31 +110,31 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
     if (inv.flags.string("format")) |v|
         config.format = parseFormat(v) orelse {
-            std.debug.print("error: invalid format '{s}'\n", .{v});
+            ctx.err.print("error: invalid format '{s}'\n", .{v}) catch {};
             return error.InvalidFormat;
         };
 
     if (inv.flags.string("level")) |v|
         config.level = parseLevel(v) orelse {
-            std.debug.print("error: invalid level '{s}'\n", .{v});
+            ctx.err.print("error: invalid level '{s}'\n", .{v}) catch {};
             return error.InvalidLevel;
         };
 
     if (inv.flags.string("context")) |v|
         config.context = parseContext(v) orelse {
-            std.debug.print("error: invalid context '{s}'\n", .{v});
+            ctx.err.print("error: invalid context '{s}'\n", .{v}) catch {};
             return error.InvalidContext;
         };
 
     if (inv.flags.string("group")) |v|
         config.group_by = parseGroupBy(v) orelse {
-            std.debug.print("error: invalid group '{s}'\n", .{v});
+            ctx.err.print("error: invalid group '{s}'\n", .{v}) catch {};
             return error.InvalidGroup;
         };
 
     if (inv.flags.string("algo")) |v|
         config.algorithm = parseAlgorithm(v) orelse {
-            std.debug.print("error: invalid algorithm '{s}'\n", .{v});
+            ctx.err.print("error: invalid algorithm '{s}'\n", .{v}) catch {};
             return error.InvalidAlgorithm;
         };
 
@@ -151,20 +151,20 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
     if (inv.flags.string("show")) |v|
         config.filter = diff_render.ChangeFilter.parse(v) catch {
-            std.debug.print("error: invalid --show value '{s}'\n", .{v});
+            ctx.err.print("error: invalid --show value '{s}'\n", .{v}) catch {};
             return error.InvalidChangeFilter;
         };
 
     // --color overrides --no-color if both are given
     if (inv.flags.string("color")) |v|
         color_mode = parseColorMode(v) orelse {
-            std.debug.print("error: invalid color mode '{s}'\n", .{v});
+            ctx.err.print("error: invalid color mode '{s}'\n", .{v}) catch {};
             return error.InvalidColorMode;
         };
 
     if (inv.flags.string("profile")) |v| {
         const p = std.meta.stringToEnum(Profile, v) orelse {
-            std.debug.print("error: invalid profile '{s}'\n", .{v});
+            ctx.err.print("error: invalid profile '{s}'\n", .{v}) catch {};
             return error.InvalidProfile;
         };
         applyProfile(p, &config);
@@ -187,24 +187,24 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
             if (trimmed.len == 0) continue;
 
             merk.crypto.hash.parseHexPrefix(trimmed) catch {
-                std.debug.print("error: invalid --rev '{s}' (expected 8-64 hex chars)\n", .{trimmed});
+                ctx.err.print("error: invalid --rev '{s}' (expected 8-64 hex chars)\n", .{trimmed}) catch {};
                 return error.InvalidRev;
             };
             try rev_strs.append(inv.alloc, trimmed);
         }
     }
     if (rev_strs.items.len > 2) {
-        std.debug.print("error: --rev can be given at most twice (comparing two trees)\n", .{});
+        ctx.err.print("error: --rev can be given at most twice (comparing two trees)\n", .{}) catch {};
         return error.TooManyRevs;
     }
 
     const staged = inv.flags.boolean("staged");
     if (staged and rev_strs.items.len > 0) {
-        std.debug.print("error: --staged and --rev are mutually exclusive\n", .{});
+        ctx.err.print("error: --staged and --rev are mutually exclusive\n", .{}) catch {};
         return error.ConflictingDiffMode;
     }
     if (staged) {
-        std.debug.print("error: --staged is not yet implemented\n", .{});
+        ctx.err.print("error: --staged is not yet implemented\n", .{}) catch {};
         return error.NotImplemented;
     }
     // --working is the default behaviour (and currently the only one with no
@@ -233,9 +233,9 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
             // Not a full hash: resolve the short hash prefix against the object store
             const resolved = opened.repo.store.resolveHashPrefix(rev_str) catch |e| {
                 switch (e) {
-                    error.Ambiguous => std.debug.print("error: ambiguous --rev '{s}' (matches multiple objects)\n", .{rev_str}),
-                    error.NotFound => std.debug.print("error: --rev '{s}' not found\n", .{rev_str}),
-                    else => std.debug.print("error: invalid --rev '{s}'\n", .{rev_str}),
+                    error.Ambiguous => ctx.err.print("error: ambiguous --rev '{s}' (matches multiple objects)\n", .{rev_str}) catch {},
+                    error.NotFound => ctx.err.print("error: --rev '{s}' not found\n", .{rev_str}) catch {},
+                    else => ctx.err.print("error: invalid --rev '{s}'\n", .{rev_str}) catch {},
                 }
                 return error.InvalidRev;
             };
@@ -245,9 +245,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         try revs.append(inv.alloc, h);
     }
 
-    var stdout_buf: [8192]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const writer = &stdout_writer.interface;
+    const writer = ctx.out;
 
     if (revs.items.len > 0) {
         var cd: diff_algorithms.CommitDiff = if (revs.items.len == 1)
@@ -291,7 +289,6 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
                 try diff_render.renderFileDiff(writer, fd, config);
         }
 
-        try writer.flush();
         return;
     }
 
@@ -370,14 +367,13 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         for (visible.items) |fd|
             try diff_render.renderFileDiff(writer, fd, config);
     }
-
-    try writer.flush();
 }
 
 pub const command = Command{
     .name = "diff",
     .description = "Show changes between the index and working tree, or between commits with --rev.",
     .usage = "[options] [<path>...]",
+    .category = .history,
     .flags = &[_]Flag{
         .{ .short = 'f', .long = "format", .kind = .value, .value_name = "fmt", .help = "unified, side-by-side, blocks, ops, summary" },
         .{ .short = 'l', .long = "level", .kind = .value, .value_name = "lvl", .help = "file, hunk, line, word" },

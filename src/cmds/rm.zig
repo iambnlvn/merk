@@ -11,8 +11,8 @@ const Context = cli.Context;
 
 pub fn run(ctx: Context, inv: *Invocation) !void {
     if (inv.positional.items.len == 0) {
-        std.debug.print("error: 'rm' requires at least one path\n", .{});
-        command.printHelpToStderr();
+        try ctx.err.print("error: 'rm' requires at least one path\n", .{});
+        command.printHelp(ctx.err) catch {};
         return error.MissingPath;
     }
 
@@ -29,7 +29,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     // worktree) half-mutated.
     for (inv.positional.items) |path| {
         if (index.lookup(path) == null) {
-            std.debug.print("error: '{s}' is not tracked\n", .{path});
+            try ctx.err.print("error: '{s}' is not tracked\n", .{path});
             return error.NotTracked;
         }
     }
@@ -56,9 +56,9 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
     for (inv.positional.items) |path| {
         if (cached) {
-            std.debug.print("removed (cached) {s}\n", .{path});
+            try ctx.out.print("removed (cached) {s}\n", .{path});
         } else {
-            std.debug.print("removed {s}\n", .{path});
+            try ctx.out.print("removed {s}\n", .{path});
         }
     }
 }
@@ -67,6 +67,7 @@ pub const command = Command{
     .name = "rm",
     .description = "Remove paths from the index and, unless --cached, the working tree.",
     .usage = "<path>...",
+    .category = .snapshot,
     .flags = &.{
         .{ .long = "cached", .kind = .boolean, .help = "only unstage; leave the working tree file alone" },
     },

@@ -381,6 +381,7 @@ pub const command = Command{
     .name = "commit",
     .description = "Record staged changes as a new commit.",
     .usage = "[-m <message>] [options] [labels...]",
+    .category = .history,
     .flags = &.{
         // message
         .{

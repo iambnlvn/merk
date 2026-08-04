@@ -71,6 +71,7 @@ pub const command = Command{
     .name = "init",
     .description = "Initialize a new merk repository.",
     .usage = "[directory]",
+    .category = .repository,
     .flags = &.{
         .{
             .short = 'q',

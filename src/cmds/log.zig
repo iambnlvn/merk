@@ -1,3 +1,5 @@
+//TODO: wip for implementing a pager like less for long outputs
+
 const std = @import("std");
 const merk = @import("merk");
 
@@ -45,14 +47,12 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     defer opened.deinit(ctx.alloc);
 
     var walk = (try opened.repo.log(.all)) orelse {
-        std.debug.print("error: no commits yet\n", .{});
+        try ctx.err.print("error: no commits yet\n", .{});
         return error.NoCommits;
     };
     defer walk.deinit();
 
-    var stdout_buf: [8192]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-    const writer = &stdout_writer.interface;
+    const writer = ctx.out;
 
     while (try walk.next()) |current_hash| {
         var commit = try commit_mod.read(inv.alloc, &opened.repo.store, current_hash);
@@ -63,7 +63,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
         const author = try std.fmt.allocPrint(inv.alloc, "{s} <{s}>", .{
             commit.identity.author.person.name,
-            commit.identity.author.person.name,
+            commit.identity.author.person.email,
         });
         defer inv.alloc.free(author);
 
@@ -98,14 +98,13 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         try writer.writeAll(summary);
         try writer.writeByte('\n');
     }
-
-    try writer.flush();
 }
 
 pub const command = Command{
     .name = "log",
     .description = "Print commits reachable from HEAD with author, committer, message, and parent information.",
     .usage = "",
+    .category = .history,
     .flags = &.{},
     .run = run,
 };

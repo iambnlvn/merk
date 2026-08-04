@@ -22,11 +22,12 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     const hex = try merk.crypto.hash.toHex(ctx.alloc, opened.repo.index.index_root);
     defer ctx.alloc.free(hex);
 
-    std.debug.print("{s}\n", .{hex});
+    try ctx.out.print("{s}\n", .{hex});
 }
 
 pub const command = Command{
     .name = "write-tree",
     .description = "Write the current index as a Merkle root.",
+    .category = .plumbing,
     .run = run,
 };
