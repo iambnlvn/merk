@@ -1,5 +1,5 @@
 const std = @import("std");
-const nodus = @import("nodus");
+const merk = @import("merk");
 
 const registry = @import("cli/registry.zig");
 const usage = @import("cli/usage.zig");
@@ -7,11 +7,22 @@ const cli = @import("cli/command.zig");
 const Context = @import("cli/context.zig").Context;
 
 pub fn main() void {
-    var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = debug_alloc.deinit();
-    const alloc = debug_alloc.allocator();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        if (gpa.deinit() == .leak) {
+            std.debug.print("warning: memory leak detected\n", .{});
+        }
+    }
+    const alloc = gpa.allocator();
 
-    run(alloc) catch |err| switch (err) {
+    var stdout_buf: [8192]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    defer stdout_writer.interface.flush() catch {};
+    defer stderr_writer.interface.flush() catch {};
+
+    run(alloc, &stdout_writer.interface, &stderr_writer.interface) catch |err| switch (err) {
         cli.Error.HelpRequested => {},
 
         cli.Error.UnknownFlag,
@@ -25,20 +36,20 @@ pub fn main() void {
         },
 
         else => {
-            std.debug.print("error: {s}\n", .{@errorName(err)});
+            stderr_writer.interface.print("error: {s}\n", .{@errorName(err)}) catch {};
             std.process.exit(1);
         },
     };
 }
 
-fn run(alloc: std.mem.Allocator) anyerror!void {
+fn run(alloc: std.mem.Allocator, out: *std.Io.Writer, err_w: *std.Io.Writer) anyerror!void {
     var args = try std.process.argsWithAllocator(alloc);
     defer args.deinit();
 
     _ = args.next();
 
     const cmd_name = args.next() orelse {
-        usage.print();
+        usage.print(err_w);
         return;
     };
 
@@ -46,20 +57,21 @@ fn run(alloc: std.mem.Allocator) anyerror!void {
         std.mem.eql(u8, cmd_name, "-h") or
         std.mem.eql(u8, cmd_name, "help"))
     {
-        usage.print();
+        usage.print(err_w);
         return;
     }
 
     const cmd = registry.find(cmd_name) orelse {
-        std.debug.print("nodus: '{s}' is not a known command\n\n", .{cmd_name});
-        usage.print();
+        err_w.print("merk: '{s}' is not a known command\n\n", .{cmd_name}) catch {};
+        usage.print(err_w);
+        err_w.flush() catch {};
         std.process.exit(1);
     };
 
-    var inv = try cmd.parseArgs(alloc, &args);
+    var inv = try cmd.parseArgs(alloc, &args, err_w);
     defer inv.deinit();
 
-    const ctx = Context{ .alloc = alloc, .repo_root = "." };
+    const ctx = Context{ .alloc = alloc, .repo_root = ".", .out = out, .err = err_w };
 
     try cmd.run(ctx, &inv);
 }
