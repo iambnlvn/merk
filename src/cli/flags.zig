@@ -1,5 +1,6 @@
-/// Command handlers pull raw strings from `FlagMap` and convert them here
-/// All functions return `null` on bad input so callers can emit an error
+/// Command handlers pull raw strings from `FlagMap` and convert them here.
+/// Every `parse*` function returns `null` on bad input so callers can decide
+/// whether to fall back to a default or emit an error.
 const std = @import("std");
 
 pub fn parseEnum(comptime T: type, raw: []const u8) ?T {
@@ -27,4 +28,8 @@ pub fn parseUnsigned(comptime T: type, raw: []const u8) ?T {
 
 pub fn parseInt(comptime T: type, raw: []const u8) ?T {
     return std.fmt.parseInt(T, raw, 10) catch null;
+}
+
+pub fn parseFloat(comptime T: type, raw: []const u8) ?T {
+    return std.fmt.parseFloat(T, raw) catch null;
 }

@@ -8,12 +8,18 @@ pub fn print(w: *std.Io.Writer) void {
         \\Usage
         \\  merk <command> [options] [arguments]
         \\
-        \\Common commands
-        \\
     ) catch return;
 
-    for (registry.commands) |cmd| {
-        w.print("  {s:<16} {s}\n", .{ cmd.name, cmd.description }) catch return;
+    for (registry.category_order) |category| {
+        var it = registry.commandsInCategory(category);
+
+        const first = it.next() orelse continue;
+
+        w.print("\n{s}\n", .{category.label()}) catch return;
+        w.print("  {s:<16} {s}\n", .{ first.name, first.description }) catch return;
+        while (it.next()) |cmd| {
+            w.print("  {s:<16} {s}\n", .{ cmd.name, cmd.description }) catch return;
+        }
     }
 
     w.writeAll(
@@ -22,7 +28,7 @@ pub fn print(w: *std.Io.Writer) void {
         \\  merk init
         \\  merk snapshot --all
         \\  merk commit -m "Initial import"
-        \\  merk history
+        \\  merk log
         \\  merk status
         \\
         \\merk 0.1.0
