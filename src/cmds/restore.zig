@@ -11,8 +11,11 @@ const Context = cli.Context;
 
 pub fn run(ctx: Context, inv: *Invocation) !void {
     if (inv.positional.items.len == 0) {
-        std.debug.print("error: 'restore' requires at least one path\n", .{});
-        command.printHelpToStderr();
+        try ctx.err.writeAll(
+            \\error: expected at least one path
+            \\
+        );
+        command.printHelp(ctx.err) catch {};
         return error.MissingPath;
     }
 
@@ -24,35 +27,47 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     const index = &opened.repo.index;
 
     if (staged) {
-        // Drop from the index without touching the worktree file — the
-        // same semantics as `Repository.unstage` (mirrors `git reset
-        // <path>`, not `checkout`), applied here directly against the
-        // index so a multi-path call does one `save` instead of one per
-        // path.
+        // Remove paths from the pending snapshot.
         for (inv.positional.items) |path| {
             if (index.lookup(path) == null) {
-                std.debug.print("error: '{s}' is not staged\n", .{path});
+                try ctx.err.print(
+                    "error: path '{s}' is not in the pending snapshot\n",
+                    .{path},
+                );
                 return error.NotStaged;
             }
         }
-        for (inv.positional.items) |path| try index.remove(path);
-        try index.save();
 
         for (inv.positional.items) |path| {
-            std.debug.print("unstaged {s}\n", .{path});
+            try index.remove(path);
         }
+
+        try index.save();
+
+        if (inv.positional.items.len == 1) {
+            try ctx.out.print(
+                "Removed '{s}' from the pending snapshot.\n",
+                .{inv.positional.items[0]},
+            );
+        } else {
+            try ctx.out.print(
+                "Removed {d} paths from the pending snapshot.\n",
+                .{inv.positional.items.len},
+            );
+        }
+
         return;
     }
 
-    // Default: overwrite the working tree file(s) with the index's
-    // version — same read-blob-then-write-file shape as
-    // `Repository.writeEntriesToWorktree`, just for the paths given
-    // rather than every tracked entry.
+    // Restore working tree files from the pending snapshot.
     const cwd = std.fs.cwd();
 
     for (inv.positional.items) |path| {
         const entry = index.lookup(path) orelse {
-            std.debug.print("error: '{s}' is not tracked\n", .{path});
+            try ctx.err.print(
+                "error: path '{s}' is not tracked by this repository\n",
+                .{path},
+            );
             return error.NotTracked;
         };
 
@@ -62,15 +77,28 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         const full_path = try std.fs.path.join(inv.alloc, &.{ opened.repo.root, path });
         defer inv.alloc.free(full_path);
 
-        if (std.fs.path.dirname(full_path)) |d| try cwd.makePath(d);
-        try cwd.writeFile(.{ .sub_path = full_path, .data = obj.payload });
+        if (std.fs.path.dirname(full_path)) |dir| {
+            try cwd.makePath(dir);
+        }
+
+        try cwd.writeFile(.{
+            .sub_path = full_path,
+            .data = obj.payload,
+        });
     }
 
-    for (inv.positional.items) |path| {
-        std.debug.print("restored {s}\n", .{path});
+    if (inv.positional.items.len == 1) {
+        try ctx.out.print(
+            "Restored '{s}'.\n",
+            .{inv.positional.items[0]},
+        );
+    } else {
+        try ctx.out.print(
+            "Restored {d} paths.\n",
+            .{inv.positional.items.len},
+        );
     }
 }
-
 pub const command = Command{
     .name = "restore",
     .description = "Restore working tree paths from the index, or unstage them with --staged.",
