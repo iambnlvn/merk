@@ -32,6 +32,31 @@ pub const RepositoryError = error{
     /// advance, so detached Focus is out of scope for this facade —
     /// surface it to the caller instead of guessing which track to use.
     DetachedFocus,
+
+    // -- path arguments (add/rm/mv/restore) --
+    /// A path argument was already absolute; every path in this API is
+    /// repo-root-relative.
+    AbsolutePath,
+    /// A path argument had a `..` segment that would resolve outside root.
+    PathEscapesRoot,
+    /// The path isn't in the index — nothing to restore/remove/move/unstage.
+    NotTracked,
+    /// `movePath`'s destination is already tracked and `force` wasn't set.
+    DestinationTracked,
+    /// `movePath` was given the same path for `from` and `to`.
+    SamePath,
+
+    // -- history/rev resolution (show/diff/uncommit) --
+    /// The current track has no commits yet.
+    NoCommits,
+    /// HEAD is a merge commit; `uncommit` only supports linear history.
+    MergeCommit,
+    /// A short hash prefix passed to `resolveRev` matched more than one object.
+    AmbiguousRev,
+    /// Neither a full hash nor a known prefix.
+    RevNotFound,
+    /// Not valid hex and not a resolvable prefix either.
+    InvalidRev,
 };
 
 pub const ResetMode = enum {
@@ -167,10 +192,24 @@ pub const Repository = struct {
         self.alloc.destroy(self);
     }
 
+    /// Rejects absolute paths and `..` segments. Every repo-relative path
+    /// argument (`add`/`rm`/`mv`/`restore`) goes through this first, so the
+    /// CLI layer doesn't have to reimplement the same two checks per
+    /// command — and any other caller of these methods gets the same
+    /// guarantee for free.
+    fn validateRelativePath(path: []const u8) RepositoryError!void {
+        if (std.fs.path.isAbsolute(path)) return error.AbsolutePath;
+        var it = std.mem.splitScalar(u8, path, '/');
+        while (it.next()) |segment| {
+            if (std.mem.eql(u8, segment, "..")) return error.PathEscapesRoot;
+        }
+    }
+
     /// Stage a batch of repo-relative paths. Errors partway through
     /// leave already-staged paths staged — callers wanting all-or-nothing
     /// semantics should back up `self.index.entries` first.
     pub fn add(self: *Repository, paths: []const []const u8) !void {
+        for (paths) |p| try validateRelativePath(p);
         for (paths) |p| _ = try self.index.addFile(&self.store, self.root, p);
         try self.index.save();
     }
@@ -178,17 +217,85 @@ pub const Repository = struct {
     /// Unstage a path (drop it from the index without touching the
     /// worktree file). Mirrors `git reset <path>`, not `checkout`.
     pub fn unstage(self: *Repository, path: []const u8) !void {
-        try self.index.remove(path);
+        try self.unstagePaths(&.{path});
+    }
+
+    /// Unstage several paths at once, validated up front and saved once
+    /// at the end — cheaper than calling `unstage` in a loop, which would
+    /// re-save after every single path.
+    pub fn unstagePaths(self: *Repository, paths: []const []const u8) !void {
+        for (paths) |p| {
+            if (self.index.lookup(p) == null) return error.NotTracked;
+        }
+        for (paths) |p| try self.index.remove(p);
+        try self.index.save();
+    }
+
+    pub const RemoveOptions = struct {
+        /// Only untrack; leave the worktree file where it is.
+        cached: bool = false,
+    };
+
+    /// Untrack paths, and unless `.cached`, delete them from the worktree
+    /// too. Every path must already be tracked, validated up front for
+    /// the same reason as `unstagePaths`.
+    pub fn removePaths(self: *Repository, paths: []const []const u8, options: RemoveOptions) !void {
+        for (paths) |p| {
+            if (self.index.lookup(p) == null) return error.NotTracked;
+        }
+
+        const dir = std.fs.cwd();
+        for (paths) |p| {
+            if (!options.cached) {
+                const full_path = try std.fs.path.join(self.alloc, &.{ self.root, p });
+                defer self.alloc.free(full_path);
+
+                dir.deleteFile(full_path) catch |err| switch (err) {
+                    error.FileNotFound => {}, // already gone on disk; still untrack it
+                    else => return err,
+                };
+            }
+            try self.index.remove(p);
+        }
+        try self.index.save();
+    }
+
+    pub const MoveOptions = struct {
+        /// Overwrite an already-tracked destination instead of erroring.
+        force: bool = false,
+    };
+
+    /// Rename a tracked path on disk and in the index. Content doesn't
+    /// change — only the location — so the blob hash carries over as-is
+    /// rather than being recomputed from a re-read.
+    pub fn movePath(self: *Repository, from: []const u8, to: []const u8, options: MoveOptions) !void {
+        try validateRelativePath(from);
+        try validateRelativePath(to);
+        if (std.mem.eql(u8, from, to)) return error.SamePath;
+
+        if (self.index.lookup(from) == null) return error.NotTracked;
+        if (!options.force and self.index.lookup(to) != null) return error.DestinationTracked;
+
+        const from_full = try std.fs.path.join(self.alloc, &.{ self.root, from });
+        defer self.alloc.free(from_full);
+        const to_full = try std.fs.path.join(self.alloc, &.{ self.root, to });
+        defer self.alloc.free(to_full);
+
+        if (std.fs.path.dirname(to_full)) |d| try std.fs.cwd().makePath(d);
+        try std.fs.cwd().rename(from_full, to_full);
+
+        try self.index.remove(from);
+        _ = try self.index.addFile(&self.store, self.root, to);
         try self.index.save();
     }
 
     /// Commit the currently-staged index as a child of the current
     /// track's HEAD (or as a root commit if the track has none yet).
     pub fn commit(self: *Repository, request: CommitRequest) !Hash {
-        const head = try self.ref_store.readTrack(self.current_track);
+        const repo_head = try self.ref_store.readTrack(self.current_track);
 
         var parent_buf: [1]ParentInfo = undefined;
-        const parents: []const ParentInfo = if (head) |h| blk: {
+        const parents: []const ParentInfo = if (repo_head) |h| blk: {
             parent_buf[0] = .{ .hash = h, .kind = .normal };
             break :blk parent_buf[0..1];
         } else &.{};
@@ -240,17 +347,41 @@ pub const Repository = struct {
         if (mode == .hard) try self.writeEntriesToWorktree();
     }
 
-    fn writeEntriesToWorktree(self: *Repository) !void {
+    /// Overwrite specific tracked worktree paths with their staged (index)
+    /// content — the worktree-writing half of `restore` (without
+    /// `--staged`). Every path must already be tracked, validated up
+    /// front so a bad path partway through a multi-path restore doesn't
+    /// leave some files overwritten and others not.
+    pub fn restorePaths(self: *Repository, paths: []const []const u8) !void {
+        for (paths) |p| {
+            if (self.index.lookup(p) == null) return error.NotTracked;
+        }
+        for (paths) |p| {
+            const entry = self.index.lookup(p).?;
+            try self.writeBlobToWorktree(p, entry.blob_hash);
+        }
+    }
+
+    /// Writes one blob's content to `<root>/<path>` on the real
+    /// filesystem, creating parent directories as needed. The one place
+    /// index content gets materialized into the worktree — `reset(.hard)`
+    /// and `restorePaths` both go through this instead of each having
+    /// their own copy of the join/mkdir/writeFile sequence.
+    fn writeBlobToWorktree(self: *Repository, path: []const u8, blob_hash: Hash) !void {
         const dir = std.fs.cwd();
+        const obj = try self.store.get(blob_hash);
+        defer self.alloc.free(obj.payload);
+
+        const full_path = try std.fs.path.join(self.alloc, &.{ self.root, path });
+        defer self.alloc.free(full_path);
+
+        if (std.fs.path.dirname(full_path)) |d| try dir.makePath(d);
+        try dir.writeFile(.{ .sub_path = full_path, .data = obj.payload });
+    }
+
+    fn writeEntriesToWorktree(self: *Repository) !void {
         for (self.index.entries.items) |entry| {
-            const obj = try self.store.get(entry.blob_hash);
-            defer self.alloc.free(obj.payload);
-
-            const full_path = try std.fs.path.join(self.alloc, &.{ self.root, entry.path });
-            defer self.alloc.free(full_path);
-
-            if (std.fs.path.dirname(full_path)) |d| try dir.makePath(d);
-            try dir.writeFile(.{ .sub_path = full_path, .data = obj.payload });
+            try self.writeBlobToWorktree(entry.path, entry.blob_hash);
         }
     }
 
@@ -258,9 +389,70 @@ pub const Repository = struct {
         return self.history.log(self.current_track, filter);
     }
 
+    /// Current track's HEAD commit hash, or `null` if the track has no
+    /// commits yet. Every history-facing command (`show`, `commit`,
+    /// `uncommit`) needs this — public so they read it here instead of
+    /// reaching into `ref_store` directly.
+    pub fn head(self: *Repository) !?Hash {
+        return self.ref_store.readTrack(self.current_track);
+    }
+
+    /// Resolves a commit reference: a full 64-char hex hash, or an 8+
+    /// char prefix resolved against the object store. `show` and `diff
+    /// --rev` both take commit arguments and previously each implemented
+    /// prefix resolution slightly differently — this is the one place
+    /// that logic lives now, so a hash that works in one works in the
+    /// other.
+    pub fn resolveRev(self: *Repository, raw: []const u8) !Hash {
+        return hash_mod.fromHex(raw) catch {
+            return self.store.resolveHashPrefix(raw) catch |err| switch (err) {
+                error.Ambiguous => error.AmbiguousRev,
+                error.NotFound => error.RevNotFound,
+                else => error.InvalidRev,
+            };
+        };
+    }
+
+    pub const UncommitResult = struct {
+        undone: Hash,
+        /// `null` means the undone commit was the root commit — the
+        /// track now has no commits at all, same as before the first
+        /// commit was ever made.
+        new_head: ?Hash,
+    };
+
+    /// Moves the current track back one commit (a soft undo — the index
+    /// is left exactly as it was, so the undone commit's changes stay
+    /// staged and ready to edit or re-commit). If HEAD is the root
+    /// commit, there's no parent to move to, so this deletes the track's
+    /// ref entirely instead — the same "no ref file yet" state every
+    /// other command already treats as "no commits" (`head()` returning
+    /// `null`, `commit`'s root-commit path).
+    ///
+    /// Errors with `error.NoCommits` if the track has no commits, or
+    /// `error.MergeCommit` if HEAD has more than one parent — uncommit
+    /// only supports linear history right now.
+    pub fn uncommit(self: *Repository) !UncommitResult {
+        const head_hash = (try self.head()) orelse return error.NoCommits;
+
+        var c = try commit_mod.read(self.alloc, &self.store, head_hash);
+        defer c.deinit(self.alloc);
+
+        if (c.parents.len > 1) return error.MergeCommit;
+
+        if (c.parents.len == 0) {
+            try self.ref_store.deleteTrack(self.current_track);
+            return .{ .undone = head_hash, .new_head = null };
+        }
+
+        const parent_hash = c.parents[0].hash;
+        try self.ref_store.updateTrack(self.current_track, parent_hash);
+        return .{ .undone = head_hash, .new_head = parent_hash };
+    }
+
     fn headSnapshot(self: *Repository) !Hash {
-        const head = (try self.ref_store.readTrack(self.current_track)) orelse return hash_mod.zero_hash;
-        var c = try commit_mod.read(self.alloc, &self.store, head);
+        const head_hash = (try self.head()) orelse return hash_mod.zero_hash;
+        var c = try commit_mod.read(self.alloc, &self.store, head_hash);
         defer c.deinit(self.alloc);
         return c.snapshot;
     }
@@ -345,9 +537,9 @@ test "commit advances the current track and status goes clean against HEAD" {
 
     const c1 = try repo.commit(testRequest("add a.txt", 1000));
 
-    const head = try repo.ref_store.readTrack(repo.current_track);
-    try std.testing.expect(head != null);
-    try std.testing.expect(merkle_mod.hashEq(head.?, c1));
+    const h = try repo.head();
+    try std.testing.expect(h != null);
+    try std.testing.expect(merkle_mod.hashEq(h.?, c1));
 
     var post_status = try repo.status();
     defer post_status.deinit(alloc);
@@ -396,8 +588,8 @@ test "reset soft moves the track without touching the index" {
 
     try repo.reset(c1, .soft);
 
-    const head = try repo.ref_store.readTrack(repo.current_track);
-    try std.testing.expect(merkle_mod.hashEq(head.?, c1));
+    const h = try repo.head();
+    try std.testing.expect(merkle_mod.hashEq(h.?, c1));
     // Soft reset leaves the index (still holding both entries) alone.
     try std.testing.expectEqual(@as(usize, 2), repo.index.entries.items.len);
 }
@@ -421,8 +613,8 @@ test "reset mixed rebuilds the index to match the target commit's snapshot" {
     try std.testing.expectEqual(@as(usize, 1), repo.index.entries.items.len);
     try std.testing.expectEqualStrings("a.txt", repo.index.entries.items[0].path);
 
-    const head = try repo.ref_store.readTrack(repo.current_track);
-    try std.testing.expect(merkle_mod.hashEq(head.?, c1));
+    const h = try repo.head();
+    try std.testing.expect(merkle_mod.hashEq(h.?, c1));
 }
 
 test "diffCommits reports the added path between two commit snapshots" {
@@ -484,4 +676,220 @@ test "add stages a real worktree file and status reports it, then commit clears 
     defer post.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), post.staged.len);
     try std.testing.expectEqual(@as(usize, 0), post.unstaged.len);
+}
+
+test "add rejects absolute paths and paths that escape the repo root" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+
+    const repo = try Repository.init(alloc, tfs.fs(), "/tmp/does-not-matter");
+    defer repo.deinit();
+
+    try std.testing.expectError(error.AbsolutePath, repo.add(&.{"/etc/passwd"}));
+    try std.testing.expectError(error.PathEscapesRoot, repo.add(&.{"../outside.txt"}));
+}
+
+test "restorePaths rewrites a modified worktree file back to the staged blob" {
+    const alloc = std.testing.allocator;
+
+    var control_tmp = std.testing.tmpDir(.{});
+    defer control_tmp.cleanup();
+    var worktree_tmp = std.testing.tmpDir(.{});
+    defer worktree_tmp.cleanup();
+
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "hello.txt", .data = "hi there" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
+
+    var control_fs = io.RealFs.init(control_tmp.dir);
+    const repo = try Repository.init(alloc, control_fs.fs(), worktree_root);
+    defer repo.deinit();
+
+    try repo.add(&.{"hello.txt"});
+
+    // Simulate an unwanted edit made after staging
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "hello.txt", .data = "an unwanted edit" });
+
+    try repo.restorePaths(&.{"hello.txt"});
+
+    const restored = try worktree_tmp.dir.readFileAlloc(alloc, "hello.txt", 1024);
+    defer alloc.free(restored);
+    try std.testing.expectEqualStrings("hi there", restored);
+}
+
+test "restorePaths errors on an untracked path without touching anything" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+
+    const repo = try Repository.init(alloc, tfs.fs(), "/tmp/does-not-matter");
+    defer repo.deinit();
+
+    try std.testing.expectError(error.NotTracked, repo.restorePaths(&.{"never-added.txt"}));
+}
+
+test "removePaths deletes the worktree file by default, --cached leaves it" {
+    const alloc = std.testing.allocator;
+
+    var control_tmp = std.testing.tmpDir(.{});
+    defer control_tmp.cleanup();
+    var worktree_tmp = std.testing.tmpDir(.{});
+    defer worktree_tmp.cleanup();
+
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "a" });
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "b.txt", .data = "b" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
+
+    var control_fs = io.RealFs.init(control_tmp.dir);
+    const repo = try Repository.init(alloc, control_fs.fs(), worktree_root);
+    defer repo.deinit();
+
+    try repo.add(&.{ "a.txt", "b.txt" });
+
+    try repo.removePaths(&.{"a.txt"}, .{ .cached = true });
+    try std.testing.expect(repo.index.lookup("a.txt") == null);
+    // --cached: worktree file survives.
+    try worktree_tmp.dir.access("a.txt", .{});
+
+    try repo.removePaths(&.{"b.txt"}, .{});
+    try std.testing.expect(repo.index.lookup("b.txt") == null);
+    try std.testing.expectError(error.FileNotFound, worktree_tmp.dir.access("b.txt", .{}));
+}
+
+test "movePath renames on disk and in the index, preserving content" {
+    const alloc = std.testing.allocator;
+
+    var control_tmp = std.testing.tmpDir(.{});
+    defer control_tmp.cleanup();
+    var worktree_tmp = std.testing.tmpDir(.{});
+    defer worktree_tmp.cleanup();
+
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "old.txt", .data = "content" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
+
+    var control_fs = io.RealFs.init(control_tmp.dir);
+    const repo = try Repository.init(alloc, control_fs.fs(), worktree_root);
+    defer repo.deinit();
+
+    try repo.add(&.{"old.txt"});
+    try repo.movePath("old.txt", "new.txt", .{});
+
+    try std.testing.expect(repo.index.lookup("old.txt") == null);
+    try std.testing.expect(repo.index.lookup("new.txt") != null);
+    try std.testing.expectError(error.FileNotFound, worktree_tmp.dir.access("old.txt", .{}));
+
+    const moved = try worktree_tmp.dir.readFileAlloc(alloc, "new.txt", 1024);
+    defer alloc.free(moved);
+    try std.testing.expectEqualStrings("content", moved);
+}
+
+test "movePath refuses an already-tracked destination without force" {
+    const alloc = std.testing.allocator;
+
+    var control_tmp = std.testing.tmpDir(.{});
+    defer control_tmp.cleanup();
+    var worktree_tmp = std.testing.tmpDir(.{});
+    defer worktree_tmp.cleanup();
+
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "a" });
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "b.txt", .data = "b" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
+
+    var control_fs = io.RealFs.init(control_tmp.dir);
+    const repo = try Repository.init(alloc, control_fs.fs(), worktree_root);
+    defer repo.deinit();
+
+    try repo.add(&.{ "a.txt", "b.txt" });
+
+    try std.testing.expectError(error.DestinationTracked, repo.movePath("a.txt", "b.txt", .{}));
+    // force lets it through and overwrites the tracked destination.
+    try repo.movePath("a.txt", "b.txt", .{ .force = true });
+    try std.testing.expect(repo.index.lookup("a.txt") == null);
+}
+
+test "uncommit on a normal commit moves the track to its parent" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+
+    const repo = try Repository.init(alloc, tfs.fs(), "/tmp/does-not-matter");
+    defer repo.deinit();
+
+    try stageFakeEntry(repo, "a.txt", "one");
+    const c1 = try repo.commit(testRequest("add a.txt", 1000));
+
+    try stageFakeEntry(repo, "b.txt", "two");
+    const c2 = try repo.commit(testRequest("add b.txt", 2000));
+
+    const result = try repo.uncommit();
+    try std.testing.expect(merkle_mod.hashEq(result.undone, c2));
+    try std.testing.expect(result.new_head != null);
+    try std.testing.expect(merkle_mod.hashEq(result.new_head.?, c1));
+
+    const h = try repo.head();
+    try std.testing.expect(merkle_mod.hashEq(h.?, c1));
+    // Soft undo: index still holds both entries, ready to re-commit
+    try std.testing.expectEqual(@as(usize, 2), repo.index.entries.items.len);
+}
+
+test "uncommit on the root commit deletes the track ref, returning to 'no commits'" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+
+    const repo = try Repository.init(alloc, tfs.fs(), "/tmp/does-not-matter");
+    defer repo.deinit();
+
+    try stageFakeEntry(repo, "a.txt", "one");
+    const c1 = try repo.commit(testRequest("add a.txt", 1000));
+
+    const result = try repo.uncommit();
+    try std.testing.expect(merkle_mod.hashEq(result.undone, c1));
+    try std.testing.expectEqual(@as(?Hash, null), result.new_head);
+
+    try std.testing.expectEqual(@as(?Hash, null), try repo.head());
+
+    // Re-committing goes through the same root-commit path as the first time
+    const c1_again = try repo.commit(testRequest("add a.txt again", 3000));
+    try std.testing.expect(try repo.head() != null);
+    _ = c1_again;
+}
+
+test "uncommit errors with NoCommits when the track has never been committed to" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+
+    const repo = try Repository.init(alloc, tfs.fs(), "/tmp/does-not-matter");
+    defer repo.deinit();
+
+    try std.testing.expectError(error.NoCommits, repo.uncommit());
+}
+
+test "resolveRev accepts a full hash and rejects garbage" {
+    const alloc = std.testing.allocator;
+    var tfs = io.TestFs.init(alloc);
+    defer tfs.deinit();
+
+    const repo = try Repository.init(alloc, tfs.fs(), "/tmp/does-not-matter");
+    defer repo.deinit();
+
+    try stageFakeEntry(repo, "a.txt", "one");
+    const c1 = try repo.commit(testRequest("add a.txt", 1000));
+
+    const hex = try hash_mod.toHex(alloc, c1);
+    defer alloc.free(hex);
+
+    const resolved = try repo.resolveRev(hex);
+    try std.testing.expect(merkle_mod.hashEq(resolved, c1));
+
+    try std.testing.expectError(error.RevNotFound, repo.resolveRev("deadbeef"));
 }
