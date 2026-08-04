@@ -17,23 +17,66 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     const index = &opened.repo.index;
 
     if (index.entries.items.len == 0) {
-        std.debug.print("index empty\n", .{});
+        try ctx.out.writeAll(
+            \\Repository
+            \\
+            \\No pending snapshot.
+            \\Working tree is clean.
+            \\
+        );
         return;
     }
+    try ctx.out.writeAll(
+        \\Repository
+        \\
+    );
 
-    for (index.entries.items) |entry| {
-        const state = try index.stateOf(opened.repo.root, entry);
-        const short = merk.crypto.hash.shortHex(entry.blob_hash);
+    var printed_any = false;
 
-        std.debug.print(
-            "{s: <8} {s} {s}\n",
-            .{ @tagName(state), short, entry.path },
+    inline for (.{
+        .modified,
+        .deleted,
+    }) |wanted_state| {
+        var header_printed = false;
+
+        for (index.entries.items) |entry| {
+            const state = try index.stateOf(opened.repo.root, entry);
+
+            if (state != wanted_state)
+                continue;
+
+            if (!header_printed) {
+                header_printed = true;
+                printed_any = true;
+
+                const header = switch (wanted_state) {
+                    .modified => "Modified",
+                    .deleted => "Deleted",
+                    else => unreachable,
+                };
+
+                try ctx.out.print("{s}\n", .{header});
+            }
+
+            try ctx.out.print("  {s}\n", .{entry.path});
+        }
+
+        if (header_printed)
+            try ctx.out.writeByte('\n');
+    }
+
+    if (!printed_any) {
+        try ctx.out.writeAll(
+            \\No pending snapshot changes.
+            \\
         );
     }
 }
 
 pub const command = Command{
     .name = "status",
-    .description = "Show the current index state.",
+    .description = "Show the repository status.",
+    .usage = "",
+    .flags = &.{},
     .run = run,
 };
