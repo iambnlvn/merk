@@ -1,5 +1,7 @@
 const std = @import("std");
-const hash_mod = @import("../crypto/crypto.zig").hash;
+const Allocator = std.mem.Allocator;
+const testing = std.testing;
+const hash_mod = @import("crypto").hash;
 const node = @import("node.zig");
 
 pub const Hash = hash_mod.Hash;
@@ -14,7 +16,7 @@ pub const Entry = struct {
     mode: u64,
     mtime: i128,
 
-    pub fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Entry, alloc: Allocator) void {
         alloc.free(self.path);
     }
 };
@@ -44,13 +46,13 @@ pub const EntryChange = struct {
     old_mode: ?u64 = null,
     new_mode: ?u64 = null,
 
-    pub fn deinit(self: *EntryChange, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *EntryChange, alloc: Allocator) void {
         alloc.free(self.path);
     }
 };
 
 /// Release all memory associated with a slice of changes
-pub fn freeChanges(alloc: std.mem.Allocator, changes: []EntryChange) void {
+pub fn freeChanges(alloc: Allocator, changes: []EntryChange) void {
     for (changes) |*c| c.deinit(alloc);
     alloc.free(changes);
 }
@@ -94,9 +96,9 @@ pub fn btreeLessThan(_: void, lhs: Entry, rhs: Entry) bool {
 }
 
 test "validatePath rejects the control directory and its contents" {
-    try std.testing.expectError(error.InvalidPath, validatePath(CONTROL_DIR_NAME));
-    try std.testing.expectError(error.InvalidPath, validatePath(CONTROL_DIR_NAME ++ "/HEAD"));
-    try std.testing.expectError(error.InvalidPath, validatePath(CONTROL_DIR_NAME ++ "/objects/ab/cd"));
+    try testing.expectError(error.InvalidPath, validatePath(CONTROL_DIR_NAME));
+    try testing.expectError(error.InvalidPath, validatePath(CONTROL_DIR_NAME ++ "/HEAD"));
+    try testing.expectError(error.InvalidPath, validatePath(CONTROL_DIR_NAME ++ "/objects/ab/cd"));
 }
 
 test "validatePath does not false-positive on a sibling prefix" {
@@ -106,15 +108,15 @@ test "validatePath does not false-positive on a sibling prefix" {
 }
 
 test "validatePath rejects absolute paths, empty paths, and .. segments" {
-    try std.testing.expectError(error.InvalidPath, validatePath(""));
-    try std.testing.expectError(error.InvalidPath, validatePath("/etc/passwd"));
-    try std.testing.expectError(error.InvalidPath, validatePath("a/../b"));
-    try std.testing.expectError(error.InvalidPath, validatePath("a//b"));
+    try testing.expectError(error.InvalidPath, validatePath(""));
+    try testing.expectError(error.InvalidPath, validatePath("/etc/passwd"));
+    try testing.expectError(error.InvalidPath, validatePath("a/../b"));
+    try testing.expectError(error.InvalidPath, validatePath("a//b"));
 }
 
 test "pathKey is deterministic big-endian prefix" {
     const h = hash_mod.blake3("src/main.zig");
     var expected: PathKey = 0;
     for (h[0..8]) |byte| expected = (expected << 8) | byte;
-    try std.testing.expectEqual(expected, pathKey("src/main.zig"));
+    try testing.expectEqual(expected, pathKey("src/main.zig"));
 }

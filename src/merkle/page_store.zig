@@ -1,7 +1,14 @@
 const std = @import("std");
-const hash_mod = @import("../crypto/crypto.zig").hash;
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+
+const hash_mod = @import("crypto").hash;
 const node = @import("node.zig");
-const io = @import("../storage/io.zig");
+
+const storage = @import("storage");
+const Vfs = storage.Vfs;
+const MemoryFs = storage.MemoryFs;
+const OsFs = storage.OsFs;
 
 const Hash = hash_mod.Hash;
 const Page = node.Page;
@@ -11,15 +18,15 @@ const Page = node.Page;
 /// `pages_dir` (relative to `fs`'s root) — of the form
 /// `<pages_dir>/xx/yy/<64-char-hex>`. Mirrors `object.Store`'s
 /// `fs`/`objects_dir` shape so both storage layers are driven identically
-/// in tests (`io.TestFs`) and in production (`io.RealFs`).
+/// in tests (`MemoryFs`) and in production (`io.RealFs`).
 pub const PageStore = struct {
-    alloc: std.mem.Allocator,
-    fs: io.FileSystem,
+    alloc: Allocator,
+    fs: Vfs,
     /// Directory pages live under, relative to `fs`'s root. May be ""
     /// if `fs` is already rooted at the pages directory itself
     pages_dir: []const u8,
 
-    pub fn init(alloc: std.mem.Allocator, fs: io.FileSystem, pages_dir: []const u8) PageStore {
+    pub fn init(alloc: Allocator, fs: Vfs, pages_dir: []const u8) PageStore {
         return .{ .alloc = alloc, .fs = fs, .pages_dir = pages_dir };
     }
 
@@ -98,44 +105,44 @@ fn testParseableLeafPage() [node.PAGE_SIZE]u8 {
 }
 
 test "put+get round-trips page bytes" {
-    const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
     const page = testPage(0xAB);
     const h = try store.put(&page);
     const back = try store.getBytes(h);
-    try std.testing.expectEqualSlices(u8, &page, &back);
+    try testing.expectEqualSlices(u8, &page, &back);
 }
 
 test "put is idempotent — writing identical content twice yields the same hash and one file" {
-    const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
     const page = testPage(0x11);
     const h1 = try store.put(&page);
     const h2 = try store.put(&page);
-    try std.testing.expectEqualSlices(u8, &h1, &h2);
-    try std.testing.expectEqual(@as(usize, 1), tfs.fileCount());
+    try testing.expectEqualSlices(u8, &h1, &h2);
+    try testing.expectEqual(@as(usize, 1), mem_fs.fileCount());
 }
 
 test "get on an unknown hash returns NotFound" {
-    const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
-    try std.testing.expectError(error.NotFound, store.getBytes(hash_mod.zero_hash));
+    try testing.expectError(error.NotFound, store.getBytes(hash_mod.zero_hash));
 }
 
 test "getBytes detects on-disk corruption via content hash mismatch" {
-    const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
     const page = testPage(0x22);
     const h = try store.put(&page);
@@ -147,21 +154,21 @@ test "getBytes detects on-disk corruption via content hash mismatch" {
     const path = try std.fmt.allocPrint(alloc, "index/pages/{s}/{s}/{s}", .{ hex[0..2], hex[2..4], hex });
     defer alloc.free(path);
 
-    const original = (try tfs.fs().readFile(alloc, path)).?;
+    const original = (try mem_fs.fs().readFile(alloc, path)).?;
     defer alloc.free(original);
     const tampered = try alloc.dupe(u8, original);
     defer alloc.free(tampered);
     tampered[0] ^= 0xFF;
-    try tfs.fs().writeFile(alloc, path, tampered);
+    try mem_fs.fs().writeFile(alloc, path, tampered);
 
-    try std.testing.expectError(error.HashMismatch, store.getBytes(h));
+    try testing.expectError(error.HashMismatch, store.getBytes(h));
 }
 
 test "getBytes rejects a page file of the wrong size as corrupt" {
-    const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
     // Fabricate an undersized "page" directly, bypassing PageStore.put,
     // to simulate a truncated write
@@ -170,48 +177,48 @@ test "getBytes rejects a page file of the wrong size as corrupt" {
     const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{bogus_hash}) catch unreachable;
     const path = try std.fmt.allocPrint(alloc, "index/pages/{s}/{s}/{s}", .{ hex[0..2], hex[2..4], hex });
     defer alloc.free(path);
-    try tfs.fs().writeFile(alloc, path, "not a full page");
+    try mem_fs.fs().writeFile(alloc, path, "not a full page");
 
-    try std.testing.expectError(error.CorruptIndexPage, store.getBytes(bogus_hash));
+    try testing.expectError(error.CorruptIndexPage, store.getBytes(bogus_hash));
 }
 
 test "get parses page bytes into a structured Page" {
-    const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
     const page = testParseableLeafPage();
     const h = try store.put(&page);
     var parsed = try store.get(h);
     defer parsed.deinit(alloc);
 
-    try std.testing.expect(parsed == .leaf);
-    try std.testing.expectEqual(@as(usize, 1), parsed.leaf.items.len);
-    try std.testing.expectEqualStrings("only.txt", parsed.leaf.items[0].path);
+    try testing.expect(parsed == .leaf);
+    try testing.expectEqual(@as(usize, 1), parsed.leaf.items.len);
+    try testing.expectEqualStrings("only.txt", parsed.leaf.items[0].path);
 }
 
 test "PageStore works with an empty pages_dir (fs already rooted there)" {
-    const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = PageStore.init(alloc, tfs.fs(), "");
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = PageStore.init(alloc, mem_fs.fs(), "");
 
     const page = testPage(0x33);
     const h = try store.put(&page);
     const back = try store.getBytes(h);
-    try std.testing.expectEqualSlices(u8, &page, &back);
+    try testing.expectEqualSlices(u8, &page, &back);
 }
 
 test "RealFs: put+get round-trips page bytes on real disk" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var real_fs = io.RealFs.init(tmp.dir);
-    const store = PageStore.init(alloc, real_fs.fs(), "index/pages");
+    var os_fs = OsFs.init(tmp.dir);
+    const store = PageStore.init(alloc, os_fs.fs(), "index/pages");
 
     const page = testPage(0xCD);
     const h = try store.put(&page);
     const back = try store.getBytes(h);
-    try std.testing.expectEqualSlices(u8, &page, &back);
+    try testing.expectEqualSlices(u8, &page, &back);
 }

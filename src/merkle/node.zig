@@ -1,9 +1,13 @@
 const std = @import("std");
-const hash_mod = @import("../crypto/crypto.zig").hash;
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
+
+const hash_mod = @import("crypto").hash;
 
 pub const Hash = hash_mod.Hash;
 
-pub const MAGIC: u32 = 0x4E_4F_44_55;
+pub const MAGIC: u32 = 0x4D_45_52_4B;
 pub const VERSION: u8 = 1;
 
 /// Fixed page size for all index pages. Must be large enough to hold at
@@ -55,10 +59,10 @@ pub const ChildRef = struct {
 /// Memory is managed by the allocator passed to `parsePage` and must be
 /// freed with `Page.deinit`
 pub const Page = union(enum) {
-    leaf: std.ArrayList(LeafEntry),
-    internal: std.ArrayList(ChildRef),
+    leaf: ArrayList(LeafEntry),
+    internal: ArrayList(ChildRef),
 
-    pub fn deinit(self: *Page, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Page, alloc: Allocator) void {
         switch (self.*) {
             .leaf => |*entries| {
                 for (entries.items) |*entry| alloc.free(entry.path);
@@ -126,7 +130,7 @@ fn readPageHeader(bytes: *const [PAGE_SIZE]u8) DiffError!PageHeader {
 
 /// Parse a page's raw bytes into an in-memory `Page`, dispatching on the
 /// page-kind tag in the first byte
-pub fn parsePage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8) DiffError!Page {
+pub fn parsePage(alloc: Allocator, bytes: *const [PAGE_SIZE]u8) DiffError!Page {
     const header = try readPageHeader(bytes);
     return switch (header.kind) {
         LEAF_PAGE => parseLeafPage(alloc, bytes, header.count),
@@ -135,14 +139,14 @@ pub fn parsePage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8) DiffErro
     };
 }
 
-fn parseLeafPage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8, count: u16) DiffError!Page {
+fn parseLeafPage(alloc: Allocator, bytes: *const [PAGE_SIZE]u8, count: u16) DiffError!Page {
     // A leaf page is never built with zero entries (btree.build bails out
     // before writing an empty tree at all) — a count of 0 here means a
     // corrupt or hand-crafted page, not a legitimate empty leaf.
     if (count == 0) return error.CorruptIndexPage;
 
     var reader = std.Io.Reader.fixed(bytes[LEAF_HEADER_LEN..]);
-    var entries: std.ArrayList(LeafEntry) = .empty;
+    var entries: ArrayList(LeafEntry) = .empty;
     errdefer {
         for (entries.items) |*entry| alloc.free(entry.path);
         entries.deinit(alloc);
@@ -187,11 +191,11 @@ fn parseLeafPage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8, count: u
     return .{ .leaf = entries };
 }
 
-fn parseInternalPage(alloc: std.mem.Allocator, bytes: *const [PAGE_SIZE]u8, count: u16) DiffError!Page {
+fn parseInternalPage(alloc: Allocator, bytes: *const [PAGE_SIZE]u8, count: u16) DiffError!Page {
     if (count == 0) return error.CorruptIndexPage;
 
     var reader = std.Io.Reader.fixed(bytes[INTERNAL_HEADER_LEN..]);
-    var children: std.ArrayList(ChildRef) = .empty;
+    var children: ArrayList(ChildRef) = .empty;
     errdefer children.deinit(alloc);
 
     var last_separator: ?PathKey = null;
@@ -235,14 +239,14 @@ test "leaf page round-trips through writePageHeader/writeLeafEntry/parsePage" {
     var page: [PAGE_SIZE]u8 = [_]u8{0} ** PAGE_SIZE;
     try buildTestLeafPage(&page, &.{ testLeaf(1, "a"), testLeaf(2, "b") });
 
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var parsed = try parsePage(alloc, &page);
     defer parsed.deinit(alloc);
 
-    try std.testing.expect(parsed == .leaf);
-    try std.testing.expectEqual(@as(usize, 2), parsed.leaf.items.len);
-    try std.testing.expectEqualStrings("a", parsed.leaf.items[0].path);
-    try std.testing.expectEqualStrings("b", parsed.leaf.items[1].path);
+    try testing.expect(parsed == .leaf);
+    try testing.expectEqual(@as(usize, 2), parsed.leaf.items.len);
+    try testing.expectEqualStrings("a", parsed.leaf.items[0].path);
+    try testing.expectEqualStrings("b", parsed.leaf.items[1].path);
 }
 
 test "parsePage rejects a bad magic" {
@@ -250,7 +254,7 @@ test "parsePage rejects a bad magic" {
     try buildTestLeafPage(&page, &.{testLeaf(1, "a")});
     std.mem.writeInt(u32, page[4..8], MAGIC +% 1, .little);
 
-    try std.testing.expectError(error.CorruptIndexPage, parsePage(std.testing.allocator, &page));
+    try testing.expectError(error.CorruptIndexPage, parsePage(testing.allocator, &page));
 }
 
 test "parsePage rejects an unsupported version" {
@@ -258,21 +262,21 @@ test "parsePage rejects an unsupported version" {
     try buildTestLeafPage(&page, &.{testLeaf(1, "a")});
     page[1] = VERSION +% 1;
 
-    try std.testing.expectError(error.UnsupportedPageVersion, parsePage(std.testing.allocator, &page));
+    try testing.expectError(error.UnsupportedPageVersion, parsePage(testing.allocator, &page));
 }
 
 test "parsePage rejects a leaf page claiming zero entries" {
     var page: [PAGE_SIZE]u8 = [_]u8{0} ** PAGE_SIZE;
     writePageHeader(&page, LEAF_PAGE, 0);
 
-    try std.testing.expectError(error.CorruptIndexPage, parsePage(std.testing.allocator, &page));
+    try testing.expectError(error.CorruptIndexPage, parsePage(testing.allocator, &page));
 }
 
 test "parsePage rejects an internal page claiming zero children" {
     var page: [PAGE_SIZE]u8 = [_]u8{0} ** PAGE_SIZE;
     writePageHeader(&page, INTERNAL_PAGE, 0);
 
-    try std.testing.expectError(error.CorruptIndexPage, parsePage(std.testing.allocator, &page));
+    try testing.expectError(error.CorruptIndexPage, parsePage(testing.allocator, &page));
 }
 
 test "parsePage rejects same-key leaf entries stored out of path order" {
@@ -282,24 +286,24 @@ test "parsePage rejects same-key leaf entries stored out of path order" {
     // reject other corruption either.
     try buildTestLeafPage(&page, &.{ testLeaf(1, "b"), testLeaf(1, "a") });
 
-    try std.testing.expectError(error.CorruptIndexPage, parsePage(std.testing.allocator, &page));
+    try testing.expectError(error.CorruptIndexPage, parsePage(testing.allocator, &page));
 }
 
 test "parsePage accepts same-key leaf entries that are correctly ordered" {
     var page: [PAGE_SIZE]u8 = [_]u8{0} ** PAGE_SIZE;
     try buildTestLeafPage(&page, &.{ testLeaf(1, "a"), testLeaf(1, "b") });
 
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var parsed = try parsePage(alloc, &page);
     defer parsed.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), parsed.leaf.items.len);
+    try testing.expectEqual(@as(usize, 2), parsed.leaf.items.len);
 }
 
 test "isChunkBoundary matches masked low bits" {
-    try std.testing.expect(isChunkBoundary(0b10000, 0b01111));
-    try std.testing.expect(!isChunkBoundary(0b10001, 0b01111));
+    try testing.expect(isChunkBoundary(0b10000, 0b01111));
+    try testing.expect(!isChunkBoundary(0b10001, 0b01111));
 }
 
 test "leafEntryWireSize accounts for the variable-length path" {
-    try std.testing.expectEqual(leafEntryWireSize(0), leafEntryWireSize(5) - 5);
+    try testing.expectEqual(leafEntryWireSize(0), leafEntryWireSize(5) - 5);
 }

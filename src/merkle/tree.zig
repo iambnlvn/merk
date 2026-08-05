@@ -1,9 +1,13 @@
 const std = @import("std");
-const hash_mod = @import("../crypto/crypto.zig").hash;
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
+
+const hash_mod = @import("crypto").hash;
 const node = @import("node.zig");
 const entry_mod = @import("entry.zig");
 const page_store_mod = @import("page_store.zig");
-const io = @import("../storage/io.zig");
+const MemoryFs = @import("storage").MemoryFs;
 
 const Hash = hash_mod.Hash;
 const Entry = entry_mod.Entry;
@@ -12,6 +16,7 @@ const ChildRef = node.ChildRef;
 const PageStore = page_store_mod.PageStore;
 const PAGE_SIZE = node.PAGE_SIZE;
 
+const zero_hash = hash_mod.zero_hash;
 /// Content-defined chunking threshold for leaf pages.
 /// When the low bits of an entry's key are all zero, the page is cut here
 const LEAF_BOUNDARY_MASK: u64 = 0x1F;
@@ -32,10 +37,10 @@ fn toLeafEntry(e: Entry) LeafEntry {
 
 /// Serialize `entries` into a content-defined Merkle B-tree and return the
 /// hash of its root page.
-pub fn build(alloc: std.mem.Allocator, store: *const PageStore, entries: []const Entry) !Hash {
-    if (entries.len == 0) return hash_mod.zero_hash;
+pub fn build(alloc: Allocator, store: *const PageStore, entries: []const Entry) !Hash {
+    if (entries.len == 0) return zero_hash;
 
-    var level: std.ArrayList(ChildRef) = .empty;
+    var level: ArrayList(ChildRef) = .empty;
     defer level.deinit(alloc);
 
     // Sort a local copy by B-tree key for page construction.
@@ -80,7 +85,7 @@ pub fn build(alloc: std.mem.Allocator, store: *const PageStore, entries: []const
 
     // Build internal levels until only the root remains
     while (level.items.len > 1) {
-        var next: std.ArrayList(ChildRef) = .empty;
+        var next: ArrayList(ChildRef) = .empty;
         errdefer next.deinit(alloc);
 
         var child_offset: usize = 0;
@@ -123,7 +128,7 @@ pub fn build(alloc: std.mem.Allocator, store: *const PageStore, entries: []const
 /// Recursively collect every entry reachable from `page_hash` into `out`,
 /// in on-disk (key-sorted) order. Paths are freshly duplicated;
 /// NOTE:  the caller owns them via whatever owns `out`.
-pub fn collect(alloc: std.mem.Allocator, store: *const PageStore, page_hash: Hash, out: *std.ArrayList(Entry)) !void {
+pub fn collect(alloc: Allocator, store: *const PageStore, page_hash: Hash, out: *ArrayList(Entry)) !void {
     var page = try store.get(page_hash);
     defer page.deinit(alloc);
 
@@ -147,7 +152,7 @@ pub fn collect(alloc: std.mem.Allocator, store: *const PageStore, page_hash: Has
     }
 }
 
-fn testEntry(alloc: std.mem.Allocator, path: []const u8, seed: u8) !Entry {
+fn testEntry(alloc: Allocator, path: []const u8, seed: u8) !Entry {
     return .{
         .path = try alloc.dupe(u8, path),
         .blob_hash = [_]u8{seed} ** 32,
@@ -157,58 +162,58 @@ fn testEntry(alloc: std.mem.Allocator, path: []const u8, seed: u8) !Entry {
     };
 }
 
-fn freeTestEntries(alloc: std.mem.Allocator, entries: *std.ArrayList(Entry)) void {
+fn freeTestEntries(alloc: Allocator, entries: *ArrayList(Entry)) void {
     for (entries.items) |*e| e.deinit(alloc);
     entries.deinit(alloc);
 }
 
 test "build of an empty entry list returns zero_hash without touching the store" {
-    const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
     const root = try build(alloc, &store, &.{});
-    try std.testing.expectEqualSlices(u8, &hash_mod.zero_hash, &root);
+    try testing.expectEqualSlices(u8, &zero_hash, &root);
 }
 
 test "build+collect round-trips a small entry set that fits one leaf page" {
-    const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
-    var entries: std.ArrayList(Entry) = .empty;
+    var entries: ArrayList(Entry) = .empty;
     defer freeTestEntries(alloc, &entries);
     try entries.append(alloc, try testEntry(alloc, "b.txt", 2));
     try entries.append(alloc, try testEntry(alloc, "a.txt", 1));
     try entries.append(alloc, try testEntry(alloc, "c.txt", 3));
 
     const root = try build(alloc, &store, entries.items);
-    try std.testing.expect(!std.mem.eql(u8, &root, &hash_mod.zero_hash));
+    try testing.expect(!std.mem.eql(u8, &root, &zero_hash));
 
-    var collected: std.ArrayList(Entry) = .empty;
+    var collected: ArrayList(Entry) = .empty;
     defer freeTestEntries(alloc, &collected);
     try collect(alloc, &store, root, &collected);
 
-    try std.testing.expectEqual(@as(usize, 3), collected.items.len);
+    try testing.expectEqual(@as(usize, 3), collected.items.len);
     for (&[_][]const u8{ "a.txt", "b.txt", "c.txt" }) |want| {
         var found = false;
         for (collected.items) |e| {
             if (std.mem.eql(u8, e.path, want)) found = true;
         }
-        try std.testing.expect(found);
+        try testing.expect(found);
     }
 }
 
 test "build+collect round-trips a large entry set spanning multiple pages and levels" {
-    const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
     const n = 600;
-    var entries: std.ArrayList(Entry) = .empty;
+    var entries: ArrayList(Entry) = .empty;
     defer freeTestEntries(alloc, &entries);
     var i: usize = 0;
     while (i < n) : (i += 1) {
@@ -219,11 +224,11 @@ test "build+collect round-trips a large entry set spanning multiple pages and le
 
     const root = try build(alloc, &store, entries.items);
 
-    var collected: std.ArrayList(Entry) = .empty;
+    var collected: ArrayList(Entry) = .empty;
     defer freeTestEntries(alloc, &collected);
     try collect(alloc, &store, root, &collected);
 
-    try std.testing.expectEqual(@as(usize, n), collected.items.len);
+    try testing.expectEqual(@as(usize, n), collected.items.len);
 
     // Every original entry must reappear with matching content — not just
     // matching count. Also confirms collect() traverses internal levels
@@ -234,20 +239,20 @@ test "build+collect round-trips a large entry set spanning multiple pages and le
             if (std.mem.eql(u8, c.path, orig.path)) found = c;
         }
         const c = found orelse return error.MissingEntry;
-        try std.testing.expectEqualSlices(u8, &orig.blob_hash, &c.blob_hash);
-        try std.testing.expectEqual(orig.size, c.size);
+        try testing.expectEqualSlices(u8, &orig.blob_hash, &c.blob_hash);
+        try testing.expectEqual(orig.size, c.size);
     }
 }
 
 test "build is deterministic — same entries in a different order produce the same root" {
-    const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = PageStore.init(alloc, tfs.fs(), "index/pages");
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
-    var forward: std.ArrayList(Entry) = .empty;
+    var forward: ArrayList(Entry) = .empty;
     defer freeTestEntries(alloc, &forward);
-    var reversed: std.ArrayList(Entry) = .empty;
+    var reversed: ArrayList(Entry) = .empty;
     defer freeTestEntries(alloc, &reversed);
 
     const names = [_][]const u8{ "a", "b", "c", "d", "e" };
@@ -260,5 +265,5 @@ test "build is deterministic — same entries in a different order produce the s
 
     const root_a = try build(alloc, &store, forward.items);
     const root_b = try build(alloc, &store, reversed.items);
-    try std.testing.expectEqualSlices(u8, &root_a, &root_b);
+    try testing.expectEqualSlices(u8, &root_a, &root_b);
 }
