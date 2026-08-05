@@ -11,18 +11,24 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 
-const merk = @import("merk");
-const hash_mod = merk.crypto.hash;
-const merkle_mod = merk.merkle;
-const object_mod = @import("../object/object.zig");
-const commit_mod = @import("./../commit.zig");
+const crypto = @import("crypto");
+const merkle_mod = @import("merkle");
+const MemoryFs = @import("storage").MemoryFs;
+
+const Store = @import("../object.zig").Store;
+const commit_mod = @import("./../commit.zig"); // TODO!: expose what we need from commit.zig only
 const diff_algorithms = @import("diff_algorithms.zig");
 
-const Hash = hash_mod.Hash;
+const Hash = crypto.Hash;
+const PageStore = merkle_mod.PageStore;
+const Entry = merkle_mod.Entry;
+const diffRoots = merkle_mod.diffRoots;
+const freeChanges = merkle_mod.freeChanges;
+const build = merkle_mod.build;
 
-pub const CommitDiff = diff_algorithms.CommitDiff;
-pub const FileDiff = diff_algorithms.FileDiff;
-pub const Algorithm = diff_algorithms.Algorithm;
+const CommitDiff = diff_algorithms.CommitDiff;
+const FileDiff = diff_algorithms.FileDiff;
+const Algorithm = diff_algorithms.Algorithm;
 
 /// Diff two snapshot roots — hashes of merkle B-tree pages built by
 /// `merk.merkle.build` (what `Index.save`/`History.commit` produce).
@@ -30,15 +36,15 @@ pub const Algorithm = diff_algorithms.Algorithm;
 /// entry in `new_root` shows up as added.
 pub fn diffSnapshotRoots(
     alloc: Allocator,
-    store: *const object_mod.Store,
-    page_store: *const merkle_mod.PageStore,
+    store: *const Store,
+    page_store: *const PageStore,
     old_root: ?Hash,
     new_root: Hash,
     algo: Algorithm,
 ) !CommitDiff {
-    const normalized_old = old_root orelse hash_mod.zero_hash;
-    const changes = try merkle_mod.diffRoots(alloc, page_store, normalized_old, new_root);
-    defer merkle_mod.freeChanges(alloc, changes);
+    const normalized_old = old_root orelse crypto.zero_hash;
+    const changes = try diffRoots(alloc, page_store, normalized_old, new_root);
+    defer freeChanges(alloc, changes);
 
     var file_diffs: ArrayList(FileDiff) = .empty;
     var blobs: ArrayList([]u8) = .empty;
@@ -78,8 +84,8 @@ pub fn diffSnapshotRoots(
 /// the root commit, where there is no parent to compare against.
 pub fn diffCommits(
     alloc: Allocator,
-    store: *const object_mod.Store,
-    page_store: *const merkle_mod.PageStore,
+    store: *const Store,
+    page_store: *const PageStore,
     old_commit: ?Hash,
     new_commit: Hash,
     algo: Algorithm,
@@ -106,8 +112,8 @@ pub fn diffCommits(
 /// every parent.
 pub fn diffCommitAgainstParent(
     alloc: Allocator,
-    store: *const object_mod.Store,
-    page_store: *const merkle_mod.PageStore,
+    store: *const Store,
+    page_store: *const PageStore,
     new_commit: Hash,
     algo: Algorithm,
 ) !CommitDiff {
@@ -123,18 +129,17 @@ pub fn diffCommitAgainstParent(
     return diffSnapshotRoots(alloc, store, page_store, old_root, new_c.snapshot, algo);
 }
 
-const io = merk.io;
-const object_test_mod = object_mod;
+const io = @import("storage");
 
 const FileSeed = struct { path: []const u8, content: []const u8 };
 
 fn buildRoot(
     alloc: Allocator,
-    page_store: *const merkle_mod.PageStore,
-    store: *const object_mod.Store,
+    page_store: *const PageStore,
+    store: *const Store,
     seeds: []const FileSeed,
 ) !Hash {
-    var entries: ArrayList(merkle_mod.Entry) = .empty;
+    var entries: ArrayList(Entry) = .empty;
     defer {
         for (entries.items) |*e| e.deinit(alloc);
         entries.deinit(alloc);
@@ -149,7 +154,7 @@ fn buildRoot(
             .mtime = 1,
         });
     }
-    return merkle_mod.build(alloc, page_store, entries.items);
+    return build(alloc, page_store, entries.items);
 }
 
 fn findFileDiff(cd: *const CommitDiff, path: []const u8) ?*const FileDiff {
@@ -161,10 +166,10 @@ fn findFileDiff(cd: *const CommitDiff, path: []const u8) ?*const FileDiff {
 
 test "diffSnapshotRoots reports modified, added, and removed files via merkle pruning" {
     const alloc = testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
-    const page_store = merkle_mod.PageStore.init(alloc, tfs.fs(), "index/pages");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
+    const page_store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
     const old_root = try buildRoot(alloc, &page_store, &store, &.{
         .{ .path = "a.txt", .content = "hello\nworld\n" },
@@ -197,10 +202,10 @@ test "diffSnapshotRoots reports modified, added, and removed files via merkle pr
 
 test "diffSnapshotRoots against a null old_root reports every entry as added" {
     const alloc = testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
-    const page_store = merkle_mod.PageStore.init(alloc, tfs.fs(), "index/pages");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
+    const page_store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
     const new_root = try buildRoot(alloc, &page_store, &store, &.{
         .{ .path = "a.txt", .content = "one\n" },
@@ -219,10 +224,10 @@ test "diffSnapshotRoots against a null old_root reports every entry as added" {
 
 test "diffCommits resolves commit hashes to snapshot roots before diffing" {
     const alloc = testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
-    const page_store = merkle_mod.PageStore.init(alloc, tfs.fs(), "index/pages");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
+    const page_store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
     const root1 = try buildRoot(alloc, &page_store, &store, &.{.{ .path = "a.txt", .content = "v1\n" }});
     var b1 = commit_mod.CommitBuilder.init(alloc, root1);
@@ -252,10 +257,10 @@ test "diffCommits resolves commit hashes to snapshot roots before diffing" {
 
 test "diffCommitAgainstParent treats a root commit as a diff against the empty tree" {
     const alloc = testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
-    const page_store = merkle_mod.PageStore.init(alloc, tfs.fs(), "index/pages");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
+    const page_store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
     const root1 = try buildRoot(alloc, &page_store, &store, &.{.{ .path = "a.txt", .content = "hello\n" }});
     var b1 = commit_mod.CommitBuilder.init(alloc, root1);
@@ -276,10 +281,10 @@ test "diffCommitAgainstParent treats a root commit as a diff against the empty t
 
 test "diffCommitAgainstParent uses the first (mainline) parent's snapshot" {
     const alloc = testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
-    const page_store = merkle_mod.PageStore.init(alloc, tfs.fs(), "index/pages");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
+    const page_store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
     const root1 = try buildRoot(alloc, &page_store, &store, &.{.{ .path = "a.txt", .content = "v1\n" }});
     var b1 = commit_mod.CommitBuilder.init(alloc, root1);
