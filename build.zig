@@ -208,6 +208,10 @@ fn makeTestModule(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     merk: *std.Build.Module,
+    crypto: *std.Build.Module,
+    compression: *std.Build.Module,
+    storage: *std.Build.Module,
+    merkle: *std.Build.Module,
 ) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path(path),
@@ -215,6 +219,10 @@ fn makeTestModule(
         .optimize = optimize,
         .imports = &.{
             .{ .name = "merk", .module = merk },
+            .{ .name = "crypto", .module = crypto },
+            .{ .name = "compression", .module = compression },
+            .{ .name = "storage", .module = storage },
+            .{ .name = "merkle", .module = merkle },
         },
     });
 }
@@ -227,9 +235,13 @@ fn addModuleTest(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     merk: *std.Build.Module,
+    crypto: *std.Build.Module,
+    compression: *std.Build.Module,
+    storage: *std.Build.Module,
+    merkle: *std.Build.Module,
 ) *std.Build.Step {
     const tests = b.addTest(.{
-        .root_module = makeTestModule(b, path, target, optimize, merk),
+        .root_module = makeTestModule(b, path, target, optimize, merk, crypto, compression, storage, merkle),
     });
 
     const run = b.addRunArtifact(tests);
@@ -249,10 +261,40 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const crypto = b.addModule("crypto", .{
+        .root_source_file = b.path("src/crypto/crypto.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const compression = b.addModule("compression", .{
+        .root_source_file = b.path("src/compression/compression.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const storage = b.addModule("storage", .{
+        .root_source_file = b.path("src/storage/storage.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const merkle = b.addModule("merkle", .{
+        .root_source_file = b.path("src/merkle/merkle.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "crypto", .module = crypto },
+            .{ .name = "storage", .module = storage },
+        },
+    });
     const mod = b.addModule("merk", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "crypto", .module = crypto },
+            .{ .name = "compression", .module = compression },
+            .{ .name = "storage", .module = storage },
+            .{ .name = "merkle", .module = merkle },
+        },
     });
 
     const exe = b.addExecutable(.{
@@ -263,6 +305,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "merk", .module = mod },
+                .{ .name = "crypto", .module = crypto },
+                .{ .name = "compression", .module = compression },
+                .{ .name = "storage", .module = storage },
+                .{ .name = "merkle", .module = merkle },
             },
         }),
     });
@@ -297,7 +343,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "test-focus", .description = "Run focus unit tests", .path = "src/core/refs/focus.zig" },
     };
     const refs_step = b.step("test-refs-subsystem", "Run all refs subsystem tests");
-    registerSuite(b, &refs_specs, refs_step, test_step, target, optimize, mod);
+    registerSuite(b, &refs_specs, refs_step, test_step, target, optimize, mod, crypto, compression, storage, merkle);
 
     const core_specs = [_]TestSuite{
         .{ .name = "test-object", .description = "Run object unit tests", .path = "src/core/object/object.zig" },
@@ -305,14 +351,25 @@ pub fn build(b: *std.Build) void {
         .{ .name = "test-index", .description = "Run index unit tests", .path = "src/core/index.zig" },
         .{ .name = "test-history", .description = "Run history unit tests", .path = "src/core/history.zig" },
     };
-    registerSuite(b, &core_specs, null, test_step, target, optimize, mod);
+    registerSuite(b, &core_specs, null, test_step, target, optimize, mod, crypto, compression, storage, merkle);
 
-    const diff_algorithms_step = addModuleTest(b, "test-diff-algorithms", "Run diff algorithm engine unit tests", "src/core/diff/diff_algorithms.zig", target, optimize, mod);
-    const diff_snapshot_step = addModuleTest(b, "test-diff-snapshot", "Run diff snapshot/merkle adapter unit tests", "src/core/diff.zig", target, optimize, mod);
-    const diff_render_step = addModuleTest(b, "test-diff-render", "Run diff render unit tests", "src/core/diff/diff_render.zig", target, optimize, mod);
+    const diff_algorithms_step = addModuleTest(b, "test-diff-algorithms", "Run diff algorithm engine unit tests", "src/core/diff/diff_algorithms.zig", target, optimize, mod, crypto, compression, storage, merkle);
+    const diff_snapshot_step = addModuleTest(b, "test-diff-snapshot", "Run diff snapshot/merkle adapter unit tests", "src/core/diff.zig", target, optimize, mod, crypto, compression, storage, merkle);
+    const diff_render_step = addModuleTest(b, "test-diff-render", "Run diff render unit tests", "src/core/diff/diff_render.zig", target, optimize, mod, crypto, compression, storage, merkle);
 
     const diff_step = b.step("test-diff", "Run all diff module tests");
-    const repo_step = addModuleTest(b, "test-repo", "Run repo unit tests", "src/core/repository.zig", target, optimize, mod);
+    const repo_step = addModuleTest(b, "test-repo", "Run repo unit tests", "src/core/repository.zig", target, optimize, mod, crypto, compression, storage, merkle);
+
+    const merkle_specs = [_]TestSuite{
+        .{ .name = "test-merkle-diff", .description = "Run merkle diff unit tests", .path = "src/merkle/diff.zig" },
+        .{ .name = "test-merkle-entry", .description = "Run merkle entry unit tests", .path = "src/merkle/entry.zig" },
+        .{ .name = "test-merkle-page", .description = "Run merkle node unit tests", .path = "src/merkle/page_store.zig" },
+        .{ .name = "test-merkle-tree", .description = "Run merkle tree unit tests", .path = "src/merkle/tree.zig" },
+    };
+
+    const merkle_step = b.step("test-merkle", "Run all mekle subsystem tests");
+
+    registerSuite(b, &merkle_specs, merkle_step, test_step, target, optimize, mod, crypto, compression, storage, merkle);
 
     diff_step.dependOn(diff_algorithms_step);
     diff_step.dependOn(diff_snapshot_step);
@@ -331,9 +388,13 @@ fn registerSuite(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     mod: *std.Build.Module,
+    crypto: *std.Build.Module,
+    compression: *std.Build.Module,
+    storage: *std.Build.Module,
+    merkle: *std.Build.Module,
 ) void {
     for (specs) |suite| {
-        const step = addModuleTest(b, suite.name, suite.description, suite.path, target, optimize, mod);
+        const step = addModuleTest(b, suite.name, suite.description, suite.path, target, optimize, mod, crypto, compression, storage, merkle);
         if (subsystem_step) |sub| {
             sub.dependOn(step);
         }
