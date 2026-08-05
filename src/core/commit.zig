@@ -1,8 +1,10 @@
 const std = @import("std");
-const hash_mod = @import("merk").crypto.hash;
+const hash_mod = @import("merk").crypto;
 const io = @import("merk").io;
 const object = @import("./object/object.zig");
-
+const storage = @import("storage");
+const Vfs = storage.Vfs;
+const MemoryFs = storage.MemoryFs;
 const Hash = hash_mod.Hash;
 const Store = object.Store;
 
@@ -266,12 +268,12 @@ pub fn read(
 /// `commit_hash` is the caller's job (a CLI command, CI policy, ...).
 pub const CommitSignatureStore = struct {
     alloc: std.mem.Allocator,
-    fs: io.FileSystem,
+    fs: Vfs,
     /// Directory signature sidecar files live under, e.g.
     /// "merk/history/signatures".
     signatures_dir: []const u8,
 
-    pub fn init(alloc: std.mem.Allocator, fs: io.FileSystem, signatures_dir: []const u8) CommitSignatureStore {
+    pub fn init(alloc: std.mem.Allocator, fs: Vfs, signatures_dir: []const u8) CommitSignatureStore {
         return .{ .alloc = alloc, .fs = fs, .signatures_dir = signatures_dir };
     }
 
@@ -748,9 +750,9 @@ fn testCommit(
 
 test "CommitBuilder.applyRequest populates author, committer default, and trailers" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
 
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
@@ -781,9 +783,9 @@ test "CommitBuilder.applyRequest populates author, committer default, and traile
 
 test "CommitBuilder.fromRequest is equivalent to init + applyRequest" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
 
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
@@ -810,9 +812,9 @@ test "CommitBuilder.fromRequest is equivalent to init + applyRequest" {
 test "commit write and read round-trip" {
     const alloc = std.testing.allocator;
 
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
 
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
@@ -861,9 +863,9 @@ test "commit write and read round-trip" {
 test "commit with explicit committer" {
     const alloc = std.testing.allocator;
 
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     var b = CommitBuilder.init(alloc, snapshot_hash);
@@ -888,9 +890,9 @@ test "commit with explicit committer" {
 
 test "author/committer with distinct timezone offsets round-trips" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     var b = CommitBuilder.init(alloc, snapshot_hash);
@@ -911,9 +913,9 @@ test "author/committer with distinct timezone offsets round-trips" {
 
 test "authorWithTz/committerWithTz reject a tz offset outside the civil range" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     var b = CommitBuilder.init(alloc, snapshot_hash);
@@ -936,9 +938,9 @@ test "authorWithTz/committerWithTz reject a tz offset outside the civil range" {
 
 test "change_id is generated when unset, and carried forward across a rebase-like rewrite" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     var b1 = CommitBuilder.init(alloc, snapshot_hash);
@@ -982,9 +984,9 @@ test "change_id is generated when unset, and carried forward across a rebase-lik
 
 test "encoding tag round-trips through write and read" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     var b = CommitBuilder.init(alloc, snapshot_hash);
@@ -1004,10 +1006,10 @@ test "encoding tag round-trips through write and read" {
 
 test "CommitSignatureStore: unsigned commit has no signature, attach/get/remove round-trip" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
-    const sig_store = CommitSignatureStore.init(alloc, tfs.fs(), "signatures");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
+    const sig_store = CommitSignatureStore.init(alloc, mem_fs.fs(), "signatures");
 
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
     var b = CommitBuilder.init(alloc, snapshot_hash);
@@ -1049,10 +1051,10 @@ test "CommitSignatureStore: unsigned commit has no signature, attach/get/remove 
 
 test "signing a commit does not change its hash" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
-    const sig_store = CommitSignatureStore.init(alloc, tfs.fs(), "signatures");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
+    const sig_store = CommitSignatureStore.init(alloc, mem_fs.fs(), "signatures");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     var b = CommitBuilder.init(alloc, snapshot_hash);
@@ -1085,18 +1087,18 @@ test "signing a commit does not change its hash" {
 
 test "wrong object type returns error" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const blob_hash = try store.put(.blob, "not a commit");
     try std.testing.expectError(error.WrongObjectType, read(alloc, &store, blob_hash));
 }
 
 test "commit with a normal parent" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     var root_b = CommitBuilder.init(alloc, snapshot_hash);
@@ -1132,9 +1134,9 @@ test "commit with a normal parent" {
 
 test "commit records why a parent edge exists: merge and cherry-pick" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     const base_hash = try testCommit(alloc, &store, snapshot_hash, "Dev A", "a@merk.dev", 1, "base");
@@ -1162,9 +1164,9 @@ test "commit records why a parent edge exists: merge and cherry-pick" {
 
 test "parentsWithKind adds several parents sharing one kind" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     const a_hash = try testCommit(alloc, &store, snapshot_hash, "Dev A", "a@merk.dev", 1, "a");
@@ -1194,9 +1196,9 @@ test "parentsWithKind adds several parents sharing one kind" {
 
 test "CommitBuilder rejects a commit with an unset (zero) snapshot" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
 
     var b = CommitBuilder.init(alloc, hash_mod.zero_hash);
     defer b.deinit();
@@ -1209,9 +1211,9 @@ test "CommitBuilder rejects a commit with an unset (zero) snapshot" {
 
 test "CommitBuilder rejects a commit with no author" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
 
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
@@ -1225,9 +1227,9 @@ test "CommitBuilder rejects a commit with no author" {
 
 test "CommitBuilder rejects a commit with no title" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
 
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
@@ -1241,9 +1243,9 @@ test "CommitBuilder rejects a commit with no title" {
 
 test "CommitBuilder rejects a commit with no intent" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
 
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
@@ -1258,9 +1260,9 @@ test "CommitBuilder rejects a commit with no intent" {
 test "commit is deterministic given the same explicit change_id" {
     const alloc = std.testing.allocator;
 
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     const fixed_change_id: ChangeId = [_]u8{0x42} ** 16;
@@ -1289,9 +1291,9 @@ test "commit is deterministic given the same explicit change_id" {
 test "commit is non-deterministic across calls when change_id is left to auto-generate" {
     const alloc = std.testing.allocator;
 
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     const make_commit = struct {
@@ -1312,9 +1314,9 @@ test "commit is non-deterministic across calls when change_id is left to auto-ge
 
 test "commit with dependencies round-trips via write/read" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     const base_change_id: ChangeId = [_]u8{0x01} ** 16;
@@ -1341,9 +1343,9 @@ test "commit with dependencies round-trips via write/read" {
 
 test "a commit with no dependencies round-trips an empty list, not null" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     var b = CommitBuilder.init(alloc, snapshot_hash);
@@ -1361,9 +1363,9 @@ test "a commit with no dependencies round-trips an empty list, not null" {
 
 test "CommitBuilder rejects a commit that depends on its own change_id" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     const self_change_id: ChangeId = [_]u8{0x09} ** 16;
@@ -1381,9 +1383,9 @@ test "CommitBuilder rejects a commit that depends on its own change_id" {
 
 test "CommitBuilder rejects a duplicate dependency" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     const cid: ChangeId = [_]u8{0x0A} ** 16;
@@ -1401,9 +1403,9 @@ test "CommitBuilder rejects a duplicate dependency" {
 
 test "CommitRequest.dependencies is threaded through applyRequest" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     const dep_a: ChangeId = [_]u8{0x0B} ** 16;

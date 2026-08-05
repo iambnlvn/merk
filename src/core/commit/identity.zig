@@ -1,4 +1,8 @@
 const std = @import("std");
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
+
 const wire = @import("wire.zig");
 const MockReader = @import("testing.zig").MockReader;
 
@@ -114,7 +118,7 @@ pub const Person = struct {
     name: []u8,
     email: []u8,
 
-    pub fn initDupe(alloc: std.mem.Allocator, info: PersonInfo) !Person {
+    pub fn initDupe(alloc: Allocator, info: PersonInfo) !Person {
         try info.validate();
         const t = info.trimmed();
 
@@ -127,7 +131,7 @@ pub const Person = struct {
         return .{ .name = name, .email = email };
     }
 
-    pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !Person {
+    pub fn deserialize(alloc: Allocator, reader: anytype) !Person {
         const name = try wire.readBytesAlloc(u16, alloc, reader);
         errdefer alloc.free(name);
 
@@ -139,7 +143,7 @@ pub const Person = struct {
         return .{ .name = name, .email = email };
     }
 
-    pub fn deinit(self: *Person, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Person, alloc: Allocator) void {
         alloc.free(self.name);
         alloc.free(self.email);
         self.* = undefined;
@@ -359,7 +363,7 @@ pub const Signature = struct {
     timestamp_ms: i64,
     timezone: Timezone,
 
-    pub fn initDupe(alloc: std.mem.Allocator, info: SignatureInfo) !Signature {
+    pub fn initDupe(alloc: Allocator, info: SignatureInfo) !Signature {
         try info.validate();
         const r = info.resolved();
 
@@ -371,7 +375,7 @@ pub const Signature = struct {
         };
     }
 
-    pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !Signature {
+    pub fn deserialize(alloc: Allocator, reader: anytype) !Signature {
         var person = try Person.deserialize(alloc, reader);
         errdefer person.deinit(alloc);
 
@@ -385,7 +389,7 @@ pub const Signature = struct {
         };
     }
 
-    pub fn deinit(self: *Signature, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Signature, alloc: Allocator) void {
         self.person.deinit(alloc);
         self.* = undefined;
     }
@@ -459,7 +463,7 @@ pub const CommitSignatures = struct {
         return self.author.eql(self.committer);
     }
 
-    pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !CommitSignatures {
+    pub fn deserialize(alloc: Allocator, reader: anytype) !CommitSignatures {
         var author = try Signature.deserialize(alloc, reader);
         errdefer author.deinit(alloc);
 
@@ -469,7 +473,7 @@ pub const CommitSignatures = struct {
         return .{ .author = author, .committer = committer };
     }
 
-    pub fn deinit(self: *CommitSignatures, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *CommitSignatures, alloc: Allocator) void {
         self.author.deinit(alloc);
         self.committer.deinit(alloc);
         self.* = undefined;
@@ -483,10 +487,10 @@ test "PersonInfo validation - success cases" {
 
 test "PersonInfo validation - empty names and emails" {
     const empty_name = PersonInfo.init("   ", "test@example.com");
-    try std.testing.expectError(error.EmptyName, empty_name.validate());
+    try testing.expectError(error.EmptyName, empty_name.validate());
 
     const empty_email = PersonInfo.init("Valid Name", "\t\r\n");
-    try std.testing.expectError(error.EmptyEmail, empty_email.validate());
+    try testing.expectError(error.EmptyEmail, empty_email.validate());
 }
 
 test "PersonInfo validation - illegal characters in name" {
@@ -499,7 +503,7 @@ test "PersonInfo validation - illegal characters in name" {
 
     for (bad_names) |bad_name| {
         const info = PersonInfo.init(bad_name, "test@example.com");
-        try std.testing.expectError(error.NameContainsIllegalCharacters, info.validate());
+        try testing.expectError(error.NameContainsIllegalCharacters, info.validate());
     }
 }
 
@@ -514,32 +518,32 @@ test "PersonInfo validation - illegal characters in email" {
 
     for (bad_emails) |bad_email| {
         const info = PersonInfo.init("Valid Name", bad_email);
-        try std.testing.expectError(error.EmailContainsIllegalCharacters, info.validate());
+        try testing.expectError(error.EmailContainsIllegalCharacters, info.validate());
     }
 }
 
 test "PersonInfo validation - email bounds and at-sign checks" {
-    try std.testing.expectError(error.MissingEmailAtSign, PersonInfo.init("Valid Name", "no-at-sign.com").validate());
-    try std.testing.expectError(error.InvalidEmailBounds, PersonInfo.init("Valid Name", "@missing-local.com").validate());
-    try std.testing.expectError(error.InvalidEmailBounds, PersonInfo.init("Valid Name", "missing-domain@").validate());
-    try std.testing.expectError(error.EmailContainsIllegalCharacters, PersonInfo.init("Valid Name", "user@domain@extra.com").validate());
+    try testing.expectError(error.MissingEmailAtSign, PersonInfo.init("Valid Name", "no-at-sign.com").validate());
+    try testing.expectError(error.InvalidEmailBounds, PersonInfo.init("Valid Name", "@missing-local.com").validate());
+    try testing.expectError(error.InvalidEmailBounds, PersonInfo.init("Valid Name", "missing-domain@").validate());
+    try testing.expectError(error.EmailContainsIllegalCharacters, PersonInfo.init("Valid Name", "user@domain@extra.com").validate());
 }
 
 test "PersonInfo serialization" {
     const info = PersonInfo.init("  Nodus Dev  ", "dev@nodus.internal  ");
-    const alloc = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
+    const alloc = testing.allocator;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
     try info.serialize(buf.writer(alloc));
 
     const expected_slice = "\x09\x00Nodus Dev\x12\x00dev@nodus.internal";
-    try std.testing.expectEqualSlices(u8, expected_slice, buf.items);
+    try testing.expectEqualSlices(u8, expected_slice, buf.items);
 }
 
 test "Person deserialization round-trip" {
-    const alloc = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
+    const alloc = testing.allocator;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     try PersonInfo.init("User", "user@email.com").serialize(buf.writer(alloc));
 
@@ -547,12 +551,12 @@ test "Person deserialization round-trip" {
     var person = try Person.deserialize(alloc, &mock_reader);
     defer person.deinit(alloc);
 
-    try std.testing.expectEqualStrings("User", person.name);
-    try std.testing.expectEqualStrings("user@email.com", person.email);
+    try testing.expectEqualStrings("User", person.name);
+    try testing.expectEqualStrings("user@email.com", person.email);
 }
 
 test "Person.eql compares name and email only" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var a = try Person.initDupe(alloc, PersonInfo.init("A", "a@b.com"));
     defer a.deinit(alloc);
     var b = try Person.initDupe(alloc, PersonInfo.init("A", "a@b.com"));
@@ -560,22 +564,22 @@ test "Person.eql compares name and email only" {
     var c = try Person.initDupe(alloc, PersonInfo.init("A", "different@b.com"));
     defer c.deinit(alloc);
 
-    try std.testing.expect(a.eql(b));
-    try std.testing.expect(!a.eql(c));
+    try testing.expect(a.eql(b));
+    try testing.expect(!a.eql(c));
 }
 
 test "Timezone.init collapses zero to .utc" {
-    try std.testing.expectEqual(Timezone.utc, try Timezone.init(0));
+    try testing.expectEqual(Timezone.utc, try Timezone.init(0));
 }
 
 test "Timezone.init rejects offsets outside the civil range" {
-    try std.testing.expectEqual(Timezone{ .offset = 840 }, try Timezone.init(840)); // +14:00, valid (Kiribati)
-    try std.testing.expectEqual(Timezone{ .offset = -720 }, try Timezone.init(-720)); // -12:00, valid (Baker Island)
+    try testing.expectEqual(Timezone{ .offset = 840 }, try Timezone.init(840)); // +14:00, valid (Kiribati)
+    try testing.expectEqual(Timezone{ .offset = -720 }, try Timezone.init(-720)); // -12:00, valid (Baker Island)
 
     // +18:00 isn't real — the old +/-1440 bound would have let this through
-    try std.testing.expectError(error.InvalidTimezoneOffset, Timezone.init(18 * 60));
-    try std.testing.expectError(error.InvalidTimezoneOffset, Timezone.init(841));
-    try std.testing.expectError(error.InvalidTimezoneOffset, Timezone.init(-721));
+    try testing.expectError(error.InvalidTimezoneOffset, Timezone.init(18 * 60));
+    try testing.expectError(error.InvalidTimezoneOffset, Timezone.init(841));
+    try testing.expectError(error.InvalidTimezoneOffset, Timezone.init(-721));
 }
 
 test "Timezone.format produces git-style +HHMM/-HHMM, null for unknown" {
@@ -583,10 +587,10 @@ test "Timezone.format produces git-style +HHMM/-HHMM, null for unknown" {
     const utc: Timezone = .utc;
     const unknown: Timezone = .unknown;
 
-    try std.testing.expectEqualStrings("+0000", utc.format(&buf).?);
-    try std.testing.expectEqualStrings("-0500", (try Timezone.init(-300)).format(&buf).?);
-    try std.testing.expectEqualStrings("+0530", (try Timezone.init(330)).format(&buf).?);
-    try std.testing.expectEqual(@as(?[]const u8, null), unknown.format(&buf));
+    try testing.expectEqualStrings("+0000", utc.format(&buf).?);
+    try testing.expectEqualStrings("-0500", (try Timezone.init(-300)).format(&buf).?);
+    try testing.expectEqualStrings("+0530", (try Timezone.init(330)).format(&buf).?);
+    try testing.expectEqual(@as(?[]const u8, null), unknown.format(&buf));
 }
 
 test "Timezone.parse inverts format for concrete offsets" {
@@ -597,40 +601,40 @@ test "Timezone.parse inverts format for concrete offsets" {
         const tz = try Timezone.init(mins);
         const text = tz.format(&buf).?;
         const parsed = try Timezone.parse(text);
-        try std.testing.expectEqual(tz, parsed);
+        try testing.expectEqual(tz, parsed);
     }
 }
 
 test "Timezone.parse rejects malformed input" {
-    try std.testing.expectError(error.InvalidTimezoneFormat, Timezone.parse("530"));
-    try std.testing.expectError(error.InvalidTimezoneFormat, Timezone.parse("+053"));
-    try std.testing.expectError(error.InvalidTimezoneFormat, Timezone.parse("053000"));
-    try std.testing.expectError(error.InvalidTimezoneFormat, Timezone.parse("*0530"));
-    try std.testing.expectError(error.InvalidTimezoneFormat, Timezone.parse("+0X30"));
-    try std.testing.expectError(error.InvalidTimezoneFormat, Timezone.parse("+0560")); // minutes >= 60
+    try testing.expectError(error.InvalidTimezoneFormat, Timezone.parse("530"));
+    try testing.expectError(error.InvalidTimezoneFormat, Timezone.parse("+053"));
+    try testing.expectError(error.InvalidTimezoneFormat, Timezone.parse("053000"));
+    try testing.expectError(error.InvalidTimezoneFormat, Timezone.parse("*0530"));
+    try testing.expectError(error.InvalidTimezoneFormat, Timezone.parse("+0X30"));
+    try testing.expectError(error.InvalidTimezoneFormat, Timezone.parse("+0560")); // minutes >= 60
 }
 
 test "Timezone serialization round-trips utc, offset, and unknown" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const cases = [_]Timezone{ .utc, .{ .offset = 330 }, .{ .offset = -300 }, .unknown };
 
     for (cases) |tz| {
-        var buf: std.ArrayList(u8) = .empty;
+        var buf: ArrayList(u8) = .empty;
         defer buf.deinit(alloc);
         try tz.serialize(buf.writer(alloc));
 
         // tag(1) + minutes(2)
-        try std.testing.expectEqual(@as(usize, 3), buf.items.len);
+        try testing.expectEqual(@as(usize, 3), buf.items.len);
 
         var mock_reader = MockReader{ .buffer = buf.items };
         const back = try Timezone.deserialize(&mock_reader);
-        try std.testing.expectEqual(tz, back);
+        try testing.expectEqual(tz, back);
     }
 }
 
 test "Timestamp.value is never coerced to 'now', including zero" {
-    try std.testing.expectEqual(@as(i64, 0), (Timestamp{ .value = 0 }).resolve());
-    try std.testing.expectEqual(@as(i64, 1_700_000_000_000), (Timestamp{ .value = 1_700_000_000_000 }).resolve());
+    try testing.expectEqual(@as(i64, 0), (Timestamp{ .value = 0 }).resolve());
+    try testing.expectEqual(@as(i64, 1_700_000_000_000), (Timestamp{ .value = 1_700_000_000_000 }).resolve());
 }
 
 test "Timestamp.now resolves near the current wall clock" {
@@ -639,52 +643,52 @@ test "Timestamp.now resolves near the current wall clock" {
     const resolved = t.resolve();
     const after = std.time.milliTimestamp();
 
-    try std.testing.expect(resolved >= before);
-    try std.testing.expect(resolved <= after);
+    try testing.expect(resolved >= before);
+    try testing.expect(resolved <= after);
 }
 
 test "SignatureInfo validation surfaces both person and timezone errors" {
     const bad_person = SignatureInfo.init(PersonInfo.init("", "a@b.com"));
-    try std.testing.expectError(error.EmptyName, bad_person.validate());
+    try testing.expectError(error.EmptyName, bad_person.validate());
 
     const bad_tz = SignatureInfo{
         .person = PersonInfo.init("A", "a@b.com"),
         .timezone = .{ .offset = 2000 },
     };
-    try std.testing.expectError(error.InvalidTimezoneOffset, bad_tz.validate());
+    try testing.expectError(error.InvalidTimezoneOffset, bad_tz.validate());
 }
 
 test "Signature serialization round-trips person, timestamp, and timezone" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const info = SignatureInfo{
         .person = PersonInfo.init("Ada Lovelace", "ada@nodus.dev"),
         .timestamp = .{ .value = 1_700_000_000_000 },
         .timezone = try Timezone.init(-300), // US Eastern
     };
 
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     try info.serialize(buf.writer(alloc));
 
     // name_len(2)+name(12) + email_len(2)+email(13) + timestamp(8) + tz_tag(1)+tz_minutes(2)
-    try std.testing.expectEqual(@as(usize, 2 + 12 + 2 + 13 + 8 + 1 + 2), buf.items.len);
+    try testing.expectEqual(@as(usize, 2 + 12 + 2 + 13 + 8 + 1 + 2), buf.items.len);
 
     var mock_reader = MockReader{ .buffer = buf.items };
     var sig = try Signature.deserialize(alloc, &mock_reader);
     defer sig.deinit(alloc);
 
-    try std.testing.expectEqualStrings("Ada Lovelace", sig.person.name);
-    try std.testing.expectEqualStrings("ada@nodus.dev", sig.person.email);
-    try std.testing.expectEqual(@as(i64, 1_700_000_000_000), sig.timestamp_ms);
-    try std.testing.expectEqual(Timezone{ .offset = -300 }, sig.timezone);
+    try testing.expectEqualStrings("Ada Lovelace", sig.person.name);
+    try testing.expectEqualStrings("ada@nodus.dev", sig.person.email);
+    try testing.expectEqual(@as(i64, 1_700_000_000_000), sig.timestamp_ms);
+    try testing.expectEqual(Timezone{ .offset = -300 }, sig.timezone);
 
     var tz_buf: [5]u8 = undefined;
-    try std.testing.expectEqualStrings("-0500", sig.formattedTimezone(&tz_buf).?);
+    try testing.expectEqualStrings("-0500", sig.formattedTimezone(&tz_buf).?);
 }
 
 test "Signature deserialize rejects an out-of-range timezone offset" {
-    const alloc = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
+    const alloc = testing.allocator;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
     try wire.writeBytes(u16, buf.writer(alloc), "User");
@@ -694,11 +698,11 @@ test "Signature deserialize rejects an out-of-range timezone offset" {
     try buf.writer(alloc).writeInt(i16, 2000, .little); // out of civil range
 
     var mock_reader = MockReader{ .buffer = buf.items };
-    try std.testing.expectError(error.InvalidTimezoneOffset, Signature.deserialize(alloc, &mock_reader));
+    try testing.expectError(error.InvalidTimezoneOffset, Signature.deserialize(alloc, &mock_reader));
 }
 
 test "Signature.samePerson / sameInstant / eql" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var a = try Signature.initDupe(alloc, .{
         .person = PersonInfo.init("Bruce Wayne", "bruce@wayne.corp"),
         .timestamp = .{ .value = 1_000 },
@@ -716,26 +720,26 @@ test "Signature.samePerson / sameInstant / eql" {
     });
     defer c.deinit(alloc);
 
-    try std.testing.expect(a.samePerson(b));
-    try std.testing.expect(a.sameInstant(b));
-    try std.testing.expect(a.eql(b)); // tz notation doesn't affect eql
+    try testing.expect(a.samePerson(b));
+    try testing.expect(a.sameInstant(b));
+    try testing.expect(a.eql(b)); // tz notation doesn't affect eql
 
-    try std.testing.expect(a.samePerson(c));
-    try std.testing.expect(!a.sameInstant(c));
-    try std.testing.expect(!a.eql(c));
+    try testing.expect(a.samePerson(c));
+    try testing.expect(!a.sameInstant(c));
+    try testing.expect(!a.eql(c));
 }
 
 test "CommitSignaturesInfo.soloAuthor mirrors author into committer" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
 
     const info = CommitSignaturesInfo.soloAuthor(.{
         .person = PersonInfo.init("Bruce Wayne", "bruce@wayne.corp"),
         .timestamp = .{ .value = 1_000 },
     });
 
-    try std.testing.expectEqualStrings("Bruce Wayne", info.committer.person.name);
+    try testing.expectEqualStrings("Bruce Wayne", info.committer.person.name);
 
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     try info.serialize(buf.writer(alloc));
 
@@ -743,13 +747,13 @@ test "CommitSignaturesInfo.soloAuthor mirrors author into committer" {
     var sigs = try CommitSignatures.deserialize(alloc, &mock_reader);
     defer sigs.deinit(alloc);
 
-    try std.testing.expectEqualStrings("Bruce Wayne", sigs.author.person.name);
-    try std.testing.expectEqualStrings("Bruce Wayne", sigs.committer.person.name);
-    try std.testing.expect(sigs.isAuthorCommitter());
+    try testing.expectEqualStrings("Bruce Wayne", sigs.author.person.name);
+    try testing.expectEqualStrings("Bruce Wayne", sigs.committer.person.name);
+    try testing.expect(sigs.isAuthorCommitter());
 }
 
 test "CommitSignaturesInfo.init keeps a distinct committer with its own timezone" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
 
     const info = CommitSignaturesInfo.init(
         .{
@@ -764,7 +768,7 @@ test "CommitSignaturesInfo.init keeps a distinct committer with its own timezone
         },
     );
 
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     try info.serialize(buf.writer(alloc));
 
@@ -772,17 +776,17 @@ test "CommitSignaturesInfo.init keeps a distinct committer with its own timezone
     var sigs = try CommitSignatures.deserialize(alloc, &mock_reader);
     defer sigs.deinit(alloc);
 
-    try std.testing.expectEqualStrings("Alan Turing", sigs.author.person.name);
-    try std.testing.expectEqualStrings("Nodus Bot", sigs.committer.person.name);
-    try std.testing.expectEqual(@as(i64, 1_000), sigs.author.timestamp_ms);
-    try std.testing.expectEqual(@as(i64, 2_000), sigs.committer.timestamp_ms);
-    try std.testing.expectEqual(Timezone{ .offset = 60 }, sigs.author.timezone);
-    try std.testing.expectEqual(Timezone.utc, sigs.committer.timezone);
-    try std.testing.expect(!sigs.isAuthorCommitter());
+    try testing.expectEqualStrings("Alan Turing", sigs.author.person.name);
+    try testing.expectEqualStrings("Nodus Bot", sigs.committer.person.name);
+    try testing.expectEqual(@as(i64, 1_000), sigs.author.timestamp_ms);
+    try testing.expectEqual(@as(i64, 2_000), sigs.committer.timestamp_ms);
+    try testing.expectEqual(Timezone{ .offset = 60 }, sigs.author.timezone);
+    try testing.expectEqual(Timezone.utc, sigs.committer.timezone);
+    try testing.expect(!sigs.isAuthorCommitter());
 }
 
 test "CommitSignatures round-trips a genuinely unknown committer timezone" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
 
     const info = CommitSignaturesInfo.init(
         .{ .person = PersonInfo.init("Original Author", "orig@example.com"), .timestamp = .{ .value = 500 } },
@@ -793,7 +797,7 @@ test "CommitSignatures round-trips a genuinely unknown committer timezone" {
         },
     );
 
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     try info.serialize(buf.writer(alloc));
 
@@ -801,10 +805,10 @@ test "CommitSignatures round-trips a genuinely unknown committer timezone" {
     var sigs = try CommitSignatures.deserialize(alloc, &mock_reader);
     defer sigs.deinit(alloc);
 
-    try std.testing.expectEqual(Timezone.unknown, sigs.committer.timezone);
+    try testing.expectEqual(Timezone.unknown, sigs.committer.timezone);
 
     var tz_buf: [5]u8 = undefined;
-    try std.testing.expectEqual(@as(?[]const u8, null), sigs.committer.formattedTimezone(&tz_buf));
+    try testing.expectEqual(@as(?[]const u8, null), sigs.committer.formattedTimezone(&tz_buf));
 }
 
 test "benchmark timezone parsing: parseInt vs manual ASCII" {
@@ -838,5 +842,5 @@ test "benchmark timezone parsing: parseInt vs manual ASCII" {
     // std.debug.print("std.fmt.parseInt : {d} ns total ({d} ns/op)\n", .{ elapsed_parseint, elapsed_parseint / iterations });
     // std.debug.print("Manual ASCII     : {d} ns total ({d} ns/op)\n", .{ elapsed_manual, elapsed_manual / iterations });
 
-    try std.testing.expect(elapsed_manual < elapsed_parseint);
+    try testing.expect(elapsed_manual < elapsed_parseint);
 }

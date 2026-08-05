@@ -1,4 +1,8 @@
 const std = @import("std");
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
+
 const wire = @import("wire.zig");
 const MockReader = @import("testing.zig").MockReader;
 
@@ -49,7 +53,7 @@ pub const Trailer = struct {
     key: []u8,
     value: []u8,
 
-    pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !Trailer {
+    pub fn deserialize(alloc: Allocator, reader: anytype) !Trailer {
         const key = try wire.readBytesAlloc(u8, alloc, reader);
         errdefer alloc.free(key);
 
@@ -63,7 +67,7 @@ pub const Trailer = struct {
         return .{ .key = key, .value = value };
     }
 
-    pub fn deinit(self: *Trailer, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Trailer, alloc: Allocator) void {
         alloc.free(self.key);
         alloc.free(self.value);
         self.* = undefined;
@@ -143,7 +147,7 @@ pub const Message = struct {
 
     trailers: []Trailer,
 
-    pub fn initDupe(alloc: std.mem.Allocator, info: MessageInfo) !Message {
+    pub fn initDupe(alloc: Allocator, info: MessageInfo) !Message {
         try info.validate();
 
         const t = info.trimmed();
@@ -178,7 +182,7 @@ pub const Message = struct {
         };
     }
 
-    pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !Message {
+    pub fn deserialize(alloc: Allocator, reader: anytype) !Message {
         const encoding = std.meta.intToEnum(
             Encoding,
             try reader.takeByte(),
@@ -232,14 +236,14 @@ pub const Message = struct {
         self: Message,
         key: []const u8,
         out: *std.ArrayListUnmanaged([]const u8),
-        alloc: std.mem.Allocator,
+        alloc: Allocator,
     ) !void {
         for (self.trailers) |t| {
             if (std.mem.eql(u8, t.key, key)) try out.append(alloc, t.value);
         }
     }
 
-    pub fn deinit(self: *Message, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Message, alloc: Allocator) void {
         alloc.free(self.title);
         alloc.free(self.body);
         for (self.trailers) |*t| t.deinit(alloc);
@@ -259,13 +263,13 @@ test "MessageInfo validation - success and failure cases" {
         .title = "   \t  ",
         .body = "Some body content",
     };
-    try std.testing.expectError(error.EmptyCommitMessage, empty_title.validate());
+    try testing.expectError(error.EmptyCommitMessage, empty_title.validate());
 
     const bad_title = MessageInfo{
         .title = "feat: added\nmultiline title",
         .body = "",
     };
-    try std.testing.expectError(error.TitleContainsIllegalCharacters, bad_title.validate());
+    try testing.expectError(error.TitleContainsIllegalCharacters, bad_title.validate());
 }
 
 test "MessageInfo serialization format - no trailers" {
@@ -273,8 +277,8 @@ test "MessageInfo serialization format - no trailers" {
         .title = " fix(core): memory leak ",
         .body = " resolved ",
     };
-    const alloc = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
+    const alloc = testing.allocator;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
     try info.serialize(buf.writer(alloc));
@@ -282,7 +286,7 @@ test "MessageInfo serialization format - no trailers" {
     // encoding byte (utf8 = 0) + u16 title len + title + u32 body len + body
     // + u8 trailer count (0)
     const expected = "\x00\x16\x00fix(core): memory leak\x08\x00\x00\x00resolved\x00";
-    try std.testing.expectEqualSlices(u8, expected, buf.items);
+    try testing.expectEqualSlices(u8, expected, buf.items);
 }
 
 test "MessageInfo serialization records a non-default encoding" {
@@ -290,17 +294,17 @@ test "MessageInfo serialization records a non-default encoding" {
         .title = "legacy import",
         .encoding = .latin1,
     };
-    const alloc = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
+    const alloc = testing.allocator;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     try info.serialize(buf.writer(alloc));
 
-    try std.testing.expectEqual(@as(u8, 2), buf.items[0]);
+    try testing.expectEqual(@as(u8, 2), buf.items[0]);
 
     var mock_reader = MockReader{ .buffer = buf.items };
     var msg = try Message.deserialize(alloc, &mock_reader);
     defer msg.deinit(alloc);
-    try std.testing.expectEqual(Encoding.latin1, msg.encoding);
+    try testing.expectEqual(Encoding.latin1, msg.encoding);
 }
 
 test "MessageInfo serialization format - with trailers" {
@@ -313,8 +317,8 @@ test "MessageInfo serialization format - with trailers" {
         .body = "",
         .trailers = &trailers,
     };
-    const alloc = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
+    const alloc = testing.allocator;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     try info.serialize(buf.writer(alloc));
 
@@ -323,17 +327,17 @@ test "MessageInfo serialization format - with trailers" {
     var msg = try Message.deserialize(alloc, &mock_reader);
     defer msg.deinit(alloc);
 
-    try std.testing.expectEqualStrings("fix: patch the thing", msg.title);
-    try std.testing.expectEqual(Encoding.utf8, msg.encoding);
-    try std.testing.expectEqual(@as(usize, 2), msg.trailers.len);
-    try std.testing.expectEqualStrings("closes", msg.trailers[0].key);
-    try std.testing.expectEqualStrings("#42", msg.trailers[0].value);
-    try std.testing.expectEqualStrings("reviewed-by", msg.trailers[1].key);
-    try std.testing.expectEqualStrings("alice@corp.com", msg.trailers[1].value);
+    try testing.expectEqualStrings("fix: patch the thing", msg.title);
+    try testing.expectEqual(Encoding.utf8, msg.encoding);
+    try testing.expectEqual(@as(usize, 2), msg.trailers.len);
+    try testing.expectEqualStrings("closes", msg.trailers[0].key);
+    try testing.expectEqualStrings("#42", msg.trailers[0].value);
+    try testing.expectEqualStrings("reviewed-by", msg.trailers[1].key);
+    try testing.expectEqualStrings("alice@corp.com", msg.trailers[1].value);
 }
 
 test "Message.trailer lookup" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const trailers = [_]TrailerInfo{
         .{ .key = "closes", .value = "#99" },
         .{ .key = "breaks", .value = "api.v1" },
@@ -346,13 +350,13 @@ test "Message.trailer lookup" {
     defer msg.deinit(alloc);
 
     // Returns first match
-    try std.testing.expectEqualStrings("#99", msg.trailer("closes").?);
-    try std.testing.expectEqualStrings("api.v1", msg.trailer("breaks").?);
-    try std.testing.expectEqual(@as(?[]const u8, null), msg.trailer("missing"));
+    try testing.expectEqualStrings("#99", msg.trailer("closes").?);
+    try testing.expectEqualStrings("api.v1", msg.trailer("breaks").?);
+    try testing.expectEqual(@as(?[]const u8, null), msg.trailer("missing"));
 }
 
 test "Message.trailersFor - multiple values for same key" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const trailers = [_]TrailerInfo{
         .{ .key = "closes", .value = "#1" },
         .{ .key = "closes", .value = "#2" },
@@ -368,10 +372,10 @@ test "Message.trailersFor - multiple values for same key" {
     defer found.deinit(alloc);
     try msg.trailersFor("closes", &found, alloc);
 
-    try std.testing.expectEqual(@as(usize, 3), found.items.len);
-    try std.testing.expectEqualStrings("#1", found.items[0]);
-    try std.testing.expectEqualStrings("#2", found.items[1]);
-    try std.testing.expectEqualStrings("#3", found.items[2]);
+    try testing.expectEqual(@as(usize, 3), found.items.len);
+    try testing.expectEqualStrings("#1", found.items[0]);
+    try testing.expectEqualStrings("#2", found.items[1]);
+    try testing.expectEqualStrings("#3", found.items[2]);
 }
 
 test "TrailerInfo validation - illegal key characters" {
@@ -391,12 +395,12 @@ test "TrailerInfo validation - illegal key characters" {
     };
     for (bad_keys, expected_errors) |k, e| {
         const t = TrailerInfo{ .key = k, .value = "val" };
-        try std.testing.expectError(e, t.validate());
+        try testing.expectError(e, t.validate());
     }
 }
 
 test "Message lifecycle via initDupe" {
-    const allocator = std.testing.allocator;
+    const allocator = testing.allocator;
     const info = MessageInfo{
         .title = " docs: update readme ",
         .body = " added instructions ",
@@ -406,15 +410,15 @@ test "Message lifecycle via initDupe" {
     var msg = try Message.initDupe(allocator, info);
     defer msg.deinit(allocator);
 
-    try std.testing.expectEqualStrings("docs: update readme", msg.title);
-    try std.testing.expectEqualStrings("added instructions", msg.body);
-    try std.testing.expectEqual(@as(usize, 1), msg.trailers.len);
-    try std.testing.expectEqualStrings("reviewed-by", msg.trailers[0].key);
-    try std.testing.expectEqualStrings("carol@corp.com", msg.trailers[0].value);
+    try testing.expectEqualStrings("docs: update readme", msg.title);
+    try testing.expectEqualStrings("added instructions", msg.body);
+    try testing.expectEqual(@as(usize, 1), msg.trailers.len);
+    try testing.expectEqualStrings("reviewed-by", msg.trailers[0].key);
+    try testing.expectEqualStrings("carol@corp.com", msg.trailers[0].value);
 }
 
 test "Message deserialization from binary stream - legacy no trailers" {
-    const allocator = std.testing.allocator;
+    const allocator = testing.allocator;
     // Wire format with encoding byte (utf8 = 0) and 0 trailers
     const serialized_data = "\x00\x0c\x00refactor: io\x04\x00\x00\x00done\x00";
 
@@ -422,8 +426,8 @@ test "Message deserialization from binary stream - legacy no trailers" {
     var msg = try Message.deserialize(allocator, &mock_reader);
     defer msg.deinit(allocator);
 
-    try std.testing.expectEqualStrings("refactor: io", msg.title);
-    try std.testing.expectEqualStrings("done", msg.body);
-    try std.testing.expectEqual(Encoding.utf8, msg.encoding);
-    try std.testing.expectEqual(@as(usize, 0), msg.trailers.len);
+    try testing.expectEqualStrings("refactor: io", msg.title);
+    try testing.expectEqualStrings("done", msg.body);
+    try testing.expectEqual(Encoding.utf8, msg.encoding);
+    try testing.expectEqual(@as(usize, 0), msg.trailers.len);
 }

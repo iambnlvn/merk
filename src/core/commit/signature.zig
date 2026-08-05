@@ -4,6 +4,10 @@
 //! trusts.
 
 const std = @import("std");
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
+
 const wire = @import("wire.zig");
 
 pub const SignatureError = error{
@@ -55,7 +59,7 @@ pub const Signature = struct {
     bytes: []u8,
     key_id: []u8,
 
-    pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !Signature {
+    pub fn deserialize(alloc: Allocator, reader: anytype) !Signature {
         const algorithm = std.meta.intToEnum(
             SignatureAlgorithm,
             try reader.takeByte(),
@@ -73,7 +77,7 @@ pub const Signature = struct {
         return .{ .algorithm = algorithm, .bytes = bytes, .key_id = key_id };
     }
 
-    pub fn deinit(self: *Signature, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Signature, alloc: Allocator) void {
         alloc.free(self.bytes);
         alloc.free(self.key_id);
         self.* = undefined;
@@ -82,21 +86,21 @@ pub const Signature = struct {
 
 test "SignatureInfo validation rejects empty key id and empty bytes" {
     const missing_key = SignatureInfo{ .algorithm = .ssh_ed25519, .bytes = "sig", .key_id = "" };
-    try std.testing.expectError(error.EmptyKeyId, missing_key.validate());
+    try testing.expectError(error.EmptyKeyId, missing_key.validate());
 
     const missing_bytes = SignatureInfo{ .algorithm = .ssh_ed25519, .bytes = "", .key_id = "SHA256:abc" };
-    try std.testing.expectError(error.EmptySignatureBytes, missing_bytes.validate());
+    try testing.expectError(error.EmptySignatureBytes, missing_bytes.validate());
 }
 
 test "SignatureInfo serialize/deserialize round-trip" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const info = SignatureInfo{
         .algorithm = .pgp_ed25519,
         .bytes = "not-a-real-signature-blob",
         .key_id = "0xDEADBEEF",
     };
 
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     try info.serialize(buf.writer(alloc));
 
@@ -105,14 +109,14 @@ test "SignatureInfo serialize/deserialize round-trip" {
     var sig = try Signature.deserialize(alloc, &mock_reader);
     defer sig.deinit(alloc);
 
-    try std.testing.expectEqual(SignatureAlgorithm.pgp_ed25519, sig.algorithm);
-    try std.testing.expectEqualStrings("not-a-real-signature-blob", sig.bytes);
-    try std.testing.expectEqualStrings("0xDEADBEEF", sig.key_id);
+    try testing.expectEqual(SignatureAlgorithm.pgp_ed25519, sig.algorithm);
+    try testing.expectEqualStrings("not-a-real-signature-blob", sig.bytes);
+    try testing.expectEqualStrings("0xDEADBEEF", sig.key_id);
 }
 
 test "Signature deserialize rejects an out-of-range algorithm byte" {
-    const alloc = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
+    const alloc = testing.allocator;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
     try buf.append(alloc, 200); // not a valid SignatureAlgorithm
@@ -121,5 +125,5 @@ test "Signature deserialize rejects an out-of-range algorithm byte" {
 
     const MockReader = @import("testing.zig").MockReader;
     var mock_reader = MockReader{ .buffer = buf.items };
-    try std.testing.expectError(error.CorruptSignature, Signature.deserialize(alloc, &mock_reader));
+    try testing.expectError(error.CorruptSignature, Signature.deserialize(alloc, &mock_reader));
 }

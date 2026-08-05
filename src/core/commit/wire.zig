@@ -1,5 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
 const MockReader = @import("testing.zig").MockReader;
 
 pub fn writeBytes(comptime LenT: type, writer: anytype, bytes: []const u8) !void {
@@ -7,7 +9,7 @@ pub fn writeBytes(comptime LenT: type, writer: anytype, bytes: []const u8) !void
     try writer.writeAll(bytes);
 }
 
-pub fn readBytesAlloc(comptime LenT: type, alloc: std.mem.Allocator, reader: anytype) ![]u8 {
+pub fn readBytesAlloc(comptime LenT: type, alloc: Allocator, reader: anytype) ![]u8 {
     const len = try reader.takeInt(LenT, .little);
 
     const buf = try alloc.alloc(u8, len);
@@ -52,7 +54,7 @@ pub fn writeStringArray(
 pub fn readStringArrayAlloc(
     comptime CountT: type,
     comptime LenT: type,
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     reader: anytype,
 ) ![][]u8 {
     const count = try readCount(CountT, reader);
@@ -72,7 +74,7 @@ pub fn readStringArrayAlloc(
 
 test "wire: writeBytes and readBytesAlloc standard roundtrip" {
     const alloc = testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
     const sample_text = "Commit message title metadata";
@@ -93,7 +95,7 @@ test "wire: writeBytes and readBytesAlloc standard roundtrip" {
 
 test "wire: readBytesAlloc unexpected EOF handling" {
     const alloc = testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
     // Intentionally forge a length prefix of 100, but write nothing else
@@ -107,7 +109,7 @@ test "wire: readBytesAlloc unexpected EOF handling" {
 
 test "wire: writeCount and readCount validation" {
     const alloc = testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
     // Check count boundary scenarios
@@ -134,7 +136,7 @@ test "wire: resolveTimestampMs passes through nonzero, fills zero with now" {
 
 test "wire: writeStringArray and readStringArrayAlloc roundtrip" {
     const alloc = testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
     const labels = [_][]const u8{ "feat", "v2", "" };
@@ -155,7 +157,7 @@ test "wire: writeStringArray and readStringArrayAlloc roundtrip" {
 
 test "wire: readStringArrayAlloc frees partial allocations on truncation" {
     const alloc = testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
     try writeCount(u16, buf.writer(alloc), 2);

@@ -1,7 +1,13 @@
 const std = @import("std");
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
+
+const crypto = @import("crypto");
+
 const wire = @import("wire.zig");
 
-const Hash = [32]u8;
+const Hash = crypto.Hash;
 
 pub const ParentError = error{TooManyParents};
 pub const MAX_PARENTS: u8 = 255;
@@ -49,7 +55,7 @@ pub fn serializeAll(parents: []const ParentInfo, writer: anytype) !void {
 
 /// Deserialize into a freshly allocated, owned slice. Caller frees with
 /// `alloc.free`.
-pub fn deserializeAllAlloc(alloc: std.mem.Allocator, reader: anytype) ![]ParentInfo {
+pub fn deserializeAllAlloc(alloc: Allocator, reader: anytype) ![]ParentInfo {
     const len = try wire.readCount(u8, reader);
     const parents = try alloc.alloc(ParentInfo, len);
     errdefer alloc.free(parents);
@@ -62,32 +68,32 @@ pub fn deserializeAllAlloc(alloc: std.mem.Allocator, reader: anytype) ![]ParentI
 test "ParentInfo defaults to .normal when not specified" {
     const hash: Hash = [_]u8{0x01} ** 32;
     const info = ParentInfo{ .hash = hash };
-    try std.testing.expectEqual(ParentKind.normal, info.kind);
+    try testing.expectEqual(ParentKind.normal, info.kind);
 }
 
 test "ParentInfo serialize/deserialize round-trip preserves kind" {
     const hash: Hash = [_]u8{0xAB} ** 32;
     const info = ParentInfo{ .hash = hash, .kind = .merge };
 
-    const alloc = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
+    const alloc = testing.allocator;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     try info.serialize(buf.writer(alloc));
 
     // 32 bytes hash + 1 byte kind
-    try std.testing.expectEqual(@as(usize, 33), buf.items.len);
+    try testing.expectEqual(@as(usize, 33), buf.items.len);
 
     const MockReader = @import("testing.zig").MockReader;
     var mock_reader = MockReader{ .buffer = buf.items };
     const decoded = try ParentInfo.deserialize(&mock_reader);
 
-    try std.testing.expectEqualSlices(u8, &hash, &decoded.hash);
-    try std.testing.expectEqual(ParentKind.merge, decoded.kind);
+    try testing.expectEqualSlices(u8, &hash, &decoded.hash);
+    try testing.expectEqual(ParentKind.merge, decoded.kind);
 }
 
 test "deserialize rejects an out-of-range kind byte" {
-    const alloc = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
+    const alloc = testing.allocator;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
     try buf.appendSlice(alloc, &([_]u8{0xFF} ** 32));
@@ -95,16 +101,16 @@ test "deserialize rejects an out-of-range kind byte" {
 
     const MockReader = @import("testing.zig").MockReader;
     var mock_reader = MockReader{ .buffer = buf.items };
-    try std.testing.expectError(error.CorruptCommit, ParentInfo.deserialize(&mock_reader));
+    try testing.expectError(error.CorruptCommit, ParentInfo.deserialize(&mock_reader));
 }
 
 test "validate rejects more than MAX_PARENTS, accepts exactly MAX_PARENTS" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
 
     const too_many = try alloc.alloc(ParentInfo, 256);
     defer alloc.free(too_many);
     @memset(too_many, ParentInfo{ .hash = [_]u8{0} ** 32 });
-    try std.testing.expectError(error.TooManyParents, validate(too_many));
+    try testing.expectError(error.TooManyParents, validate(too_many));
 
     const max = try alloc.alloc(ParentInfo, MAX_PARENTS);
     defer alloc.free(max);
@@ -113,14 +119,14 @@ test "validate rejects more than MAX_PARENTS, accepts exactly MAX_PARENTS" {
 }
 
 test "serializeAll/deserializeAllAlloc round-trip with mixed kinds, in order" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const parents = [_]ParentInfo{
         .{ .hash = [_]u8{1} ** 32, .kind = .normal },
         .{ .hash = [_]u8{2} ** 32, .kind = .merge },
         .{ .hash = [_]u8{3} ** 32, .kind = .cherry_pick },
     };
 
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
     try serializeAll(&parents, buf.writer(alloc));
 
@@ -129,20 +135,20 @@ test "serializeAll/deserializeAllAlloc round-trip with mixed kinds, in order" {
     const decoded = try deserializeAllAlloc(alloc, &mock_reader);
     defer alloc.free(decoded);
 
-    try std.testing.expectEqual(@as(usize, 3), decoded.len);
-    try std.testing.expectEqual(ParentKind.normal, decoded[0].kind);
-    try std.testing.expectEqual(ParentKind.merge, decoded[1].kind);
-    try std.testing.expectEqual(ParentKind.cherry_pick, decoded[2].kind);
-    try std.testing.expectEqualSlices(u8, &parents[1].hash, &decoded[1].hash);
+    try testing.expectEqual(@as(usize, 3), decoded.len);
+    try testing.expectEqual(ParentKind.normal, decoded[0].kind);
+    try testing.expectEqual(ParentKind.merge, decoded[1].kind);
+    try testing.expectEqual(ParentKind.cherry_pick, decoded[2].kind);
+    try testing.expectEqualSlices(u8, &parents[1].hash, &decoded[1].hash);
 }
 
 test "serializeAll rejects TooManyParents before writing anything" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const too_many = try alloc.alloc(ParentInfo, 256);
     defer alloc.free(too_many);
     @memset(too_many, ParentInfo{ .hash = [_]u8{0} ** 32 });
 
-    var buf: std.ArrayList(u8) = .empty;
+    var buf: ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
-    try std.testing.expectError(error.TooManyParents, serializeAll(too_many, buf.writer(alloc)));
+    try testing.expectError(error.TooManyParents, serializeAll(too_many, buf.writer(alloc)));
 }

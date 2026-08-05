@@ -1,4 +1,7 @@
 const std = @import("std");
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+
 const wire = @import("wire.zig");
 const MockReader = @import("testing.zig").MockReader;
 
@@ -144,7 +147,7 @@ pub const Intent = union(enum) {
     /// Caller frees the result with `.deinit(alloc)` — a no-op for
     /// every built-in kind, and the only variant that actually owns
     /// anything is `.custom`.
-    pub fn deserialize(alloc: std.mem.Allocator, reader: anytype) !Intent {
+    pub fn deserialize(alloc: Allocator, reader: anytype) !Intent {
         const raw_tag = try reader.takeByte();
         const t = std.meta.intToEnum(IntentTag, raw_tag) catch return error.CorruptCommit;
 
@@ -170,7 +173,7 @@ pub const Intent = union(enum) {
 
     /// Free the `.custom` name, if this is one. A no-op for every
     /// built-in kind — safe to call unconditionally.
-    pub fn deinit(self: *Intent, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Intent, alloc: Allocator) void {
         switch (self.*) {
             .custom => |n| alloc.free(n),
             else => {},
@@ -261,7 +264,7 @@ pub const CommitMetadataInfo = struct {
     }
 
     pub fn deserialize(
-        alloc: std.mem.Allocator,
+        alloc: Allocator,
         reader: anytype,
     ) !CommitMetadata {
         const change_id_bytes = try reader.take(16);
@@ -301,7 +304,7 @@ pub const CommitMetadata = struct {
 
     pub fn deinit(
         self: *CommitMetadata,
-        alloc: std.mem.Allocator,
+        alloc: Allocator,
     ) void {
         self.intent.deinit(alloc);
 
