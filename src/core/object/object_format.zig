@@ -58,6 +58,15 @@ pub const EncodedObject = struct {
     hash: Hash,
 };
 
+/// Bytes appended after the stored body: the content hash always, plus
+/// the structural hash trailer when present. `encodeAlloc` and
+/// `decodeFromBuffer` both need this to size/locate the trailer — one
+/// place for it, so encode and decode can't quietly drift apart on how
+/// big the tail is.
+fn trailerLen(has_structural_hash: bool) usize {
+    return hash_len + (if (has_structural_hash) @as(usize, structural_hash_len) else 0);
+}
+
 pub fn encodeAlloc(
     alloc: std.mem.Allocator,
     obj_type: ObjectType,
@@ -72,7 +81,7 @@ pub fn encodeAlloc(
     const stored = try compressAlloc(alloc, codec, payload);
     defer alloc.free(stored);
 
-    const trailer_len: usize = hash_len + (if (structural_hash != null) @as(usize, structural_hash_len) else 0);
+    const trailer_len: usize = trailerLen(structural_hash != null);
     const total_len = header_len + stored.len + trailer_len;
     const bytes = try alloc.alloc(u8, total_len);
     errdefer alloc.free(bytes);
@@ -103,7 +112,7 @@ pub fn decodeFromBuffer(alloc: std.mem.Allocator, bytes: []const u8) !Object {
     if (bytes.len < header_len) return error.CorruptObject;
     const header = try decodeHeaderFromBuffer(bytes[0..header_len]);
 
-    const trailer_len: usize = hash_len + (if (header.has_structural_hash) @as(usize, structural_hash_len) else 0);
+    const trailer_len: usize = trailerLen(header.has_structural_hash);
     const expected_len = header_len + @as(usize, header.stored_len) + trailer_len;
     if (bytes.len != expected_len) return error.CorruptObject;
 

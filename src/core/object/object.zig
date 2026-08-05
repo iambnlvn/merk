@@ -1,5 +1,5 @@
 const std = @import("std");
-const io = @import("merk").io;
+const fs_mod = @import("merk").io;
 const format = @import("./object_format.zig");
 const hash_mod = @import("merk").crypto.hash;
 const compression = @import("merk").compression;
@@ -11,13 +11,13 @@ pub const Object = format.Object;
 const object_name_len = 2 + 1 + 2 + 1 + 64; // "xx/yy/<64 hex chars>"
 
 pub const Store = struct {
-    fs: io.FileSystem,
+    fs: fs_mod.vfs.Vfs,
     alloc: std.mem.Allocator,
     /// Directory objects live under, relative to `fs`'s root. May be ""
     /// if `fs` is already rooted at the objects directory itself
     objects_dir: []const u8,
 
-    pub fn init(alloc: std.mem.Allocator, fs: io.FileSystem, objects_dir: []const u8) Store {
+    pub fn init(alloc: std.mem.Allocator, fs: fs_mod.vfs.Vfs, objects_dir: []const u8) Store {
         return .{ .fs = fs, .alloc = alloc, .objects_dir = objects_dir };
     }
 
@@ -150,25 +150,18 @@ pub const Store = struct {
 
     /// Number of loose objects currently on disk
     pub fn count(self: *const Store) !usize {
-        const names = try self.fs.listFiles(self.alloc, self.objects_dir);
+        const names = try self.listObjectEntries();
         defer freeNames(self.alloc, names);
-
-        var n: usize = 0;
-        for (names) |name| {
-            if (isObjectFileName(name)) n += 1;
-        }
-        return n;
+        return names.len;
     }
 
     /// Total on-disk size, in bytes, of all loose objects
     pub fn totalSize(self: *const Store) !u64 {
-        const names = try self.fs.listFiles(self.alloc, self.objects_dir);
+        const names = try self.listObjectEntries();
         defer freeNames(self.alloc, names);
 
         var total: u64 = 0;
         for (names) |name| {
-            if (!isObjectFileName(name)) continue;
-
             const full_path = try joinPath(self.alloc, self.objects_dir, name);
             defer self.alloc.free(full_path);
 
@@ -176,14 +169,95 @@ pub const Store = struct {
         }
         return total;
     }
+
+    pub const CompressionStats = struct {
+        objects: usize = 0,
+        payload_bytes: u64 = 0,
+        stored_bytes: u64 = 0,
+    };
+
+    /// Aggregate payload-vs-stored byte counts across every loose object,
+    /// read straight from each object's header (`getHeader`, not a full
+    /// decode) — the cheapest way to answer "is compression pulling its
+    /// weight here" once `compression.choose` starts actually selecting
+    /// something other than `.none`. Right now `stored_bytes` will
+    /// equal `payload_bytes`, since encode-time compression is disabled
+    /// (see `compression.Codec.zlib`'s doc comment) — this is measuring
+    /// infrastructure that's ready for when that changes, not evidence
+    /// compression is doing anything today.
+    pub fn compressionStats(self: *const Store) !CompressionStats {
+        const names = try self.listObjectEntries();
+        defer freeNames(self.alloc, names);
+
+        var stats = CompressionStats{};
+        for (names) |name| {
+            const hex = name[name.len - 64 ..];
+            const obj_hash = hash_mod.fromHex(hex) catch continue;
+
+            const header = self.getHeader(obj_hash) catch continue;
+            stats.objects += 1;
+            stats.payload_bytes += header.payload_len;
+            stats.stored_bytes += header.stored_len;
+        }
+        return stats;
+    }
+
+    /// Sharded loose-object filenames directly under `objects_dir` —
+    /// filtered to the "xx/yy/<64 hex>" shape `isObjectFileName` checks
+    /// for, so `structural_index/...` entries and anything else living
+    /// alongside the shards don't leak in. `count`, `totalSize`,
+    /// `verifyAll`, and `compressionStats` all want exactly this list;
+    /// one place to change the filter instead of four.
+    fn listObjectEntries(self: *const Store) ![][]u8 {
+        const names = try self.fs.listFiles(self.alloc, self.objects_dir);
+
+        var kept: std.ArrayListUnmanaged([]u8) = .{};
+        errdefer {
+            for (kept.items) |n| self.alloc.free(n);
+            kept.deinit(self.alloc);
+        }
+
+        var i: usize = 0;
+        errdefer {
+            // Anything not yet claimed by `kept` (or already freed as
+            // non-object-shaped) still needs freeing on the error path —
+            // `kept.append` below is the only thing here that can fail.
+            for (names[i..]) |n| self.alloc.free(n);
+            self.alloc.free(names);
+        }
+
+        while (i < names.len) : (i += 1) {
+            const name = names[i];
+            if (isObjectFileName(name)) {
+                try kept.append(self.alloc, name);
+            } else {
+                self.alloc.free(name);
+            }
+        }
+        self.alloc.free(names);
+
+        return kept.toOwnedSlice(self.alloc);
+    }
+
+    /// Builds a "<base>/xx/yy/<hex>" path (or "xx/yy/<hex>" if `base` is
+    /// empty) — the sharding scheme both loose objects (`objectPath`) and
+    /// the structural-hash side index (`structuralIndexPath`) use, so a
+    /// change to the shard width only has one place to happen.
+    fn shardedPath(alloc: std.mem.Allocator, base: []const u8, hex: []const u8) ![]u8 {
+        if (base.len == 0) {
+            return std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ hex[0..2], hex[2..4], hex });
+        }
+        return std.fmt.allocPrint(alloc, "{s}/{s}/{s}/{s}", .{ base, hex[0..2], hex[2..4], hex });
+    }
+
     fn structuralIndexPath(self: *const Store, sh: Hash) ![]u8 {
         var hex_buf: [64]u8 = undefined;
         const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{sh}) catch unreachable;
 
-        if (self.objects_dir.len == 0) {
-            return std.fmt.allocPrint(self.alloc, "structural_index/{s}/{s}/{s}", .{ hex[0..2], hex[2..4], hex });
-        }
-        return std.fmt.allocPrint(self.alloc, "{s}/structural_index/{s}/{s}/{s}", .{ self.objects_dir, hex[0..2], hex[2..4], hex });
+        const base = try joinPath(self.alloc, self.objects_dir, "structural_index");
+        defer self.alloc.free(base);
+
+        return shardedPath(self.alloc, base, hex);
     }
 
     fn addToStructuralIndex(self: *const Store, sh: Hash, obj_hash: Hash) !void {
@@ -256,11 +330,10 @@ pub const Store = struct {
         var report = VerifyReport{};
         errdefer report.deinit(self.alloc);
 
-        const names = try self.fs.listFiles(self.alloc, self.objects_dir);
+        const names = try self.listObjectEntries();
         defer freeNames(self.alloc, names);
 
         for (names) |name| {
-            if (!isObjectFileName(name) or name.len < 64) continue;
             report.checked += 1;
 
             const hex = name[name.len - 64 ..];
@@ -310,11 +383,7 @@ pub const Store = struct {
     fn objectPath(self: *const Store, obj_hash: Hash) ![]u8 {
         var hex_buf: [64]u8 = undefined;
         const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{obj_hash}) catch unreachable;
-
-        if (self.objects_dir.len == 0) {
-            return std.fmt.allocPrint(self.alloc, "{s}/{s}/{s}", .{ hex[0..2], hex[2..4], hex });
-        }
-        return std.fmt.allocPrint(self.alloc, "{s}/{s}/{s}/{s}", .{ self.objects_dir, hex[0..2], hex[2..4], hex });
+        return shardedPath(self.alloc, self.objects_dir, hex);
     }
 };
 
@@ -376,10 +445,10 @@ fn isHexChar(c: u8) bool {
 
 test "store put and get round-trip" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
 
     const payload = "hello, object store!";
     const h = try store.put(.blob, payload);
@@ -394,10 +463,10 @@ test "store put and get round-trip" {
 
 test "store works with an empty objects_dir (fs already rooted there)" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "");
+    const store = Store.init(alloc, mem_fs.fs(), "");
     const h = try store.put(.tree, "rooted at fs root");
 
     const obj = try store.get(h);
@@ -407,10 +476,10 @@ test "store works with an empty objects_dir (fs already rooted there)" {
 
 test "store deduplication avoids a second write" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
 
     const h1 = try store.put(.blob, "dedup test");
     try std.testing.expectEqual(@as(usize, 1), try store.count());
@@ -422,10 +491,10 @@ test "store deduplication avoids a second write" {
 
 test "store getHeader matches the full decode without materializing the payload" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const payload = "intent-aware version control " ** 32;
 
     const h = try store.put(.commit, payload);
@@ -442,10 +511,10 @@ test "store getHeader matches the full decode without materializing the payload"
 
 test "store getHeader on a missing object returns NotFound" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     var ghost: Hash = std.mem.zeroes(Hash);
     ghost[0] = 0xAB;
 
@@ -454,10 +523,10 @@ test "store getHeader on a missing object returns NotFound" {
 
 test "store delete removes the object" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const h = try store.put(.blob, "temporary");
     try std.testing.expect(store.exists(h));
 
@@ -468,10 +537,10 @@ test "store delete removes the object" {
 
 test "store delete on a missing object surfaces the underlying error" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     var ghost: Hash = std.mem.zeroes(Hash);
     ghost[0] = 0xCD;
 
@@ -480,27 +549,27 @@ test "store delete on a missing object surfaces the underlying error" {
 
 test "store count only counts well-formed object entries" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     _ = try store.put(.blob, "one");
     _ = try store.put(.tree, "two");
     _ = try store.put(.commit, "three");
 
     // Something that lives alongside the shard dirs but isn't itself a
     // valid "xx/yy/hash" entry should be ignored by count()
-    try tfs.fs().writeFile(alloc, "objects/README", "not an object");
+    try mem_fs.fs().writeFile(alloc, "objects/README", "not an object");
 
     try std.testing.expectEqual(@as(usize, 3), try store.count());
 }
 
 test "store totalSize sums the on-disk bytes of loose objects" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     _ = try store.put(.blob, "a");
     _ = try store.put(.blob, "bb");
 
@@ -508,12 +577,33 @@ test "store totalSize sums the on-disk bytes of loose objects" {
     try std.testing.expect(total > 0);
 }
 
+test "store compressionStats aggregates payload/stored bytes across objects, ignoring the structural index" {
+    const alloc = std.testing.allocator;
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
+
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
+    _ = try store.put(.blob, "twelve bytes");
+    const sh: Hash = [_]u8{0x11} ** 32;
+    _ = try store.putWithStructuralHash(.ast, "fn f() void {}", sh);
+
+    const stats = try store.compressionStats();
+    try std.testing.expectEqual(@as(usize, 2), stats.objects);
+    try std.testing.expectEqual(@as(u64, "twelve bytes".len + "fn f() void {}".len), stats.payload_bytes);
+    //TODO!:
+    // Compression is currently disabled (codec always .none), so stored
+    // should exactly match payload — this test also doubles as a
+    // tripwire: it'll start failing the moment `choose()` picks
+    // something other than `.none`, which is the reminder to update it.
+    try std.testing.expectEqual(stats.payload_bytes, stats.stored_bytes);
+}
+
 test "store verifyAll reports corruption without failing the whole scan" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const good1 = try store.put(.blob, "healthy object one");
     const good2 = try store.put(.blob, "healthy object two");
     const bad = try store.put(.blob, "about to be corrupted");
@@ -524,12 +614,12 @@ test "store verifyAll reports corruption without failing the whole scan" {
     const path = try std.fmt.allocPrint(alloc, "objects/{s}/{s}/{s}", .{ hex[0..2], hex[2..4], hex });
     defer alloc.free(path);
 
-    const original = (try tfs.fs().readFile(alloc, path)).?;
+    const original = (try mem_fs.fs().readFile(alloc, path)).?;
     defer alloc.free(original);
     const tampered = try alloc.dupe(u8, original);
     defer alloc.free(tampered);
     tampered[tampered.len - 1] ^= 0xFF;
-    try tfs.fs().writeFile(alloc, path, tampered);
+    try mem_fs.fs().writeFile(alloc, path, tampered);
 
     var report = try store.verifyAll();
     defer report.deinit(alloc);
@@ -547,10 +637,10 @@ test "store verifyAll reports corruption without failing the whole scan" {
 
 test "resolveHashPrefix finds a unique match by full hash" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const h = try store.put(.blob, "unique object");
 
     var hex_buf: [64]u8 = undefined;
@@ -565,10 +655,10 @@ test "resolveHashPrefix finds a unique match by full hash" {
 
 test "resolveHashPrefix delegates minimum-length validation to hash_mod" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     _ = try store.put(.blob, "irrelevant");
 
     try std.testing.expectError(error.InvalidHexLength, store.resolveHashPrefix("a"));
@@ -576,10 +666,10 @@ test "resolveHashPrefix delegates minimum-length validation to hash_mod" {
 
 test "resolveHashPrefix returns NotFound for a prefix nothing matches" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     _ = try store.put(.blob, "something");
 
     try std.testing.expectError(error.NotFound, store.resolveHashPrefix("f" ** 16));
@@ -587,10 +677,10 @@ test "resolveHashPrefix returns NotFound for a prefix nothing matches" {
 
 test "resolveHashPrefix returns Ambiguous for a shared prefix" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
 
     // Bypass Store.put entirely and fabricate two "objects" that share
     // a long common prefix but differ afterward — resolveHashPrefix only
@@ -601,18 +691,18 @@ test "resolveHashPrefix returns Ambiguous for a shared prefix" {
     const hash_a = shared_prefix ++ "1" ** (64 - shared_prefix.len);
     const hash_b = shared_prefix ++ "2" ** (64 - shared_prefix.len);
 
-    try tfs.fs().writeFile(alloc, "objects/aa/bb/" ++ hash_a, "dummy");
-    try tfs.fs().writeFile(alloc, "objects/aa/bb/" ++ hash_b, "dummy");
+    try mem_fs.fs().writeFile(alloc, "objects/aa/bb/" ++ hash_a, "dummy");
+    try mem_fs.fs().writeFile(alloc, "objects/aa/bb/" ++ hash_b, "dummy");
 
     try std.testing.expectError(error.Ambiguous, store.resolveHashPrefix(shared_prefix));
 }
 
 test "ObjectReader streams a payload across many small reads" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const payload = "node graph semantic history " ** 48;
     const h = try store.put(.blob, payload);
 
@@ -636,10 +726,10 @@ test "ObjectReader streams a payload across many small reads" {
 
 test "ObjectReader reset() allows a second full pass" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const h = try store.put(.blob, "read me twice");
 
     var reader = try ObjectReader.init(&store, h);
@@ -659,10 +749,10 @@ test "ObjectReader reset() allows a second full pass" {
 
 test "ObjectReader.init on a missing hash returns NotFound" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     var ghost: Hash = std.mem.zeroes(Hash);
     ghost[0] = 0xEF;
 
@@ -671,10 +761,10 @@ test "ObjectReader.init on a missing hash returns NotFound" {
 
 test "findByStructuralHash finds every ast object sharing a structural hash" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
 
     const shared_sh: Hash = [_]u8{0xAB} ** 32;
     const other_sh: Hash = [_]u8{0xCD} ** 32;
@@ -714,10 +804,10 @@ test "findByStructuralHash finds every ast object sharing a structural hash" {
 
 test "getStructuralHash returns null for objects encoded without one" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const h = try store.put(.blob, "no structural hash here");
 
     const sh = try store.getStructuralHash(h);
@@ -726,10 +816,10 @@ test "getStructuralHash returns null for objects encoded without one" {
 
 test "getStructuralHash round-trips without touching the payload" {
     const alloc = std.testing.allocator;
-    var tfs = io.TestFs.init(alloc);
-    defer tfs.deinit();
+    var mem_fs = fs_mod.mem_fs.init(alloc);
+    defer mem_fs.deinit();
 
-    const store = Store.init(alloc, tfs.fs(), "objects");
+    const store = Store.init(alloc, mem_fs.fs(), "objects");
     const sh: Hash = [_]u8{0x42} ** 32;
     const h = try store.putWithStructuralHash(.ast, "struct Foo { x: i32 }", sh);
 
