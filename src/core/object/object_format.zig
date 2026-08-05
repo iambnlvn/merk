@@ -1,5 +1,5 @@
 //    [4]  magic   = 0x4D_45_52_4B  ("MERK")
-//    [1]  version = 2
+//    [1]  version = 1
 //    [1]  type    = ObjectType (u8)
 //    [1]  codec   = compression.Codec (u8)
 //    [1]  flags   = bit 0: has structural hash
@@ -63,6 +63,18 @@ pub const EncodedObject = struct {
     hash: Hash,
 };
 
+/// The content hash covers `type ++ payload` — same object bytes under a
+/// different `ObjectType` hash differently. `encodeAlloc` computes this
+/// once to embed in the trailer; `decodeFromBuffer` recomputes it from
+/// the decoded payload to verify against that trailer. One place for
+/// the definition means encode and decode can't quietly drift apart on
+/// what's actually covered by the hash.
+fn contentHash(obj_type: ObjectType, payload: []const u8) Hash {
+    const type_byte = [1]u8{@intFromEnum(obj_type)};
+    const parts: []const []const u8 = &.{ &type_byte, payload };
+    return blake3Many(parts);
+}
+
 /// Bytes appended after the stored body: the content hash always, plus
 /// the structural hash trailer when present. `encodeAlloc` and
 /// `decodeFromBuffer` both need this to size/locate the trailer — one
@@ -79,9 +91,7 @@ pub fn encodeAlloc(
     codec: compression.Codec,
     structural_hash: ?Hash,
 ) !EncodedObject {
-    const type_byte = [1]u8{@intFromEnum(obj_type)};
-    const parts: []const []const u8 = &.{ &type_byte, payload };
-    const obj_hash = blake3Many(parts);
+    const obj_hash = contentHash(obj_type, payload);
 
     const stored = try compressAlloc(alloc, codec, payload);
     defer alloc.free(stored);
@@ -127,9 +137,7 @@ pub fn decodeFromBuffer(alloc: Allocator, bytes: []const u8) !Object {
     const payload = try compression.decodeAlloc(alloc, header.codec, stored, header.payload_len);
     errdefer alloc.free(payload);
 
-    const type_byte = [1]u8{@intFromEnum(header.obj_type)};
-    const parts: []const []const u8 = &.{ &type_byte, payload };
-    const computed = blake3Many(parts);
+    const computed = contentHash(header.obj_type, payload);
     if (!std.mem.eql(u8, &computed, content_trailer)) return error.HashMismatch;
 
     var structural_hash: ?Hash = null;

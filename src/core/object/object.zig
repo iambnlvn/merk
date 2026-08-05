@@ -20,15 +20,45 @@ const parseHexPrefix = crypto.parseHexPrefix;
 
 const object_name_len = 2 + 1 + 2 + 1 + 64; // "xx/yy/<64 hex chars>"
 
+///NOTE: duplicate impl already present in staging module,
+/// TODO: figure out how to extract it
+pub const ComponentDir = struct {
+    /// Directory this component's state lives under, relative to its
+    /// `Vfs` root. May be "" if the `Vfs` is already rooted there.
+    repo_dir: []const u8,
+
+    pub fn init(repo_dir: []const u8) ComponentDir {
+        return .{ .repo_dir = repo_dir };
+    }
+
+    /// Join with `sub`, e.g. "staging/pages" -> "<repo_dir>/staging/pages".
+    /// Caller owns and must free the result.
+    pub fn join(self: ComponentDir, alloc: Allocator, sub: []const u8) ![]u8 {
+        if (self.repo_dir.len == 0) return alloc.dupe(u8, sub);
+        return std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.repo_dir, sub });
+    }
+
+    /// Two-level hex sharding for hash-keyed on-disk stores: joins with
+    /// "xx/yy/<hex>" so no single directory ever holds more than a
+    /// couple hundred entries. Shared by loose objects (`Store`) and
+    /// the structural-hash side index (`StructuralIndex`) — both used
+    /// to carry their own copy of this exact split-the-hex logic.
+    pub fn shardedPath(self: ComponentDir, alloc: Allocator, hex: []const u8) ![]u8 {
+        const shard = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ hex[0..2], hex[2..4], hex });
+        defer alloc.free(shard);
+        return self.join(alloc, shard);
+    }
+};
+
 pub const Store = struct {
     fs: Vfs,
     alloc: Allocator,
-    /// Directory objects live under, relative to `fs`'s root. May be ""
-    /// if `fs` is already rooted at the objects directory itself
-    objects_dir: []const u8,
+    /// Where loose objects live, relative to `fs`'s root. Typically
+    /// ".merk/objects" when `fs` is rooted at the repo root.
+    dir: ComponentDir,
 
     pub fn init(alloc: Allocator, fs: Vfs, objects_dir: []const u8) Store {
-        return .{ .fs = fs, .alloc = alloc, .objects_dir = objects_dir };
+        return .{ .fs = fs, .alloc = alloc, .dir = ComponentDir.init(objects_dir) };
     }
 
     pub fn put(self: *const Store, obj_type: ObjectType, payload: []const u8) !Hash {
@@ -172,7 +202,7 @@ pub const Store = struct {
 
         var total: u64 = 0;
         for (names) |name| {
-            const full_path = try joinPath(self.alloc, self.objects_dir, name);
+            const full_path = try self.dir.join(self.alloc, name);
             defer self.alloc.free(full_path);
 
             if (try self.fs.statFile(full_path)) |stat| total += stat.size;
@@ -212,14 +242,14 @@ pub const Store = struct {
         return stats;
     }
 
-    /// Sharded loose-object filenames directly under `objects_dir` —
+    /// Sharded loose-object filenames directly under the objects dir —
     /// filtered to the "xx/yy/<64 hex>" shape `isObjectFileName` checks
     /// for, so `structural_index/...` entries and anything else living
     /// alongside the shards don't leak in. `count`, `totalSize`,
     /// `verifyAll`, and `compressionStats` all want exactly this list;
     /// one place to change the filter instead of four.
     fn listObjectEntries(self: *const Store) ![][]u8 {
-        const names = try self.fs.listFiles(self.alloc, self.objects_dir);
+        const names = try self.fs.listFiles(self.alloc, self.dir.repo_dir);
 
         var kept: std.ArrayListUnmanaged([]u8) = .{};
         errdefer {
@@ -249,25 +279,22 @@ pub const Store = struct {
         return kept.toOwnedSlice(self.alloc);
     }
 
-    /// Builds a "<base>/xx/yy/<hex>" path (or "xx/yy/<hex>" if `base` is
-    /// empty) — the sharding scheme both loose objects (`objectPath`) and
-    /// the structural-hash side index (`structuralIndexPath`) use, so a
-    /// change to the shard width only has one place to happen.
-    fn shardedPath(alloc: Allocator, base: []const u8, hex: []const u8) ![]u8 {
-        if (base.len == 0) {
-            return std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ hex[0..2], hex[2..4], hex });
-        }
-        return std.fmt.allocPrint(alloc, "{s}/{s}/{s}/{s}", .{ base, hex[0..2], hex[2..4], hex });
-    }
-
+    /// Path to the structural-hash side index entry for `sh`: one flat
+    /// file per structural hash, sharded the same way loose objects are
+    /// ("structural_index/xx/yy/<hex>"), so a repo with many distinct
+    /// structural hashes still gets small directories.
     fn structuralIndexPath(self: *const Store, sh: Hash) ![]u8 {
         var hex_buf: [64]u8 = undefined;
         const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{sh}) catch unreachable;
 
-        const base = try joinPath(self.alloc, self.objects_dir, "structural_index");
-        defer self.alloc.free(base);
+        const sub_path = try std.fmt.allocPrint(
+            self.alloc,
+            "structural_index/{s}/{s}/{s}",
+            .{ hex[0..2], hex[2..4], hex },
+        );
+        defer self.alloc.free(sub_path);
 
-        return shardedPath(self.alloc, base, hex);
+        return self.dir.join(self.alloc, sub_path);
     }
 
     fn addToStructuralIndex(self: *const Store, sh: Hash, obj_hash: Hash) !void {
@@ -368,7 +395,7 @@ pub const Store = struct {
     pub fn resolveHashPrefix(self: *const Store, prefix: []const u8) !Hash {
         try parseHexPrefix(prefix);
 
-        const shard_dir = try joinPath(self.alloc, self.objects_dir, prefix[0..2]);
+        const shard_dir = try self.dir.join(self.alloc, prefix[0..2]);
         defer self.alloc.free(shard_dir);
 
         const names = try self.fs.listFiles(self.alloc, shard_dir);
@@ -393,7 +420,7 @@ pub const Store = struct {
     fn objectPath(self: *const Store, obj_hash: Hash) ![]u8 {
         var hex_buf: [64]u8 = undefined;
         const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{obj_hash}) catch unreachable;
-        return shardedPath(self.alloc, self.objects_dir, hex);
+        return self.dir.shardedPath(self.alloc, hex);
     }
 };
 
@@ -429,11 +456,6 @@ pub const ObjectReader = struct {
         self.pos = 0;
     }
 };
-
-fn joinPath(alloc: Allocator, dir: []const u8, sub: []const u8) ![]u8 {
-    if (dir.len == 0) return alloc.dupe(u8, sub);
-    return std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, sub });
-}
 
 fn freeNames(alloc: Allocator, names: [][]u8) void {
     for (names) |n| alloc.free(n);
