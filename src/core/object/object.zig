@@ -1,23 +1,33 @@
 const std = @import("std");
-const fs_mod = @import("merk").io;
-const format = @import("./object_format.zig");
-const hash_mod = @import("merk").crypto.hash;
-const compression = @import("merk").compression;
+const crypto = @import("crypto");
+const compression = @import("compression");
+const storage = @import("storage");
 
-pub const Hash = format.Hash;
+const format = @import("./object_format.zig");
+
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+
+const Vfs = storage.Vfs;
+const MemoryFs = storage.MemoryFs;
+
+pub const Hash = crypto.Hash;
 pub const ObjectType = format.ObjectType;
 pub const Object = format.Object;
+
+const fromHex = crypto.fromHex;
+const parseHexPrefix = crypto.parseHexPrefix;
 
 const object_name_len = 2 + 1 + 2 + 1 + 64; // "xx/yy/<64 hex chars>"
 
 pub const Store = struct {
-    fs: fs_mod.vfs.Vfs,
-    alloc: std.mem.Allocator,
+    fs: Vfs,
+    alloc: Allocator,
     /// Directory objects live under, relative to `fs`'s root. May be ""
     /// if `fs` is already rooted at the objects directory itself
     objects_dir: []const u8,
 
-    pub fn init(alloc: std.mem.Allocator, fs: fs_mod.vfs.Vfs, objects_dir: []const u8) Store {
+    pub fn init(alloc: Allocator, fs: Vfs, objects_dir: []const u8) Store {
         return .{ .fs = fs, .alloc = alloc, .objects_dir = objects_dir };
     }
 
@@ -192,7 +202,7 @@ pub const Store = struct {
         var stats = CompressionStats{};
         for (names) |name| {
             const hex = name[name.len - 64 ..];
-            const obj_hash = hash_mod.fromHex(hex) catch continue;
+            const obj_hash = fromHex(hex) catch continue;
 
             const header = self.getHeader(obj_hash) catch continue;
             stats.objects += 1;
@@ -243,7 +253,7 @@ pub const Store = struct {
     /// empty) — the sharding scheme both loose objects (`objectPath`) and
     /// the structural-hash side index (`structuralIndexPath`) use, so a
     /// change to the shard width only has one place to happen.
-    fn shardedPath(alloc: std.mem.Allocator, base: []const u8, hex: []const u8) ![]u8 {
+    fn shardedPath(alloc: Allocator, base: []const u8, hex: []const u8) ![]u8 {
         if (base.len == 0) {
             return std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ hex[0..2], hex[2..4], hex });
         }
@@ -318,7 +328,7 @@ pub const Store = struct {
         checked: usize = 0,
         corrupt: std.ArrayListUnmanaged(Hash) = .{},
 
-        pub fn deinit(self: *VerifyReport, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *VerifyReport, alloc: Allocator) void {
             self.corrupt.deinit(alloc);
         }
     };
@@ -337,7 +347,7 @@ pub const Store = struct {
             report.checked += 1;
 
             const hex = name[name.len - 64 ..];
-            const obj_hash = hash_mod.fromHex(hex) catch {
+            const obj_hash = fromHex(hex) catch {
                 try report.corrupt.append(self.alloc, std.mem.zeroes(Hash));
                 continue;
             };
@@ -356,7 +366,7 @@ pub const Store = struct {
     }
     /// Resolve a hex prefix to the single object hash it identifies
     pub fn resolveHashPrefix(self: *const Store, prefix: []const u8) !Hash {
-        try hash_mod.parseHexPrefix(prefix);
+        try parseHexPrefix(prefix);
 
         const shard_dir = try joinPath(self.alloc, self.objects_dir, prefix[0..2]);
         defer self.alloc.free(shard_dir);
@@ -372,7 +382,7 @@ pub const Store = struct {
             const hex = rel[3..];
             if (!std.mem.startsWith(u8, hex, prefix)) continue;
 
-            const h = hash_mod.fromHex(hex) catch continue;
+            const h = fromHex(hex) catch continue;
             if (found != null) return error.Ambiguous;
             found = h;
         }
@@ -388,7 +398,7 @@ pub const Store = struct {
 };
 
 pub const ObjectReader = struct {
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     obj_type: ObjectType,
     payload: []u8,
     pos: usize,
@@ -420,12 +430,12 @@ pub const ObjectReader = struct {
     }
 };
 
-fn joinPath(alloc: std.mem.Allocator, dir: []const u8, sub: []const u8) ![]u8 {
+fn joinPath(alloc: Allocator, dir: []const u8, sub: []const u8) ![]u8 {
     if (dir.len == 0) return alloc.dupe(u8, sub);
     return std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, sub });
 }
 
-fn freeNames(alloc: std.mem.Allocator, names: [][]u8) void {
+fn freeNames(alloc: Allocator, names: [][]u8) void {
     for (names) |n| alloc.free(n);
     alloc.free(names);
 }
@@ -444,26 +454,26 @@ fn isHexChar(c: u8) bool {
 }
 
 test "store put and get round-trip" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
 
     const payload = "hello, object store!";
     const h = try store.put(.blob, payload);
-    try std.testing.expect(store.exists(h));
+    try testing.expect(store.exists(h));
 
     const obj = try store.get(h);
     defer alloc.free(obj.payload);
 
-    try std.testing.expectEqual(ObjectType.blob, obj.obj_type);
-    try std.testing.expectEqualStrings(payload, obj.payload);
+    try testing.expectEqual(ObjectType.blob, obj.obj_type);
+    try testing.expectEqualStrings(payload, obj.payload);
 }
 
 test "store works with an empty objects_dir (fs already rooted there)" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "");
@@ -471,27 +481,27 @@ test "store works with an empty objects_dir (fs already rooted there)" {
 
     const obj = try store.get(h);
     defer alloc.free(obj.payload);
-    try std.testing.expectEqualStrings("rooted at fs root", obj.payload);
+    try testing.expectEqualStrings("rooted at fs root", obj.payload);
 }
 
 test "store deduplication avoids a second write" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
 
     const h1 = try store.put(.blob, "dedup test");
-    try std.testing.expectEqual(@as(usize, 1), try store.count());
+    try testing.expectEqual(@as(usize, 1), try store.count());
 
     const h2 = try store.put(.blob, "dedup test");
-    try std.testing.expectEqualSlices(u8, &h1, &h2);
-    try std.testing.expectEqual(@as(usize, 1), try store.count());
+    try testing.expectEqualSlices(u8, &h1, &h2);
+    try testing.expectEqual(@as(usize, 1), try store.count());
 }
 
 test "store getHeader matches the full decode without materializing the payload" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -500,56 +510,56 @@ test "store getHeader matches the full decode without materializing the payload"
     const h = try store.put(.commit, payload);
     const header = try store.getHeader(h);
 
-    try std.testing.expectEqual(format.VERSION, header.version);
-    try std.testing.expectEqual(ObjectType.commit, header.obj_type);
-    try std.testing.expectEqual(@as(u32, payload.len), header.payload_len);
+    try testing.expectEqual(format.VERSION, header.version);
+    try testing.expectEqual(ObjectType.commit, header.obj_type);
+    try testing.expectEqual(@as(u32, payload.len), header.payload_len);
 
     const obj = try store.get(h);
     defer alloc.free(obj.payload);
-    try std.testing.expectEqual(header.payload_len, @as(u32, @intCast(obj.payload.len)));
+    try testing.expectEqual(header.payload_len, @as(u32, @intCast(obj.payload.len)));
 }
 
 test "store getHeader on a missing object returns NotFound" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
     var ghost: Hash = std.mem.zeroes(Hash);
     ghost[0] = 0xAB;
 
-    try std.testing.expectError(error.NotFound, store.getHeader(ghost));
+    try testing.expectError(error.NotFound, store.getHeader(ghost));
 }
 
 test "store delete removes the object" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
     const h = try store.put(.blob, "temporary");
-    try std.testing.expect(store.exists(h));
+    try testing.expect(store.exists(h));
 
     try store.delete(h);
-    try std.testing.expect(!store.exists(h));
-    try std.testing.expectError(error.NotFound, store.get(h));
+    try testing.expect(!store.exists(h));
+    try testing.expectError(error.NotFound, store.get(h));
 }
 
 test "store delete on a missing object surfaces the underlying error" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
     var ghost: Hash = std.mem.zeroes(Hash);
     ghost[0] = 0xCD;
 
-    try std.testing.expectError(error.FileNotFound, store.delete(ghost));
+    try testing.expectError(error.FileNotFound, store.delete(ghost));
 }
 
 test "store count only counts well-formed object entries" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -561,12 +571,12 @@ test "store count only counts well-formed object entries" {
     // valid "xx/yy/hash" entry should be ignored by count()
     try mem_fs.fs().writeFile(alloc, "objects/README", "not an object");
 
-    try std.testing.expectEqual(@as(usize, 3), try store.count());
+    try testing.expectEqual(@as(usize, 3), try store.count());
 }
 
 test "store totalSize sums the on-disk bytes of loose objects" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -574,12 +584,12 @@ test "store totalSize sums the on-disk bytes of loose objects" {
     _ = try store.put(.blob, "bb");
 
     const total = try store.totalSize();
-    try std.testing.expect(total > 0);
+    try testing.expect(total > 0);
 }
 
 test "store compressionStats aggregates payload/stored bytes across objects, ignoring the structural index" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -588,19 +598,19 @@ test "store compressionStats aggregates payload/stored bytes across objects, ign
     _ = try store.putWithStructuralHash(.ast, "fn f() void {}", sh);
 
     const stats = try store.compressionStats();
-    try std.testing.expectEqual(@as(usize, 2), stats.objects);
-    try std.testing.expectEqual(@as(u64, "twelve bytes".len + "fn f() void {}".len), stats.payload_bytes);
+    try testing.expectEqual(@as(usize, 2), stats.objects);
+    try testing.expectEqual(@as(u64, "twelve bytes".len + "fn f() void {}".len), stats.payload_bytes);
     //TODO!:
     // Compression is currently disabled (codec always .none), so stored
     // should exactly match payload — this test also doubles as a
     // tripwire: it'll start failing the moment `choose()` picks
     // something other than `.none`, which is the reminder to update it.
-    try std.testing.expectEqual(stats.payload_bytes, stats.stored_bytes);
+    try testing.expectEqual(stats.payload_bytes, stats.stored_bytes);
 }
 
 test "store verifyAll reports corruption without failing the whole scan" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -624,9 +634,9 @@ test "store verifyAll reports corruption without failing the whole scan" {
     var report = try store.verifyAll();
     defer report.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 3), report.checked);
-    try std.testing.expectEqual(@as(usize, 1), report.corrupt.items.len);
-    try std.testing.expectEqualSlices(u8, &bad, &report.corrupt.items[0]);
+    try testing.expectEqual(@as(usize, 3), report.checked);
+    try testing.expectEqual(@as(usize, 1), report.corrupt.items.len);
+    try testing.expectEqualSlices(u8, &bad, &report.corrupt.items[0]);
 
     // Sanity: the untouched objects are still fine
     const obj1 = try store.get(good1);
@@ -636,8 +646,8 @@ test "store verifyAll reports corruption without failing the whole scan" {
 }
 
 test "resolveHashPrefix finds a unique match by full hash" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -647,37 +657,37 @@ test "resolveHashPrefix finds a unique match by full hash" {
     const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{h}) catch unreachable;
 
     const resolved = try store.resolveHashPrefix(hex);
-    try std.testing.expectEqualSlices(u8, &h, &resolved);
+    try testing.expectEqualSlices(u8, &h, &resolved);
 
     const short_prefix = try store.resolveHashPrefix(hex[0..32]);
-    try std.testing.expectEqualSlices(u8, &h, &short_prefix);
+    try testing.expectEqualSlices(u8, &h, &short_prefix);
 }
 
-test "resolveHashPrefix delegates minimum-length validation to hash_mod" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+test "resolveHashPrefix delegates minimum-length validation to crypto" {
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
     _ = try store.put(.blob, "irrelevant");
 
-    try std.testing.expectError(error.InvalidHexLength, store.resolveHashPrefix("a"));
+    try testing.expectError(error.InvalidHexLength, store.resolveHashPrefix("a"));
 }
 
 test "resolveHashPrefix returns NotFound for a prefix nothing matches" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
     _ = try store.put(.blob, "something");
 
-    try std.testing.expectError(error.NotFound, store.resolveHashPrefix("f" ** 16));
+    try testing.expectError(error.NotFound, store.resolveHashPrefix("f" ** 16));
 }
 
 test "resolveHashPrefix returns Ambiguous for a shared prefix" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -694,12 +704,12 @@ test "resolveHashPrefix returns Ambiguous for a shared prefix" {
     try mem_fs.fs().writeFile(alloc, "objects/aa/bb/" ++ hash_a, "dummy");
     try mem_fs.fs().writeFile(alloc, "objects/aa/bb/" ++ hash_b, "dummy");
 
-    try std.testing.expectError(error.Ambiguous, store.resolveHashPrefix(shared_prefix));
+    try testing.expectError(error.Ambiguous, store.resolveHashPrefix(shared_prefix));
 }
 
 test "ObjectReader streams a payload across many small reads" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -719,14 +729,14 @@ test "ObjectReader streams a payload across many small reads" {
         offset += n;
     }
 
-    try std.testing.expectEqual(payload.len, offset);
-    try std.testing.expectEqualStrings(payload, out);
-    try std.testing.expectEqual(@as(usize, 0), reader.remaining());
+    try testing.expectEqual(payload.len, offset);
+    try testing.expectEqualStrings(payload, out);
+    try testing.expectEqual(@as(usize, 0), reader.remaining());
 }
 
 test "ObjectReader reset() allows a second full pass" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -737,31 +747,31 @@ test "ObjectReader reset() allows a second full pass" {
 
     var first: [32]u8 = undefined;
     const n1 = reader.read(&first);
-    try std.testing.expectEqual(@as(usize, 0), reader.remaining());
+    try testing.expectEqual(@as(usize, 0), reader.remaining());
 
     reader.reset();
     var second: [32]u8 = undefined;
     const n2 = reader.read(&second);
 
-    try std.testing.expectEqual(n1, n2);
-    try std.testing.expectEqualSlices(u8, first[0..n1], second[0..n2]);
+    try testing.expectEqual(n1, n2);
+    try testing.expectEqualSlices(u8, first[0..n1], second[0..n2]);
 }
 
 test "ObjectReader.init on a missing hash returns NotFound" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
     var ghost: Hash = std.mem.zeroes(Hash);
     ghost[0] = 0xEF;
 
-    try std.testing.expectError(error.NotFound, ObjectReader.init(&store, ghost));
+    try testing.expectError(error.NotFound, ObjectReader.init(&store, ghost));
 }
 
 test "findByStructuralHash finds every ast object sharing a structural hash" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -783,7 +793,7 @@ test "findByStructuralHash finds every ast object sharing a structural hash" {
     const matches = try store.findByStructuralHash(shared_sh);
     defer alloc.free(matches);
 
-    try std.testing.expectEqual(@as(usize, 2), matches.len);
+    try testing.expectEqual(@as(usize, 2), matches.len);
 
     var found_h1 = false;
     var found_h2 = false;
@@ -791,32 +801,32 @@ test "findByStructuralHash finds every ast object sharing a structural hash" {
         if (std.mem.eql(u8, &m, &h1)) found_h1 = true;
         if (std.mem.eql(u8, &m, &h2)) found_h2 = true;
         // Sanity: neither the differently-hashed nor the plain blob leaked in
-        try std.testing.expect(!std.mem.eql(u8, &m, &h3));
-        try std.testing.expect(!std.mem.eql(u8, &m, &h4));
+        try testing.expect(!std.mem.eql(u8, &m, &h3));
+        try testing.expect(!std.mem.eql(u8, &m, &h4));
     }
-    try std.testing.expect(found_h1);
-    try std.testing.expect(found_h2);
+    try testing.expect(found_h1);
+    try testing.expect(found_h2);
 
     const no_matches = try store.findByStructuralHash(std.mem.zeroes(Hash));
     defer alloc.free(no_matches);
-    try std.testing.expectEqual(@as(usize, 0), no_matches.len);
+    try testing.expectEqual(@as(usize, 0), no_matches.len);
 }
 
 test "getStructuralHash returns null for objects encoded without one" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
     const h = try store.put(.blob, "no structural hash here");
 
     const sh = try store.getStructuralHash(h);
-    try std.testing.expect(sh == null);
+    try testing.expect(sh == null);
 }
 
 test "getStructuralHash round-trips without touching the payload" {
-    const alloc = std.testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(alloc);
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -824,6 +834,6 @@ test "getStructuralHash round-trips without touching the payload" {
     const h = try store.putWithStructuralHash(.ast, "struct Foo { x: i32 }", sh);
 
     const got = try store.getStructuralHash(h);
-    try std.testing.expect(got != null);
-    try std.testing.expectEqualSlices(u8, &sh, &got.?);
+    try testing.expect(got != null);
+    try testing.expectEqualSlices(u8, &sh, &got.?);
 }

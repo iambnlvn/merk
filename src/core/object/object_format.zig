@@ -10,10 +10,15 @@
 //    [32] BLAKE3 structural hash (optional, present if flags bit 0 is set)
 
 const std = @import("std");
-const compression = @import("merk").compression;
-const hash_mod = @import("merk").crypto.hash;
+const compression = @import("compression");
+const crypto = @import("crypto");
 
-pub const Hash = hash_mod.Hash;
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+
+pub const Hash = crypto.Hash;
+
+const blake3Many = crypto.blake3Many;
 
 pub const ObjectType = enum(u8) {
     blob = 1,
@@ -68,7 +73,7 @@ fn trailerLen(has_structural_hash: bool) usize {
 }
 
 pub fn encodeAlloc(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     obj_type: ObjectType,
     payload: []const u8,
     codec: compression.Codec,
@@ -76,7 +81,7 @@ pub fn encodeAlloc(
 ) !EncodedObject {
     const type_byte = [1]u8{@intFromEnum(obj_type)};
     const parts: []const []const u8 = &.{ &type_byte, payload };
-    const obj_hash = hash_mod.blake3Many(parts);
+    const obj_hash = blake3Many(parts);
 
     const stored = try compressAlloc(alloc, codec, payload);
     defer alloc.free(stored);
@@ -108,7 +113,7 @@ pub fn encodeAlloc(
 /// version, out-of-range enum bytes, a length that doesn't match the
 /// header's claims, or a content hash mismatch all return an error
 /// rather than a partially-trustworthy `Object`
-pub fn decodeFromBuffer(alloc: std.mem.Allocator, bytes: []const u8) !Object {
+pub fn decodeFromBuffer(alloc: Allocator, bytes: []const u8) !Object {
     if (bytes.len < header_len) return error.CorruptObject;
     const header = try decodeHeaderFromBuffer(bytes[0..header_len]);
 
@@ -124,7 +129,7 @@ pub fn decodeFromBuffer(alloc: std.mem.Allocator, bytes: []const u8) !Object {
 
     const type_byte = [1]u8{@intFromEnum(header.obj_type)};
     const parts: []const []const u8 = &.{ &type_byte, payload };
-    const computed = hash_mod.blake3Many(parts);
+    const computed = blake3Many(parts);
     if (!std.mem.eql(u8, &computed, content_trailer)) return error.HashMismatch;
 
     var structural_hash: ?Hash = null;
@@ -201,7 +206,7 @@ pub fn structuralHashOffset(header: ObjectHeader) usize {
 // callback's signature until chunking exists; it performs no chunking.
 fn noOpChunk(_: []const u8) void {}
 
-fn compressAlloc(alloc: std.mem.Allocator, codec: compression.Codec, payload: []const u8) ![]u8 {
+fn compressAlloc(alloc: Allocator, codec: compression.Codec, payload: []const u8) ![]u8 {
     if (codec == .none) return try alloc.dupe(u8, payload);
 
     var reader = std.Io.Reader.fixed(payload);
@@ -213,7 +218,7 @@ fn compressAlloc(alloc: std.mem.Allocator, codec: compression.Codec, payload: []
 }
 
 test "encodeAlloc/decodeFromBuffer round-trip for every object type" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const payload = "content-addressed storage";
 
     inline for (.{ ObjectType.blob, ObjectType.tree, ObjectType.commit, ObjectType.ast }) |t| {
@@ -223,14 +228,14 @@ test "encodeAlloc/decodeFromBuffer round-trip for every object type" {
         const obj = try decodeFromBuffer(alloc, encoded.bytes);
         defer alloc.free(obj.payload);
 
-        try std.testing.expectEqual(t, obj.obj_type);
-        try std.testing.expectEqualStrings(payload, obj.payload);
-        try std.testing.expect(obj.structural_hash == null);
+        try testing.expectEqual(t, obj.obj_type);
+        try testing.expectEqualStrings(payload, obj.payload);
+        try testing.expect(obj.structural_hash == null);
     }
 }
 
 test "same payload under different object types hashes differently" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const payload = "same bytes, different meaning";
 
     const as_blob = try encodeAlloc(alloc, .blob, payload, .none, null);
@@ -238,11 +243,11 @@ test "same payload under different object types hashes differently" {
     const as_tree = try encodeAlloc(alloc, .tree, payload, .none, null);
     defer alloc.free(as_tree.bytes);
 
-    try std.testing.expect(!std.mem.eql(u8, &as_blob.hash, &as_tree.hash));
+    try testing.expect(!std.mem.eql(u8, &as_blob.hash, &as_tree.hash));
 }
 
 test "empty payload round-trips" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
 
     const encoded = try encodeAlloc(alloc, .blob, "", .none, null);
     defer alloc.free(encoded.bytes);
@@ -250,11 +255,11 @@ test "empty payload round-trips" {
     const obj = try decodeFromBuffer(alloc, encoded.bytes);
     defer alloc.free(obj.payload);
 
-    try std.testing.expectEqual(@as(usize, 0), obj.payload.len);
+    try testing.expectEqual(@as(usize, 0), obj.payload.len);
 }
 
 test "large payload round-trips" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const payload = "node graph semantic history " ** 512;
 
     const encoded = try encodeAlloc(alloc, .commit, payload, .none, null);
@@ -263,18 +268,18 @@ test "large payload round-trips" {
     const obj = try decodeFromBuffer(alloc, encoded.bytes);
     defer alloc.free(obj.payload);
 
-    try std.testing.expectEqualStrings(payload, obj.payload);
+    try testing.expectEqualStrings(payload, obj.payload);
 }
 
 test "codec none stores the payload verbatim" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const payload = "raw passthrough";
 
     const encoded = try encodeAlloc(alloc, .blob, payload, .none, null);
     defer alloc.free(encoded.bytes);
 
     const stored = encoded.bytes[header_len .. encoded.bytes.len - hash_len];
-    try std.testing.expectEqualStrings(payload, stored);
+    try testing.expectEqualStrings(payload, stored);
 }
 
 test "decodeHeaderFromBuffer rejects wrong magic" {
@@ -282,7 +287,7 @@ test "decodeHeaderFromBuffer rejects wrong magic" {
     std.mem.writeInt(u32, bytes[0..4], 0xDEAD_BEEF, .little);
     @memset(bytes[4..], 0);
 
-    try std.testing.expectError(error.CorruptObject, decodeHeaderFromBuffer(&bytes));
+    try testing.expectError(error.CorruptObject, decodeHeaderFromBuffer(&bytes));
 }
 
 test "decodeHeaderFromBuffer rejects unsupported version" {
@@ -291,13 +296,13 @@ test "decodeHeaderFromBuffer rejects unsupported version" {
     bytes[4] = 1; // legacy v1
     @memset(bytes[5..], 0);
 
-    try std.testing.expectError(error.UnsupportedVersion, decodeHeaderFromBuffer(&bytes));
+    try testing.expectError(error.UnsupportedVersion, decodeHeaderFromBuffer(&bytes));
 }
 
 test "decodeHeaderFromBuffer rejects a truncated buffer" {
     var bytes: [header_len - 3]u8 = undefined;
     @memset(&bytes, 0);
-    try std.testing.expectError(error.CorruptObject, decodeHeaderFromBuffer(&bytes));
+    try testing.expectError(error.CorruptObject, decodeHeaderFromBuffer(&bytes));
 }
 
 test "decodeHeaderFromBuffer rejects an out-of-range object type byte" {
@@ -308,7 +313,7 @@ test "decodeHeaderFromBuffer rejects an out-of-range object type byte" {
     bytes[6] = 0;
     @memset(bytes[7..], 0);
 
-    try std.testing.expectError(error.CorruptObject, decodeHeaderFromBuffer(&bytes));
+    try testing.expectError(error.CorruptObject, decodeHeaderFromBuffer(&bytes));
 }
 
 test "decodeHeaderFromBuffer rejects an out-of-range codec byte" {
@@ -319,7 +324,7 @@ test "decodeHeaderFromBuffer rejects an out-of-range codec byte" {
     bytes[6] = 0xFF; // no Codec tag is 255
     @memset(bytes[7..], 0);
 
-    try std.testing.expectError(error.CorruptObject, decodeHeaderFromBuffer(&bytes));
+    try testing.expectError(error.CorruptObject, decodeHeaderFromBuffer(&bytes));
 }
 
 test "decodeHeaderFromBuffer ignores unrecognized flag bits (forward compatibility)" {
@@ -337,30 +342,30 @@ test "decodeHeaderFromBuffer ignores unrecognized flag bits (forward compatibili
     // version (that only sets metadata flags, no new trailer bytes)
     // still decodes cleanly under this version.
     const header = try decodeHeaderFromBuffer(&bytes);
-    try std.testing.expect(header.has_structural_hash);
+    try testing.expect(header.has_structural_hash);
 }
 
 test "decodeFromBuffer rejects a tampered trailer hash" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const encoded = try encodeAlloc(alloc, .blob, "tamper me", .none, null);
     defer alloc.free(encoded.bytes);
 
     encoded.bytes[encoded.bytes.len - 1] ^= 0xFF;
 
-    try std.testing.expectError(error.HashMismatch, decodeFromBuffer(alloc, encoded.bytes));
+    try testing.expectError(error.HashMismatch, decodeFromBuffer(alloc, encoded.bytes));
 }
 
 test "decodeFromBuffer rejects a buffer shorter than the header claims" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const encoded = try encodeAlloc(alloc, .blob, "size mismatch", .none, null);
     defer alloc.free(encoded.bytes);
 
     const truncated = encoded.bytes[0 .. encoded.bytes.len - 4];
-    try std.testing.expectError(error.CorruptObject, decodeFromBuffer(alloc, truncated));
+    try testing.expectError(error.CorruptObject, decodeFromBuffer(alloc, truncated));
 }
 
 test "decodeFromBuffer rejects an oversized buffer with trailing garbage" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const encoded = try encodeAlloc(alloc, .blob, "trailing garbage", .none, null);
     defer alloc.free(encoded.bytes);
 
@@ -369,11 +374,11 @@ test "decodeFromBuffer rejects an oversized buffer with trailing garbage" {
     @memcpy(padded[0..encoded.bytes.len], encoded.bytes);
     @memset(padded[encoded.bytes.len..], 0xAA);
 
-    try std.testing.expectError(error.CorruptObject, decodeFromBuffer(alloc, padded));
+    try testing.expectError(error.CorruptObject, decodeFromBuffer(alloc, padded));
 }
 
 test "encodeAlloc/decodeFromBuffer round-trips a structural hash for ast objects" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const payload = "fn foo() void {}";
     const sh: Hash = [_]u8{0xAB} ** 32;
 
@@ -383,11 +388,11 @@ test "encodeAlloc/decodeFromBuffer round-trips a structural hash for ast objects
     const obj = try decodeFromBuffer(alloc, encoded.bytes);
     defer alloc.free(obj.payload);
 
-    try std.testing.expectEqualSlices(u8, &sh, &obj.structural_hash.?);
+    try testing.expectEqualSlices(u8, &sh, &obj.structural_hash.?);
 }
 
 test "structural hash trailer does not affect the content hash" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const payload = "fn foo() void { return; }";
 
     const without_sh = try encodeAlloc(alloc, .ast, payload, .none, null);
@@ -397,38 +402,38 @@ test "structural hash trailer does not affect the content hash" {
     const with_sh = try encodeAlloc(alloc, .ast, payload, .none, sh);
     defer alloc.free(with_sh.bytes);
 
-    try std.testing.expectEqualSlices(u8, &without_sh.hash, &with_sh.hash);
+    try testing.expectEqualSlices(u8, &without_sh.hash, &with_sh.hash);
 }
 
 test "decodeHeaderFromBuffer reports has_structural_hash from the flags byte" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const sh: Hash = [_]u8{0x99} ** 32;
 
     const with_sh = try encodeAlloc(alloc, .ast, "x", .none, sh);
     defer alloc.free(with_sh.bytes);
     const header_with = try decodeHeaderFromBuffer(with_sh.bytes[0..header_len]);
-    try std.testing.expect(header_with.has_structural_hash);
+    try testing.expect(header_with.has_structural_hash);
 
     const without_sh = try encodeAlloc(alloc, .ast, "x", .none, null);
     defer alloc.free(without_sh.bytes);
     const header_without = try decodeHeaderFromBuffer(without_sh.bytes[0..header_len]);
-    try std.testing.expect(!header_without.has_structural_hash);
+    try testing.expect(!header_without.has_structural_hash);
 }
 
 test "old-style objects with a zero flags byte decode with no structural hash" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const encoded = try encodeAlloc(alloc, .blob, "legacy object", .none, null);
     defer alloc.free(encoded.bytes);
 
-    try std.testing.expectEqual(@as(u8, 0), encoded.bytes[7]);
+    try testing.expectEqual(@as(u8, 0), encoded.bytes[7]);
 
     const obj = try decodeFromBuffer(alloc, encoded.bytes);
     defer alloc.free(obj.payload);
-    try std.testing.expect(obj.structural_hash == null);
+    try testing.expect(obj.structural_hash == null);
 }
 
 test "structuralHashOffset points at the correct trailer position" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const payload = "offset check";
     const sh: Hash = [_]u8{0x7E} ** 32;
 
@@ -438,6 +443,6 @@ test "structuralHashOffset points at the correct trailer position" {
     const header = try decodeHeaderFromBuffer(encoded.bytes[0..header_len]);
     const offset = structuralHashOffset(header);
 
-    try std.testing.expectEqual(encoded.bytes.len, offset + structural_hash_len);
-    try std.testing.expectEqualSlices(u8, &sh, encoded.bytes[offset..][0..structural_hash_len]);
+    try testing.expectEqual(encoded.bytes.len, offset + structural_hash_len);
+    try testing.expectEqualSlices(u8, &sh, encoded.bytes[offset..][0..structural_hash_len]);
 }
