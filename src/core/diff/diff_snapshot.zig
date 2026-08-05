@@ -7,6 +7,10 @@
 //  fetching just the changed blobs.
 
 const std = @import("std");
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
+
 const merk = @import("merk");
 const hash_mod = merk.crypto.hash;
 const merkle_mod = merk.merkle;
@@ -25,7 +29,7 @@ pub const Algorithm = diff_algorithms.Algorithm;
 /// `old_root == null` means "empty tree" (the root-commit case): every
 /// entry in `new_root` shows up as added.
 pub fn diffSnapshotRoots(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     store: *const object_mod.Store,
     page_store: *const merkle_mod.PageStore,
     old_root: ?Hash,
@@ -36,8 +40,8 @@ pub fn diffSnapshotRoots(
     const changes = try merkle_mod.diffRoots(alloc, page_store, normalized_old, new_root);
     defer merkle_mod.freeChanges(alloc, changes);
 
-    var file_diffs: std.ArrayList(FileDiff) = .empty;
-    var blobs: std.ArrayList([]u8) = .empty;
+    var file_diffs: ArrayList(FileDiff) = .empty;
+    var blobs: ArrayList([]u8) = .empty;
     errdefer {
         for (file_diffs.items) |*f| f.deinit(alloc);
         file_diffs.deinit(alloc);
@@ -73,7 +77,7 @@ pub fn diffSnapshotRoots(
 /// Pass `null` for `old_commit` to diff against an empty tree, e.g. for
 /// the root commit, where there is no parent to compare against.
 pub fn diffCommits(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     store: *const object_mod.Store,
     page_store: *const merkle_mod.PageStore,
     old_commit: ?Hash,
@@ -101,7 +105,7 @@ pub fn diffCommits(
 /// same convention `git show` uses by default — not a diff against
 /// every parent.
 pub fn diffCommitAgainstParent(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     store: *const object_mod.Store,
     page_store: *const merkle_mod.PageStore,
     new_commit: Hash,
@@ -125,12 +129,12 @@ const object_test_mod = object_mod;
 const FileSeed = struct { path: []const u8, content: []const u8 };
 
 fn buildRoot(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     page_store: *const merkle_mod.PageStore,
     store: *const object_mod.Store,
     seeds: []const FileSeed,
 ) !Hash {
-    var entries: std.ArrayList(merkle_mod.Entry) = .empty;
+    var entries: ArrayList(merkle_mod.Entry) = .empty;
     defer {
         for (entries.items) |*e| e.deinit(alloc);
         entries.deinit(alloc);
@@ -156,7 +160,7 @@ fn findFileDiff(cd: *const CommitDiff, path: []const u8) ?*const FileDiff {
 }
 
 test "diffSnapshotRoots reports modified, added, and removed files via merkle pruning" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var tfs = io.TestFs.init(alloc);
     defer tfs.deinit();
     const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
@@ -176,23 +180,23 @@ test "diffSnapshotRoots reports modified, added, and removed files via merkle pr
     var cd = try diffSnapshotRoots(alloc, &store, &page_store, old_root, new_root, .histogram);
     defer cd.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 3), cd.files.len);
+    try testing.expectEqual(@as(usize, 3), cd.files.len);
 
     const a = findFileDiff(&cd, "a.txt") orelse return error.MissingFile;
-    try std.testing.expectEqual(@as(u32, 1), a.lines_added);
-    try std.testing.expectEqual(@as(u32, 1), a.lines_removed);
+    try testing.expectEqual(@as(u32, 1), a.lines_added);
+    try testing.expectEqual(@as(u32, 1), a.lines_removed);
 
     const gone = findFileDiff(&cd, "gone.txt") orelse return error.MissingFile;
-    try std.testing.expectEqual(@as(u32, 0), gone.lines_added);
-    try std.testing.expectEqual(@as(u32, 1), gone.lines_removed);
+    try testing.expectEqual(@as(u32, 0), gone.lines_added);
+    try testing.expectEqual(@as(u32, 1), gone.lines_removed);
 
     const new_file = findFileDiff(&cd, "new.txt") orelse return error.MissingFile;
-    try std.testing.expectEqual(@as(u32, 1), new_file.lines_added);
-    try std.testing.expectEqual(@as(u32, 0), new_file.lines_removed);
+    try testing.expectEqual(@as(u32, 1), new_file.lines_added);
+    try testing.expectEqual(@as(u32, 0), new_file.lines_removed);
 }
 
 test "diffSnapshotRoots against a null old_root reports every entry as added" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var tfs = io.TestFs.init(alloc);
     defer tfs.deinit();
     const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
@@ -206,15 +210,15 @@ test "diffSnapshotRoots against a null old_root reports every entry as added" {
     var cd = try diffSnapshotRoots(alloc, &store, &page_store, null, new_root, .histogram);
     defer cd.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), cd.files.len);
+    try testing.expectEqual(@as(usize, 2), cd.files.len);
     for (cd.files) |fd| {
-        try std.testing.expectEqual(@as(u32, 1), fd.lines_added);
-        try std.testing.expectEqual(@as(u32, 0), fd.lines_removed);
+        try testing.expectEqual(@as(u32, 1), fd.lines_added);
+        try testing.expectEqual(@as(u32, 0), fd.lines_removed);
     }
 }
 
 test "diffCommits resolves commit hashes to snapshot roots before diffing" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var tfs = io.TestFs.init(alloc);
     defer tfs.deinit();
     const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
@@ -240,14 +244,14 @@ test "diffCommits resolves commit hashes to snapshot roots before diffing" {
     var cd = try diffCommits(alloc, &store, &page_store, c1, c2, .histogram);
     defer cd.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), cd.files.len);
-    try std.testing.expectEqualStrings("a.txt", cd.files[0].path);
-    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_added);
-    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_removed);
+    try testing.expectEqual(@as(usize, 1), cd.files.len);
+    try testing.expectEqualStrings("a.txt", cd.files[0].path);
+    try testing.expectEqual(@as(u32, 1), cd.files[0].lines_added);
+    try testing.expectEqual(@as(u32, 1), cd.files[0].lines_removed);
 }
 
 test "diffCommitAgainstParent treats a root commit as a diff against the empty tree" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var tfs = io.TestFs.init(alloc);
     defer tfs.deinit();
     const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
@@ -264,14 +268,14 @@ test "diffCommitAgainstParent treats a root commit as a diff against the empty t
     var cd = try diffCommitAgainstParent(alloc, &store, &page_store, c1, .histogram);
     defer cd.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), cd.files.len);
-    try std.testing.expectEqualStrings("a.txt", cd.files[0].path);
-    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_added);
-    try std.testing.expectEqual(@as(u32, 0), cd.files[0].lines_removed);
+    try testing.expectEqual(@as(usize, 1), cd.files.len);
+    try testing.expectEqualStrings("a.txt", cd.files[0].path);
+    try testing.expectEqual(@as(u32, 1), cd.files[0].lines_added);
+    try testing.expectEqual(@as(u32, 0), cd.files[0].lines_removed);
 }
 
 test "diffCommitAgainstParent uses the first (mainline) parent's snapshot" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var tfs = io.TestFs.init(alloc);
     defer tfs.deinit();
     const store = object_test_mod.Store.init(alloc, tfs.fs(), "objects");
@@ -297,12 +301,12 @@ test "diffCommitAgainstParent uses the first (mainline) parent's snapshot" {
     var cd = try diffCommitAgainstParent(alloc, &store, &page_store, c2, .histogram);
     defer cd.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), cd.files.len);
-    try std.testing.expectEqualStrings("a.txt", cd.files[0].path);
-    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_added);
-    try std.testing.expectEqual(@as(u32, 1), cd.files[0].lines_removed);
+    try testing.expectEqual(@as(usize, 1), cd.files.len);
+    try testing.expectEqualStrings("a.txt", cd.files[0].path);
+    try testing.expectEqual(@as(u32, 1), cd.files[0].lines_added);
+    try testing.expectEqual(@as(u32, 1), cd.files[0].lines_removed);
 }
 
 test {
-    std.testing.refAllDecls(@This());
+    testing.refAllDecls(@This());
 }

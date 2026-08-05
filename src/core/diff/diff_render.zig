@@ -1,4 +1,7 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
+
 const diff_algorithms = @import("./diff_algorithms.zig");
 
 const LineDelta = diff_algorithms.LineDelta;
@@ -96,8 +99,8 @@ pub const RenderConfig = struct {
     }
 };
 
-pub fn renderCommit(writer: anytype, cd: *const CommitDiff, config: RenderConfig, alloc: std.mem.Allocator) !void {
-    var filtered: std.ArrayList(*const FileDiff) = .empty;
+pub fn renderCommit(writer: anytype, cd: *const CommitDiff, config: RenderConfig, alloc: Allocator) !void {
+    var filtered: ArrayList(*const FileDiff) = .empty;
     defer filtered.deinit(alloc);
 
     for (cd.files) |*fd| {
@@ -129,19 +132,12 @@ pub fn renderCommit(writer: anytype, cd: *const CommitDiff, config: RenderConfig
 
 pub fn renderFileDiff(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
     if (config.level == .file) {
-        const status = fileStatus(fd);
-        const sc = switch (status) {
-            .added => "A",
-            .deleted => "D",
-            .modified => "M",
-            .unchanged => "~",
-        };
-        try writer.print("{s} {s} (+{d} -{d})\n", .{ sc, fd.path, fd.lines_added, fd.lines_removed });
+        try writeFileHeaderLine(writer, fd, fileStatus(fd));
         return;
     }
 
     if (config.level == .word) {
-        try renderWordHighlight(writer, fd);
+        try renderWordDiff(writer, fd);
         return;
     }
 
@@ -237,19 +233,15 @@ fn renderOperations(writer: anytype, fd: *const FileDiff, config: RenderConfig) 
 }
 
 fn renderSummary(writer: anytype, fd: *const FileDiff) !void {
-    const status = fileStatus(fd);
-    const sc = switch (status) {
-        .added => "A",
-        .deleted => "D",
-        .modified => "M",
-        .unchanged => "~",
-    };
-    try writer.print("{s} {s} (+{d} -{d})\n", .{ sc, fd.path, fd.lines_added, fd.lines_removed });
+    try writeFileHeaderLine(writer, fd, fileStatus(fd));
+}
+
+fn writeFileHeaderLine(writer: anytype, fd: *const FileDiff, status: FileStatus) !void {
+    try writer.print("{s} {s} (+{d} -{d})\n", .{ statusString(status), fd.path, fd.lines_added, fd.lines_removed });
 }
 
 fn renderWordHighlight(writer: anytype, fd: *const FileDiff) !void {
-    try writer.print("WORD HIGHLIGHT: {s}\n", .{fd.path});
-    try renderWordDeltas(writer, fd.word_deltas);
+    try renderWordDiff(writer, fd);
 }
 
 pub fn renderWordDiff(writer: anytype, fd: *const FileDiff) !void {
@@ -332,8 +324,8 @@ pub const DirGroup = struct {
     files: []*const FileDiff,
 };
 
-pub fn groupByDirectory(alloc: std.mem.Allocator, files: []*const FileDiff) ![]DirGroup {
-    var map = std.StringHashMap(std.ArrayList(*const FileDiff)).init(alloc);
+pub fn groupByDirectory(alloc: Allocator, files: []*const FileDiff) ![]DirGroup {
+    var map = std.StringHashMap(ArrayList(*const FileDiff)).init(alloc);
     defer {
         var it = map.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(alloc);
@@ -347,7 +339,7 @@ pub fn groupByDirectory(alloc: std.mem.Allocator, files: []*const FileDiff) ![]D
         try gop.value_ptr.append(alloc, fd);
     }
 
-    var groups: std.ArrayList(DirGroup) = .empty;
+    var groups: ArrayList(DirGroup) = .empty;
     var it = map.iterator();
     while (it.next()) |entry| {
         try groups.append(alloc, .{
@@ -355,7 +347,18 @@ pub fn groupByDirectory(alloc: std.mem.Allocator, files: []*const FileDiff) ![]D
             .files = try entry.value_ptr.toOwnedSlice(alloc),
         });
     }
-    return groups.toOwnedSlice(alloc);
+
+    const owned = try groups.toOwnedSlice(alloc);
+    // StringHashMap iteration order is unspecified — without this sort,
+    // `renderCommit`'s grouped output would vary from run to run for the
+    // exact same diff, which is a bad property for anything piping this
+    // through a pager, a diff-of-diffs, or a test snapshot.
+    std.mem.sort(DirGroup, owned, {}, struct {
+        fn lt(_: void, a: DirGroup, b: DirGroup) bool {
+            return std.mem.lessThan(u8, a.dir, b.dir);
+        }
+    }.lt);
+    return owned;
 }
 
 pub const DiffSummary = struct {
@@ -386,11 +389,16 @@ pub fn summarize(cd: *const CommitDiff) DiffSummary {
 pub fn fileStatus(fd: *const FileDiff) FileStatus {
     var has_ins = false;
     var has_del = false;
-    for (fd.line_deltas) |d| switch (d.op) {
-        .ins => has_ins = true,
-        .del => has_del = true,
-        .eq => {},
-    };
+    for (fd.line_deltas) |d| {
+        switch (d.op) {
+            .ins => has_ins = true,
+            .del => has_del = true,
+            .eq => {},
+        }
+        // Once both are seen the answer is settled (.modified) — no need
+        // to keep scanning the rest of what can be a long delta list.
+        if (has_ins and has_del) break;
+    }
     if (has_ins and has_del) return .modified;
     if (has_ins) return .added;
     if (has_del) return .deleted;
@@ -473,6 +481,25 @@ test "groupByDirectory groups files" {
         alloc.free(groups);
     }
     try std.testing.expectEqual(@as(usize, 2), groups.len);
+}
+
+test "groupByDirectory returns directories in sorted order regardless of insertion order" {
+    const alloc = std.testing.allocator;
+    const files = &[_]FileDiff{
+        .{ .path = "zzz/a.zig", .line_deltas = &.{}, .word_deltas = &.{}, .lines_added = 0, .lines_removed = 0, .words_added = 0, .words_removed = 0 },
+        .{ .path = "aaa/b.zig", .line_deltas = &.{}, .word_deltas = &.{}, .lines_added = 0, .lines_removed = 0, .words_added = 0, .words_removed = 0 },
+        .{ .path = "mmm/c.zig", .line_deltas = &.{}, .word_deltas = &.{}, .lines_added = 0, .lines_removed = 0, .words_added = 0, .words_removed = 0 },
+    };
+    var ptrs = [_]*const FileDiff{ &files[0], &files[1], &files[2] };
+    const groups = try groupByDirectory(alloc, &ptrs);
+    defer {
+        for (groups) |g| alloc.free(g.files);
+        alloc.free(groups);
+    }
+    try std.testing.expectEqual(@as(usize, 3), groups.len);
+    try std.testing.expectEqualStrings("aaa", groups[0].dir);
+    try std.testing.expectEqualStrings("mmm", groups[1].dir);
+    try std.testing.expectEqualStrings("zzz", groups[2].dir);
 }
 
 test {

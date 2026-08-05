@@ -19,6 +19,10 @@
 //
 
 const std = @import("std");
+const testing = std.testing;
+
+const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
 
 pub const Op = enum(u8) {
     eq = 0,
@@ -54,7 +58,7 @@ pub const FileDiff = struct {
     words_added: u32,
     words_removed: u32,
 
-    pub fn deinit(self: *FileDiff, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *FileDiff, alloc: Allocator) void {
         alloc.free(self.path);
         alloc.free(self.line_deltas);
         alloc.free(self.word_deltas);
@@ -75,7 +79,7 @@ pub const CommitDiff = struct {
     /// the caller owns.
     blobs: [][]u8 = &.{},
 
-    pub fn deinit(self: *CommitDiff, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *CommitDiff, alloc: Allocator) void {
         for (self.files) |*f| f.deinit(alloc);
         alloc.free(self.files);
         for (self.blobs) |b| alloc.free(b);
@@ -96,7 +100,7 @@ pub const Algorithm = enum {
 };
 
 pub fn diffFile(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     path: []const u8,
     old_src: []const u8,
     new_src: []const u8,
@@ -105,7 +109,7 @@ pub fn diffFile(
 }
 
 pub fn diffFileWith(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     path: []const u8,
     old_src: []const u8,
     new_src: []const u8,
@@ -150,7 +154,7 @@ pub fn diffFileWith(
 }
 
 pub fn diffCommit(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     old_files: []const FileSnapshot,
     new_files: []const FileSnapshot,
 ) !CommitDiff {
@@ -164,12 +168,12 @@ pub fn diffCommit(
 /// diff_snapshot.zig's diffSnapshotRoots/diffCommits, which only fetch the
 /// blobs that actually changed instead of every file on both sides.
 pub fn diffCommitWith(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     old_files: []const FileSnapshot,
     new_files: []const FileSnapshot,
     algo: Algorithm,
 ) !CommitDiff {
-    var file_diffs: std.ArrayList(FileDiff) = .empty;
+    var file_diffs: ArrayList(FileDiff) = .empty;
     errdefer {
         for (file_diffs.items) |*f| f.deinit(alloc);
         file_diffs.deinit(alloc);
@@ -206,7 +210,7 @@ pub fn diffCommitWith(
 }
 
 fn runLineDiff(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     old: []const []const u8,
     new: []const []const u8,
     algo: Algorithm,
@@ -223,7 +227,7 @@ fn runLineDiff(
 
 fn myersDiff(
     comptime T: type,
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     old: []const []const u8,
     new: []const []const u8,
     old_lo: usize,
@@ -269,7 +273,7 @@ fn myersDiff(
     // v[1]=0 bootstrap convention, made explicit here instead of relying
     // on v's oversized allocation to supply it implicitly. Total trace
     // memory is still O(D²), just +2 slots per step, not O(D·(N+M)).
-    var trace: std.ArrayList([]isize) = .empty;
+    var trace: ArrayList([]isize) = .empty;
     defer {
         for (trace.items) |snap| alloc.free(snap);
         trace.deinit(alloc);
@@ -311,7 +315,7 @@ fn myersDiff(
         }
     }
 
-    var ops: std.ArrayList(T) = .empty;
+    var ops: ArrayList(T) = .empty;
     errdefer ops.deinit(alloc);
 
     var x: isize = @intCast(N);
@@ -417,8 +421,8 @@ fn stripCommonEnds(
 /// Patience's and Histogram's prefix/suffix emission — previously four
 /// near-identical copies of this loop across the two functions.
 fn appendEqRun(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayList(LineDelta),
+    alloc: Allocator,
+    out: *ArrayList(LineDelta),
     old: []const []const u8,
     old_start: usize,
     old_end: usize,
@@ -431,7 +435,7 @@ fn appendEqRun(
 }
 
 fn patienceDiff(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     old: []const []const u8,
     new: []const []const u8,
 ) ![]LineDelta {
@@ -439,7 +443,7 @@ fn patienceDiff(
 }
 
 fn patienceDiffRange(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     old: []const []const u8,
     new: []const []const u8,
     old_lo: usize,
@@ -449,7 +453,7 @@ fn patienceDiffRange(
 ) ![]LineDelta {
     const ends = stripCommonEnds(old, new, old_lo, old_hi, new_lo, new_hi);
 
-    var out: std.ArrayList(LineDelta) = .empty;
+    var out: ArrayList(LineDelta) = .empty;
     errdefer out.deinit(alloc);
 
     try appendEqRun(alloc, &out, old, old_lo, ends.alo, new_lo);
@@ -497,7 +501,7 @@ fn patienceDiffRange(
 const Anchor = struct { old_idx: usize, new_idx: usize };
 
 fn patienceAnchors(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     old: []const []const u8,
     new: []const []const u8,
     old_lo: usize,
@@ -530,7 +534,7 @@ fn patienceAnchors(
         }
     }
 
-    var pairs: std.ArrayList(Anchor) = .empty;
+    var pairs: ArrayList(Anchor) = .empty;
     defer pairs.deinit(alloc);
 
     for (new_lo..new_hi) |j| {
@@ -572,7 +576,7 @@ fn patienceAnchors(
         if (lo2 == pile_count) pile_count += 1;
     }
 
-    var lis: std.ArrayList(Anchor) = .empty;
+    var lis: ArrayList(Anchor) = .empty;
     defer lis.deinit(alloc);
 
     if (pile_count > 0) {
@@ -589,7 +593,7 @@ fn patienceAnchors(
 }
 
 fn histogramDiff(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     old: []const []const u8,
     new: []const []const u8,
 ) ![]LineDelta {
@@ -597,7 +601,7 @@ fn histogramDiff(
 }
 
 fn histogramDiffRange(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     old: []const []const u8,
     new: []const []const u8,
     old_lo: usize,
@@ -607,7 +611,7 @@ fn histogramDiffRange(
 ) ![]LineDelta {
     const ends = stripCommonEnds(old, new, old_lo, old_hi, new_lo, new_hi);
 
-    var out: std.ArrayList(LineDelta) = .empty;
+    var out: ArrayList(LineDelta) = .empty;
     errdefer out.deinit(alloc);
 
     try appendEqRun(alloc, &out, old, old_lo, ends.alo, new_lo);
@@ -663,7 +667,7 @@ const Region = struct {
 const HISTOGRAM_MAX_CHAIN: usize = 64;
 
 fn histogramFindRegion(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     old: []const []const u8,
     new: []const []const u8,
     old_lo: usize,
@@ -677,7 +681,7 @@ fn histogramFindRegion(
     // anyway, and walking its full position list would reintroduce the
     // O(N·M) blowup this replaces) and remember it in `overflowed` so
     // it's skipped outright on the new-side scan too.
-    var positions = std.StringHashMap(std.ArrayList(usize)).init(alloc);
+    var positions = std.StringHashMap(ArrayList(usize)).init(alloc);
     defer {
         var it = positions.valueIterator();
         while (it.next()) |list| list.deinit(alloc);
@@ -745,8 +749,8 @@ fn histogramFindRegion(
     return best;
 }
 
-fn diffWords(alloc: std.mem.Allocator, line_deltas: []const LineDelta) ![]WordDelta {
-    var out: std.ArrayList(WordDelta) = .empty;
+fn diffWords(alloc: Allocator, line_deltas: []const LineDelta) ![]WordDelta {
+    var out: ArrayList(WordDelta) = .empty;
     errdefer out.deinit(alloc);
 
     var i: usize = 0;
@@ -756,9 +760,9 @@ fn diffWords(alloc: std.mem.Allocator, line_deltas: []const LineDelta) ![]WordDe
             continue;
         }
 
-        var del_words: std.ArrayList([]const u8) = .empty;
+        var del_words: ArrayList([]const u8) = .empty;
         defer del_words.deinit(alloc);
-        var ins_words: std.ArrayList([]const u8) = .empty;
+        var ins_words: ArrayList([]const u8) = .empty;
         defer ins_words.deinit(alloc);
         var del_lineno: u32 = 0;
         var ins_lineno: u32 = 0;
@@ -801,8 +805,8 @@ fn diffWords(alloc: std.mem.Allocator, line_deltas: []const LineDelta) ![]WordDe
     return out.toOwnedSlice(alloc);
 }
 
-fn splitLines(alloc: std.mem.Allocator, src: []const u8) ![][]const u8 {
-    var lines: std.ArrayList([]const u8) = .empty;
+fn splitLines(alloc: Allocator, src: []const u8) ![][]const u8 {
+    var lines: ArrayList([]const u8) = .empty;
     errdefer lines.deinit(alloc);
 
     var it = std.mem.splitScalar(u8, src, '\n');
@@ -818,7 +822,7 @@ fn splitLines(alloc: std.mem.Allocator, src: []const u8) ![][]const u8 {
 /// allocated its own temporary slice per line, appended it into
 /// del_words/ins_words, then freed the temporary — an alloc+copy+free
 /// per line where writing straight into the caller's growable list does.
-fn tokenizeWordsInto(out: *std.ArrayList([]const u8), alloc: std.mem.Allocator, line: []const u8) !void {
+fn tokenizeWordsInto(out: *ArrayList([]const u8), alloc: Allocator, line: []const u8) !void {
     var i: usize = 0;
     while (i < line.len) {
         if (std.ascii.isWhitespace(line[i])) {
@@ -838,8 +842,8 @@ fn tokenizeWordsInto(out: *std.ArrayList([]const u8), alloc: std.mem.Allocator, 
 
 /// Standalone tokenizer kept for direct callers/tests that just want a
 /// word list back rather than appending into an existing ArrayList.
-fn tokenizeWords(alloc: std.mem.Allocator, line: []const u8) ![][]const u8 {
-    var words: std.ArrayList([]const u8) = .empty;
+fn tokenizeWords(alloc: Allocator, line: []const u8) ![][]const u8 {
+    var words: ArrayList([]const u8) = .empty;
     errdefer words.deinit(alloc);
     try tokenizeWordsInto(&words, alloc, line);
     return words.toOwnedSlice(alloc);
@@ -862,58 +866,58 @@ fn makeWordDelta(op: Op, word: []const u8, _: u32, _: u32) WordDelta {
 }
 
 test "splitLines basic" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const lines = try splitLines(alloc, "a\nb\nc");
     defer alloc.free(lines);
-    try std.testing.expectEqual(@as(usize, 3), lines.len);
-    try std.testing.expectEqualStrings("a", lines[0]);
-    try std.testing.expectEqualStrings("c", lines[2]);
+    try testing.expectEqual(@as(usize, 3), lines.len);
+    try testing.expectEqualStrings("a", lines[0]);
+    try testing.expectEqualStrings("c", lines[2]);
 }
 
 test "splitLines trailing newline does not add phantom line" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const lines = try splitLines(alloc, "a\nb\n");
     defer alloc.free(lines);
-    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try testing.expectEqual(@as(usize, 2), lines.len);
 }
 
 test "diffFile identical sources produces no deltas" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const src = "fn main() void {}\n";
     inline for (.{ Algorithm.myers, .patience, .histogram }) |algo| {
         var fd = try diffFileWith(alloc, "main.zig", src, src, algo);
         defer fd.deinit(alloc);
-        try std.testing.expectEqual(@as(u32, 0), fd.lines_added);
-        try std.testing.expectEqual(@as(u32, 0), fd.lines_removed);
+        try testing.expectEqual(@as(u32, 0), fd.lines_added);
+        try testing.expectEqual(@as(u32, 0), fd.lines_removed);
     }
 }
 
 test "diffFile single line added — all algos" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const old = "fn a() void {}\n";
     const new = "fn a() void {}\nfn b() void {}\n";
     inline for (.{ Algorithm.myers, .patience, .histogram }) |algo| {
         var fd = try diffFileWith(alloc, "x.zig", old, new, algo);
         defer fd.deinit(alloc);
-        try std.testing.expectEqual(@as(u32, 1), fd.lines_added);
-        try std.testing.expectEqual(@as(u32, 0), fd.lines_removed);
+        try testing.expectEqual(@as(u32, 1), fd.lines_added);
+        try testing.expectEqual(@as(u32, 0), fd.lines_removed);
     }
 }
 
 test "diffFile single line removed — all algos" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const old = "fn a() void {}\nfn b() void {}\n";
     const new = "fn a() void {}\n";
     inline for (.{ Algorithm.myers, .patience, .histogram }) |algo| {
         var fd = try diffFileWith(alloc, "x.zig", old, new, algo);
         defer fd.deinit(alloc);
-        try std.testing.expectEqual(@as(u32, 0), fd.lines_added);
-        try std.testing.expectEqual(@as(u32, 1), fd.lines_removed);
+        try testing.expectEqual(@as(u32, 0), fd.lines_added);
+        try testing.expectEqual(@as(u32, 1), fd.lines_removed);
     }
 }
 
 test "patience prefers unique anchors over ambiguous matches" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const old =
         \\void func1() {
         \\    x += 1
@@ -939,28 +943,28 @@ test "patience prefers unique anchors over ambiguous matches" {
     var fd_histogram = try diffFileWith(alloc, "f.c", old, new, .histogram);
     defer fd_histogram.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u32, 2), fd_patience.lines_added);
-    try std.testing.expectEqual(@as(u32, 0), fd_patience.lines_removed);
-    try std.testing.expectEqual(@as(u32, 2), fd_histogram.lines_added);
-    try std.testing.expectEqual(@as(u32, 0), fd_histogram.lines_removed);
+    try testing.expectEqual(@as(u32, 2), fd_patience.lines_added);
+    try testing.expectEqual(@as(u32, 0), fd_patience.lines_removed);
+    try testing.expectEqual(@as(u32, 2), fd_histogram.lines_added);
+    try testing.expectEqual(@as(u32, 0), fd_histogram.lines_removed);
 }
 
 test "histogram handles repeated lines gracefully" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const old = "}\n}\n}\n";
     const new = "}\n}\n}\n}\n";
     var fd = try diffFileWith(alloc, "b.c", old, new, .histogram);
     defer fd.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 1), fd.lines_added);
-    try std.testing.expectEqual(@as(u32, 0), fd.lines_removed);
+    try testing.expectEqual(@as(u32, 1), fd.lines_added);
+    try testing.expectEqual(@as(u32, 0), fd.lines_removed);
 }
 
 test "histogram stays fast and correct on files dominated by repeated lines" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
 
-    var old_buf: std.ArrayList(u8) = .empty;
+    var old_buf: ArrayList(u8) = .empty;
     defer old_buf.deinit(alloc);
-    var new_buf: std.ArrayList(u8) = .empty;
+    var new_buf: ArrayList(u8) = .empty;
     defer new_buf.deinit(alloc);
 
     const repeat_count = 8000;
@@ -990,16 +994,16 @@ test "histogram stays fast and correct on files dominated by repeated lines" {
     var fd = try diffFileWith(alloc, "noisy.zig", old_buf.items, new_buf.items, .histogram);
     defer fd.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u32, 1), fd.lines_added);
-    try std.testing.expectEqual(@as(u32, 1), fd.lines_removed);
+    try testing.expectEqual(@as(u32, 1), fd.lines_added);
+    try testing.expectEqual(@as(u32, 1), fd.lines_removed);
 }
 
 test "histogram chain cap still falls back correctly when a line is maximally common" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
 
-    var old_buf: std.ArrayList(u8) = .empty;
+    var old_buf: ArrayList(u8) = .empty;
     defer old_buf.deinit(alloc);
-    var new_buf: std.ArrayList(u8) = .empty;
+    var new_buf: ArrayList(u8) = .empty;
     defer new_buf.deinit(alloc);
 
     for (0..100) |_| {
@@ -1016,12 +1020,12 @@ test "histogram chain cap still falls back correctly when a line is maximally co
     var fd = try diffFileWith(alloc, "cap.zig", old_buf.items, new_buf.items, .histogram);
     defer fd.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u32, 1), fd.lines_added);
-    try std.testing.expectEqual(@as(u32, 1), fd.lines_removed);
+    try testing.expectEqual(@as(u32, 1), fd.lines_added);
+    try testing.expectEqual(@as(u32, 1), fd.lines_removed);
 }
 
 test "all algos agree on net line delta" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const old =
         \\pub fn foo(x: u32) u32 {
         \\    return x + 1;
@@ -1055,37 +1059,37 @@ test "all algos agree on net line delta" {
     const net_m: i32 = @as(i32, @intCast(fd_m.lines_added)) - @as(i32, @intCast(fd_m.lines_removed));
     const net_p: i32 = @as(i32, @intCast(fd_p.lines_added)) - @as(i32, @intCast(fd_p.lines_removed));
     const net_h: i32 = @as(i32, @intCast(fd_h.lines_added)) - @as(i32, @intCast(fd_h.lines_removed));
-    try std.testing.expectEqual(@as(i32, 5), net_m);
-    try std.testing.expectEqual(@as(i32, 5), net_p);
-    try std.testing.expectEqual(@as(i32, 5), net_h);
+    try testing.expectEqual(@as(i32, 5), net_m);
+    try testing.expectEqual(@as(i32, 5), net_p);
+    try testing.expectEqual(@as(i32, 5), net_h);
 }
 
 test "myers backtrack bootstrap: single-line total replacement (forces d=0 boundary read)" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var fd = try diffFileWith(alloc, "one.txt", "old line\n", "new line\n", .myers);
     defer fd.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 1), fd.lines_added);
-    try std.testing.expectEqual(@as(u32, 1), fd.lines_removed);
+    try testing.expectEqual(@as(u32, 1), fd.lines_added);
+    try testing.expectEqual(@as(u32, 1), fd.lines_removed);
 }
 
 test "myers backtrack bootstrap: pure insertion and pure deletion at d=1" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     inline for (.{
         .{ .old = "a\n", .new = "a\nb\n", .added = 1, .removed = 0 },
         .{ .old = "a\nb\n", .new = "a\n", .added = 0, .removed = 1 },
     }) |case| {
         var fd = try diffFileWith(alloc, "x.txt", case.old, case.new, .myers);
         defer fd.deinit(alloc);
-        try std.testing.expectEqual(@as(u32, case.added), fd.lines_added);
-        try std.testing.expectEqual(@as(u32, case.removed), fd.lines_removed);
+        try testing.expectEqual(@as(u32, case.added), fd.lines_added);
+        try testing.expectEqual(@as(u32, case.removed), fd.lines_removed);
     }
 }
 
 test "myers windowed trace stays correct on large file with small edit distance" {
-    const alloc = std.testing.allocator;
-    var old_buf: std.ArrayList(u8) = .empty;
+    const alloc = testing.allocator;
+    var old_buf: ArrayList(u8) = .empty;
     defer old_buf.deinit(alloc);
-    var new_buf: std.ArrayList(u8) = .empty;
+    var new_buf: ArrayList(u8) = .empty;
     defer new_buf.deinit(alloc);
 
     for (0..3000) |i| {
@@ -1102,22 +1106,22 @@ test "myers windowed trace stays correct on large file with small edit distance"
 
     var fd = try diffFileWith(alloc, "big.zig", old_buf.items, new_buf.items, .myers);
     defer fd.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 1), fd.lines_added);
-    try std.testing.expectEqual(@as(u32, 2), fd.lines_removed);
+    try testing.expectEqual(@as(u32, 1), fd.lines_added);
+    try testing.expectEqual(@as(u32, 2), fd.lines_removed);
 }
 
 test "myers windowed trace handles fully disjoint content (high edit distance)" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const old = "a\nb\nc\nd\ne\n";
     const new = "v\nw\nx\ny\nz\n";
     var fd = try diffFileWith(alloc, "disjoint.txt", old, new, .myers);
     defer fd.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 5), fd.lines_added);
-    try std.testing.expectEqual(@as(u32, 5), fd.lines_removed);
+    try testing.expectEqual(@as(u32, 5), fd.lines_added);
+    try testing.expectEqual(@as(u32, 5), fd.lines_removed);
 }
 
 test "myers windowed trace correct for word-level diffs (T = WordDelta)" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const old = "the quick brown fox jumps over the lazy dog\n";
     const new = "the quick red fox jumps over the sleepy dog\n";
 
@@ -1131,20 +1135,20 @@ test "myers windowed trace correct for word-level diffs (T = WordDelta)" {
         .del => words_removed += 1,
         .eq => {},
     };
-    try std.testing.expectEqual(@as(u32, 2), words_added);
-    try std.testing.expectEqual(@as(u32, 2), words_removed);
+    try testing.expectEqual(@as(u32, 2), words_added);
+    try testing.expectEqual(@as(u32, 2), words_removed);
 }
 
 test "tokenizeWords splits identifiers and punctuation" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     const words = try tokenizeWords(alloc, "fn foo(x: u32)");
     defer alloc.free(words);
-    try std.testing.expectEqual(@as(usize, 7), words.len);
-    try std.testing.expectEqualStrings("fn", words[0]);
-    try std.testing.expectEqualStrings("foo", words[1]);
-    try std.testing.expectEqualStrings("(", words[2]);
+    try testing.expectEqual(@as(usize, 7), words.len);
+    try testing.expectEqualStrings("fn", words[0]);
+    try testing.expectEqualStrings("foo", words[1]);
+    try testing.expectEqualStrings("(", words[2]);
 }
 
 test {
-    std.testing.refAllDecls(@This());
+    testing.refAllDecls(@This());
 }
