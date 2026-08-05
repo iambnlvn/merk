@@ -348,7 +348,7 @@ pub fn build(b: *std.Build) void {
     const core_specs = [_]TestSuite{
         .{ .name = "test-object", .description = "Run object unit tests", .path = "src/core/object/object.zig" },
         .{ .name = "test-commit", .description = "Run commit unit tests", .path = "src/core/commit.zig" },
-        .{ .name = "test-index", .description = "Run index unit tests", .path = "src/core/index.zig" },
+        .{ .name = "test-staging", .description = "Run staging area unit tests", .path = "src/core/staging.zig" },
         .{ .name = "test-history", .description = "Run history unit tests", .path = "src/core/history.zig" },
     };
     registerSuite(b, &core_specs, null, test_step, target, optimize, mod, crypto, compression, storage, merkle);
