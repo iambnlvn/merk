@@ -1,12 +1,15 @@
 const std = @import("std");
-const hash_mod = @import("merk").crypto.hash;
-const fs_mod = @import("merk").io;
+const crypto = @import("crypto");
+const storage = @import("storage");
+
 const channel_mod = @import("channel_name.zig");
 const current_mod = @import("current.zig");
 
 const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const Vfs = storage.Vfs;
 
-pub const Hash = hash_mod.Hash;
+pub const Hash = crypto.Hash;
 pub const ChannelName = channel_mod.ChannelName;
 pub const Current = current_mod.Current;
 
@@ -14,13 +17,13 @@ const CHANNELS_DIR = channel_mod.CHANNELS_DIR;
 const CURRENT_FILE = current_mod.CURRENT_FILE;
 
 /// Root directory for markers (tags), sibling to `refs/channels`.
-/// Reserved so the on-disk layout is settled up front; `RefStore`
+/// Reserved so the on-disk layout is settled up front; `ReferenceStore`
 /// doesn't operate on it yet.
 pub const MARKERS_DIR = "refs/markers";
 
 /// Root directory for peers (remotes), sibling to `refs/channels`.
 /// Reserved so the on-disk layout is settled up front.
-/// TODO: RefStore doesn't operate on it yet
+/// TODO: ReferenceStore doesn't operate on it yet
 pub const PEERS_DIR = "refs/peers";
 
 /// This module's own error conditions. Every public function below can
@@ -46,16 +49,16 @@ pub const RefsError = error{
     DestinationExists,
 };
 
-pub const RefStore = struct {
-    alloc: std.mem.Allocator,
-    fs: fs_mod.vfs.Vfs,
+pub const ReferenceStore = struct {
+    alloc: Allocator,
+    fs: Vfs,
 
     /// Create a new reference store backed by the given filesystem
     /// abstraction
     ///
     /// `fs` is expected to provide the repository's reference root,
     /// where `refs/current` and `refs/channels/*` are stored
-    pub fn init(alloc: std.mem.Allocator, fs: fs_mod.vfs.Vfs) RefStore {
+    pub fn init(alloc: Allocator, fs: Vfs) ReferenceStore {
         return .{ .alloc = alloc, .fs = fs };
     }
 
@@ -64,8 +67,9 @@ pub const RefStore = struct {
     /// this single parse — including the translation of a malformed
     /// file into `error.CorruptCurrent`, so callers never need to know
     /// `Current.parse` exists or what errors it can raise internally.
-    fn readCurrent(self: RefStore) !?Current {
-        const bytes = try self.fs.readFile(self.alloc, CURRENT_FILE) orelse return null;
+    fn readCurrent(self: ReferenceStore) !?Current {
+        const file = try self.fs.readFile(self.alloc, CURRENT_FILE);
+        const bytes = file orelse return null;
         defer self.alloc.free(bytes);
         return Current.parse(self.alloc, bytes) catch return error.CorruptCurrent;
     }
@@ -112,8 +116,9 @@ pub const RefStore = struct {
     ///
     /// Errors with `error.CorruptCurrent` if Current exists but is
     /// unreadable.
-    pub fn currentChannel(self: RefStore) !?[]u8 {
-        const state = try self.readCurrent() orelse return null;
+    pub fn currentChannel(self: ReferenceStore) !?[]u8 {
+        const current = try self.readCurrent();
+        const state = current orelse return null;
         return switch (state) {
             .symbolic => |s| s, // ownership transfers to caller
             .detached => null,
@@ -131,8 +136,9 @@ pub const RefStore = struct {
     ///
     /// Errors with `error.CorruptCurrent` if Current exists but is
     /// unreadable.
-    pub fn isCurrentChannel(self: RefStore, channel: ChannelName) !bool {
-        const name = try self.currentChannel() orelse return false;
+    pub fn isCurrentChannel(self: ReferenceStore, channel: ChannelName) !bool {
+        const current = try self.currentChannel();
+        const name = current orelse return false;
         defer self.alloc.free(name);
         return ChannelName.eql(channel, .{ .raw = name });
     }
@@ -141,7 +147,7 @@ pub const RefStore = struct {
     /// equivalent of `git switch`/`git checkout <branch>`. Does not
     /// require `channel` to already have a reference file; Current can
     /// point at a channel that's never been committed to yet.
-    pub fn setCurrentToChannel(self: RefStore, channel: ChannelName) !void {
+    pub fn setCurrentToChannel(self: ReferenceStore, channel: ChannelName) !void {
         var buf: [256]u8 = undefined;
         const contents = try std.fmt.bufPrint(&buf, "{s}{s}", .{ current_mod.symbolic_prefix, channel.raw });
         try self.fs.writeFile(self.alloc, CURRENT_FILE, contents);
@@ -149,19 +155,19 @@ pub const RefStore = struct {
 
     /// Point Current directly at `hash` (detached Current) — the
     /// on-disk equivalent of `git checkout <commit>`.
-    pub fn setDetachedCurrent(self: RefStore, hash: Hash) !void {
-        const hex = try hash_mod.toHex(self.alloc, hash);
+    pub fn setDetachedCurrent(self: ReferenceStore, hash: Hash) !void {
+        const hex = try crypto.toHex(self.alloc, hash);
         defer self.alloc.free(hex);
         try self.fs.writeFile(self.alloc, CURRENT_FILE, hex);
     }
 
     /// Point `channel`'s reference file at `hash`, creating the channel
     /// if it doesn't have one yet.
-    pub fn updateChannel(self: RefStore, channel: ChannelName, hash: Hash) !void {
+    pub fn updateChannel(self: ReferenceStore, channel: ChannelName, hash: Hash) !void {
         var path_buf: [256]u8 = undefined;
         const path = try channel.refPath(&path_buf);
 
-        const hex = try hash_mod.toHex(self.alloc, hash);
+        const hex = try crypto.toHex(self.alloc, hash);
         defer self.alloc.free(hex);
 
         try self.fs.writeFile(self.alloc, path, hex);
@@ -176,21 +182,23 @@ pub const RefStore = struct {
     /// committed to — not an error). Errors with
     /// `error.CorruptChannelRef` if the file exists but isn't a valid
     /// hex hash.
-    pub fn readChannel(self: RefStore, channel: ChannelName) !?Hash {
+    pub fn readChannel(self: ReferenceStore, channel: ChannelName) !?Hash {
         var path_buf: [256]u8 = undefined;
         const path = try channel.refPath(&path_buf);
 
-        const bytes = try self.fs.readFile(self.alloc, path) orelse return null;
+        const file = try self.fs.readFile(self.alloc, path);
+        const bytes = file orelse return null;
         defer self.alloc.free(bytes);
 
         const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
-        return hash_mod.fromHex(trimmed) catch return error.CorruptChannelRef;
+        return crypto.fromHex(trimmed) catch return error.CorruptChannelRef;
     }
 
     /// Whether `channel` currently has a reference file (has ever been
     /// committed to), independent of whether it's currently checked out.
-    pub fn channelExists(self: RefStore, channel: ChannelName) !bool {
-        return (try self.readChannel(channel)) != null;
+    pub fn channelExists(self: ReferenceStore, channel: ChannelName) !bool {
+        const hash = try self.readChannel(channel);
+        return hash != null;
     }
 
     /// Remove `refs/channels/<channel>`. Errors with
@@ -202,7 +210,7 @@ pub const RefStore = struct {
     /// callers that care (e.g. a `merk channel -d` command refusing to
     /// delete the current channel) should check `isCurrentChannel`
     /// themselves — this is pure reference-file bookkeeping.
-    pub fn deleteChannel(self: RefStore, channel: ChannelName) !void {
+    pub fn deleteChannel(self: ReferenceStore, channel: ChannelName) !void {
         var path_buf: [256]u8 = undefined;
         const path = try channel.refPath(&path_buf);
 
@@ -215,7 +223,7 @@ pub const RefStore = struct {
     /// Like `deleteChannel`, but a channel with no reference file is
     /// treated as already-deleted rather than an error. Returns whether
     /// a reference file was actually removed.
-    pub fn deleteChannelIfExists(self: RefStore, channel: ChannelName) !bool {
+    pub fn deleteChannelIfExists(self: ReferenceStore, channel: ChannelName) !bool {
         self.deleteChannel(channel) catch |err| switch (err) {
             error.ChannelNotFound => return false,
             else => return err,
@@ -241,9 +249,12 @@ pub const RefStore = struct {
     /// Errors with `error.ChannelNotFound` if `from` has no reference
     /// file, or `error.DestinationExists` if `to` already does and
     /// `.force` wasn't set.
-    pub fn renameChannel(self: RefStore, from: ChannelName, to: ChannelName, options: RenameOptions) !void {
-        const hash = (try self.readChannel(from)) orelse return error.ChannelNotFound;
-        if (!options.force and try self.channelExists(to)) return error.DestinationExists;
+    pub fn renameChannel(self: ReferenceStore, from: ChannelName, to: ChannelName, options: RenameOptions) !void {
+        const source_hash = try self.readChannel(from);
+        const hash = source_hash orelse return error.ChannelNotFound;
+
+        const destination_exists = try self.channelExists(to);
+        if (!options.force and destination_exists) return error.DestinationExists;
 
         try self.updateChannel(to, hash);
         try self.deleteChannel(from);
@@ -254,14 +265,16 @@ pub const RefStore = struct {
     /// particular order. Empty slice if no channels exist yet, a fresh
     /// repo isn't an error. Caller owns the returned slice and each name
     /// in it.
-    pub fn listChannels(self: RefStore, alloc: std.mem.Allocator) ![][]u8 {
+    pub fn listChannels(self: ReferenceStore, alloc: Allocator) ![][]u8 {
         return self.fs.listFiles(alloc, CHANNELS_DIR);
     }
 };
 
+pub const RefStore = ReferenceStore;
+
 test "resolveCurrent - detached current with malformed hex propagates an error" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     try mem_fs.fs().writeFile(allocator, CURRENT_FILE, "not-a-valid-hash");
@@ -274,7 +287,7 @@ test "resolveCurrent - detached current with malformed hex propagates an error" 
 
 test "resolveCurrent - empty current file is treated as corrupt, not missing" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     try mem_fs.fs().writeFile(allocator, CURRENT_FILE, "");
@@ -287,7 +300,7 @@ test "resolveCurrent - empty current file is treated as corrupt, not missing" {
 
 test "resolveCurrent - symbolic current with malformed hex in target file errors" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -303,7 +316,7 @@ test "resolveCurrent - symbolic current with malformed hex in target file errors
 
 test "currentChannel - symbolic current with empty channel name" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     try mem_fs.fs().writeFile(allocator, CURRENT_FILE, current_mod.symbolic_prefix);
@@ -317,7 +330,7 @@ test "currentChannel - symbolic current with empty channel name" {
 
 test "updateChannel overwrites previous hash on the same channel" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -342,7 +355,7 @@ test "updateChannel overwrites previous hash on the same channel" {
 
 test "readChannel returns null for a channel that was never created" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -354,7 +367,7 @@ test "readChannel returns null for a channel that was never created" {
 
 test "switching current from detached to symbolic changes currentChannel result" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -375,7 +388,7 @@ test "switching current from detached to symbolic changes currentChannel result"
 
 test "switching channels via setCurrentToChannel changes what resolveCurrent follows" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -406,7 +419,7 @@ test "switching channels via setCurrentToChannel changes what resolveCurrent fol
 
 test "updateChannel handles deeply nested channel names with multiple path segments" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -429,7 +442,7 @@ test "updateChannel handles deeply nested channel names with multiple path segme
 
 test "hash round-trip preserves non-uniform byte patterns" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -448,7 +461,7 @@ test "hash round-trip preserves non-uniform byte patterns" {
 
 test "distinct channels with distinct hashes do not clobber each other" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -479,7 +492,7 @@ test "distinct channels with distinct hashes do not clobber each other" {
 
 test "setCurrentToChannel followed by setDetachedCurrent correctly overwrites symbolic state" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -507,7 +520,7 @@ test "setCurrentToChannel followed by setDetachedCurrent correctly overwrites sy
 
 test "currentState distinguishes symbolic from detached without resolving" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -537,7 +550,7 @@ test "currentState distinguishes symbolic from detached without resolving" {
 
 test "channelExists reflects whether a channel has ever been committed to" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -554,7 +567,7 @@ test "channelExists reflects whether a channel has ever been committed to" {
 
 test "deleteChannel removes the reference and errors on a repeat delete" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -573,7 +586,7 @@ test "deleteChannel removes the reference and errors on a repeat delete" {
 
 test "deleteChannelIfExists reports whether it actually deleted anything" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -592,7 +605,7 @@ test "deleteChannelIfExists reports whether it actually deleted anything" {
 
 test "renameChannel moves the hash and removes the old reference file" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -613,7 +626,7 @@ test "renameChannel moves the hash and removes the old reference file" {
 
 test "renameChannel errors on a missing source and on an existing destination without force" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -641,7 +654,7 @@ test "renameChannel errors on a missing source and on an existing destination wi
 
 test "listChannels finds nested channels and is empty for a fresh repo" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -689,7 +702,7 @@ test "reference layout is unified under a single refs/ root" {
 
 test "isCurrentChannel is true only for the channel Current symbolically points at" {
     const allocator = testing.allocator;
-    var mem_fs = fs_mod.mem_fs.init(allocator);
+    var mem_fs = storage.mem_fs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -716,7 +729,7 @@ test "os_fs: RefStore end-to-end with real filesystem" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var real_fs = fs_mod.os_fs.init(tmp.dir);
+    var real_fs = storage.os_fs.init(tmp.dir);
     const store = RefStore.init(allocator, real_fs.fs());
     const main = try ChannelName.parse("main");
 
@@ -734,7 +747,7 @@ test "os_fs: current round-trips between symbolic and detached on real disk" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var real_fs = fs_mod.os_fs.init(tmp.dir);
+    var real_fs = storage.os_fs.init(tmp.dir);
     const store = RefStore.init(allocator, real_fs.fs());
     const main = try ChannelName.parse("main");
 
@@ -758,7 +771,7 @@ test "os_fs: listChannels with nested paths on real disk" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var real_fs = fs_mod.os_fs.init(tmp.dir);
+    var real_fs = storage.os_fs.init(tmp.dir);
     const store = RefStore.init(allocator, real_fs.fs());
 
     const main = try ChannelName.parse("main");

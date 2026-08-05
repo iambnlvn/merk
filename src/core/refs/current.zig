@@ -1,10 +1,10 @@
 const std = @import("std");
-const hash_mod = @import("merk").crypto.hash;
+const crypto = @import("crypto");
 const channel_mod = @import("channel_name.zig");
 
 const testing = std.testing;
-
-pub const Hash = hash_mod.Hash;
+const Allocator = std.mem.Allocator;
+pub const Hash = crypto.Hash;
 
 /// Repo-root-relative path of the file recording what's currently
 /// checked out: `refs/current`, sibling to `refs/channels/`,
@@ -35,7 +35,7 @@ pub const Current = union(enum) {
     /// channel.
     detached: Hash,
 
-    pub fn deinit(self: Current, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: Current, alloc: Allocator) void {
         switch (self) {
             .symbolic => |s| alloc.free(s),
             .detached => {},
@@ -43,14 +43,14 @@ pub const Current = union(enum) {
     }
 
     /// Parse raw `refs/current` bytes into symbolic-or-detached state.
-    pub fn parse(alloc: std.mem.Allocator, raw: []const u8) !Current {
+    pub fn parse(alloc: Allocator, raw: []const u8) !Current {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
 
         if (std.mem.startsWith(u8, trimmed, symbolic_prefix)) {
             const channel = trimmed[symbolic_prefix.len..];
             return Current{ .symbolic = try alloc.dupe(u8, channel) };
         }
-        return Current{ .detached = try hash_mod.fromHex(trimmed) };
+        return Current{ .detached = try crypto.fromHex(trimmed) };
     }
 };
 
