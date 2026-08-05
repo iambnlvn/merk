@@ -2,15 +2,15 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
-const hash_mod = @import("crypto").hash;
+const crypto = @import("crypto");
+const storage = @import("storage");
+
 const node = @import("node.zig");
 
-const storage = @import("storage");
+const Hash = crypto.Hash;
 const Vfs = storage.Vfs;
 const MemoryFs = storage.MemoryFs;
 const OsFs = storage.OsFs;
-
-const Hash = hash_mod.Hash;
 const Page = node.Page;
 
 /// Manages persistent storage of fixed-size index pages.
@@ -31,7 +31,7 @@ pub const PageStore = struct {
     }
 
     pub fn put(self: *const PageStore, page_bytes: *const [node.PAGE_SIZE]u8) !Hash {
-        const page_hash = hash_mod.blake3(page_bytes);
+        const page_hash = crypto.blake3(page_bytes);
         const path = try self.pagePath(page_hash);
         defer self.alloc.free(path);
 
@@ -57,7 +57,7 @@ pub const PageStore = struct {
         var bytes: [node.PAGE_SIZE]u8 = undefined;
         @memcpy(&bytes, raw[0..node.PAGE_SIZE]);
 
-        const computed = hash_mod.blake3(&bytes);
+        const computed = crypto.blake3(&bytes);
         if (!node.hashEq(computed, page_hash)) return error.HashMismatch;
         return bytes;
     }
@@ -96,7 +96,7 @@ fn testParseableLeafPage() [node.PAGE_SIZE]u8 {
     node.writeLeafEntry(&writer, .{
         .key = 1,
         .path = @constCast("only.txt"),
-        .blob_hash = hash_mod.zero_hash,
+        .blob_hash = crypto.zero_hash,
         .size = 0,
         .mode = 0o644,
         .mtime = 0,
@@ -135,7 +135,7 @@ test "get on an unknown hash returns NotFound" {
     defer mem_fs.deinit();
     const store = PageStore.init(alloc, mem_fs.fs(), "index/pages");
 
-    try testing.expectError(error.NotFound, store.getBytes(hash_mod.zero_hash));
+    try testing.expectError(error.NotFound, store.getBytes(crypto.zero_hash));
 }
 
 test "getBytes detects on-disk corruption via content hash mismatch" {
@@ -173,7 +173,7 @@ test "getBytes rejects a page file of the wrong size as corrupt" {
     // Fabricate an undersized "page" directly, bypassing PageStore.put,
     // to simulate a truncated write
     var hex_buf: [64]u8 = undefined;
-    const bogus_hash = hash_mod.blake3("short content");
+    const bogus_hash = crypto.blake3("short content");
     const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{bogus_hash}) catch unreachable;
     const path = try std.fmt.allocPrint(alloc, "index/pages/{s}/{s}/{s}", .{ hex[0..2], hex[2..4], hex });
     defer alloc.free(path);

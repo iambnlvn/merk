@@ -1,10 +1,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
-const hash_mod = @import("crypto").hash;
+
+const crypto = @import("crypto");
 const node = @import("node.zig");
 
-pub const Hash = hash_mod.Hash;
+pub const Hash = crypto.Hash;
 pub const PathKey = node.PathKey;
 
 /// Represents a tracked file in the repository
@@ -59,7 +60,7 @@ pub fn freeChanges(alloc: Allocator, changes: []EntryChange) void {
 
 /// Compute the B-tree key for a given path
 pub fn pathKey(path: []const u8) PathKey {
-    return node.foldHashPrefix(hash_mod.blake3(path));
+    return node.foldHashPrefix(crypto.blake3(path));
 }
 
 /// Name of the repository control directory, reserved so a tracked
@@ -115,7 +116,7 @@ test "validatePath rejects absolute paths, empty paths, and .. segments" {
 }
 
 test "pathKey is deterministic big-endian prefix" {
-    const h = hash_mod.blake3("src/main.zig");
+    const h = crypto.blake3("src/main.zig");
     var expected: PathKey = 0;
     for (h[0..8]) |byte| expected = (expected << 8) | byte;
     try testing.expectEqual(expected, pathKey("src/main.zig"));

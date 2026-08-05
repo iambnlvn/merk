@@ -1,21 +1,22 @@
 const std = @import("std");
 const testing = std.testing;
-
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 
-const hash_mod = @import("crypto").hash;
+const crypto = @import("crypto");
+const MemoryFs = @import("storage").MemoryFs;
+
 const node = @import("node.zig");
 const entry_mod = @import("entry.zig");
 const page_store_mod = @import("page_store.zig");
-const MemoryFs = @import("storage").MemoryFs;
-const Hash = hash_mod.Hash;
+
+const Hash = crypto.Hash;
 const LeafEntry = node.LeafEntry;
 const ChildRef = node.ChildRef;
-const PageStore = page_store_mod.PageStore;
 const DiffError = node.DiffError;
-const EntryChange = entry_mod.EntryChange;
 const hashEq = node.hashEq;
+const PageStore = page_store_mod.PageStore;
+const EntryChange = entry_mod.EntryChange;
 
 /// Diff two index-root hashes directly, without loading a full `Index`.
 /// Useful for comparing commit index states. Caller supplies `store`
@@ -45,8 +46,8 @@ fn diffNodes(
 ) DiffError!void {
     if (hashEq(old_hash, new_hash)) return;
 
-    const old_zero = hashEq(old_hash, hash_mod.zero_hash);
-    const new_zero = hashEq(new_hash, hash_mod.zero_hash);
+    const old_zero = hashEq(old_hash, crypto.zero_hash);
+    const new_zero = hashEq(new_hash, crypto.zero_hash);
     if (old_zero and new_zero) return;
     if (old_zero) return collectSubtree(alloc, store, new_hash, .added, changes);
     if (new_zero) return collectSubtree(alloc, store, old_hash, .removed, changes);
@@ -205,7 +206,7 @@ fn collectSubtree(
     kind: entry_mod.ChangeKind,
     changes: *ArrayList(EntryChange),
 ) DiffError!void {
-    if (hashEq(page_hash, hash_mod.zero_hash)) return;
+    if (hashEq(page_hash, crypto.zero_hash)) return;
 
     var page = try store.get(page_hash);
     defer page.deinit(alloc);
@@ -260,7 +261,7 @@ fn flattenSubtree(
     page_hash: Hash,
     out: *ArrayList(LeafEntry),
 ) DiffError!void {
-    if (hashEq(page_hash, hash_mod.zero_hash)) return;
+    if (hashEq(page_hash, crypto.zero_hash)) return;
 
     var page = try store.get(page_hash);
     defer page.deinit(alloc);
@@ -346,12 +347,12 @@ test "diffRoots against zero_hash reports every entry as added/removed" {
 
     const root = try btree_mod.build(alloc, &store, entries.items);
 
-    const added = try diffRoots(alloc, &store, hash_mod.zero_hash, root);
+    const added = try diffRoots(alloc, &store, crypto.zero_hash, root);
     defer entry_mod.freeChanges(alloc, added);
     try testing.expectEqual(@as(usize, 2), added.len);
     for (added) |c| try testing.expectEqual(entry_mod.ChangeKind.added, c.kind);
 
-    const removed = try diffRoots(alloc, &store, root, hash_mod.zero_hash);
+    const removed = try diffRoots(alloc, &store, root, crypto.zero_hash);
     defer entry_mod.freeChanges(alloc, removed);
     try testing.expectEqual(@as(usize, 2), removed.len);
     for (removed) |c| try testing.expectEqual(entry_mod.ChangeKind.removed, c.kind);

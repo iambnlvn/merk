@@ -3,9 +3,9 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 
-const hash_mod = @import("crypto").hash;
+const crypto = @import("crypto");
 
-pub const Hash = hash_mod.Hash;
+pub const Hash = crypto.Hash;
 
 pub const MAGIC: u32 = 0x4D_45_52_4B;
 pub const VERSION: u8 = 1;
@@ -226,7 +226,7 @@ pub fn writeLeafEntry(writer: *std.Io.Writer, entry: LeafEntry) !void {
 }
 
 fn testLeaf(key: PathKey, path: []const u8) LeafEntry {
-    return .{ .key = key, .path = @constCast(path), .blob_hash = hash_mod.zero_hash, .size = 1, .mode = 0o644, .mtime = 0 };
+    return .{ .key = key, .path = @constCast(path), .blob_hash = crypto.zero_hash, .size = 1, .mode = 0o644, .mtime = 0 };
 }
 
 fn buildTestLeafPage(page: *[PAGE_SIZE]u8, entries: []const LeafEntry) !void {

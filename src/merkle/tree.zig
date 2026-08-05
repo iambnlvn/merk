@@ -3,20 +3,27 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 
-const hash_mod = @import("crypto").hash;
+const crypto = @import("crypto");
+const MemoryFs = @import("storage").MemoryFs;
+
 const node = @import("node.zig");
 const entry_mod = @import("entry.zig");
 const page_store_mod = @import("page_store.zig");
-const MemoryFs = @import("storage").MemoryFs;
 
-const Hash = hash_mod.Hash;
+const Hash = crypto.Hash;
+const zero_hash = crypto.zero_hash;
 const Entry = entry_mod.Entry;
 const LeafEntry = node.LeafEntry;
 const ChildRef = node.ChildRef;
 const PageStore = page_store_mod.PageStore;
-const PAGE_SIZE = node.PAGE_SIZE;
 
-const zero_hash = hash_mod.zero_hash;
+const PAGE_SIZE = node.PAGE_SIZE;
+const LEAF_PAGE = node.LEAF_PAGE;
+const LEAF_HEADER_LEN = node.LEAF_HEADER_LEN;
+const INTERNAL_HEADER_LEN = node.INTERNAL_HEADER_LEN;
+const CHILD_REF_LEN = node.CHILD_REF_LEN;
+const INTERNAL_PAGE = node.INTERNAL_PAGE;
+
 /// Content-defined chunking threshold for leaf pages.
 /// When the low bits of an entry's key are all zero, the page is cut here
 const LEAF_BOUNDARY_MASK: u64 = 0x1F;
@@ -54,18 +61,18 @@ pub fn build(alloc: Allocator, store: *const PageStore, entries: []const Entry) 
     while (offset < sorted_entries.len) {
         var page: [PAGE_SIZE]u8 = [_]u8{0} ** PAGE_SIZE;
 
-        var writer = std.Io.Writer.fixed(page[node.LEAF_HEADER_LEN..]);
+        var writer = std.Io.Writer.fixed(page[LEAF_HEADER_LEN..]);
         const first_key = entry_mod.pathKey(sorted_entries[offset].path);
         var count: u16 = 0;
 
         while (offset < sorted_entries.len) {
             const e = sorted_entries[offset];
             const needed = node.leafEntryWireSize(e.path.len);
-            if (needed > PAGE_SIZE - node.LEAF_HEADER_LEN) return error.IndexEntryTooLarge;
+            if (needed > PAGE_SIZE - LEAF_HEADER_LEN) return error.IndexEntryTooLarge;
 
             // Hard page-size boundary: if we can't fit this entry and we've
             // already written at least one entry, start a new page
-            if (writer.end + needed > page.len - node.LEAF_HEADER_LEN and count > 0) break;
+            if (writer.end + needed > page.len - LEAF_HEADER_LEN and count > 0) break;
 
             try node.writeLeafEntry(&writer, toLeafEntry(e));
             count += 1;
@@ -75,7 +82,7 @@ pub fn build(alloc: Allocator, store: *const PageStore, entries: []const Entry) 
             if (node.isChunkBoundary(entry_mod.pathKey(e.path), LEAF_BOUNDARY_MASK)) break;
         }
 
-        node.writePageHeader(&page, node.LEAF_PAGE, count);
+        node.writePageHeader(&page, LEAF_PAGE, count);
         const page_hash = try store.put(&page);
         try level.append(alloc, .{
             .separator = first_key,
@@ -92,13 +99,13 @@ pub fn build(alloc: Allocator, store: *const PageStore, entries: []const Entry) 
         while (child_offset < level.items.len) {
             var page: [PAGE_SIZE]u8 = [_]u8{0} ** PAGE_SIZE;
 
-            var writer = std.Io.Writer.fixed(page[node.INTERNAL_HEADER_LEN..]);
+            var writer = std.Io.Writer.fixed(page[INTERNAL_HEADER_LEN..]);
             const first_separator = level.items[child_offset].separator;
             var child_count: u16 = 0;
 
             while (child_offset < level.items.len) {
                 // Hard boundary check
-                if (writer.end + node.CHILD_REF_LEN > page.len - node.INTERNAL_HEADER_LEN and child_count > 0) break;
+                if (writer.end + CHILD_REF_LEN > page.len - INTERNAL_HEADER_LEN and child_count > 0) break;
 
                 const child = level.items[child_offset];
                 try writer.writeInt(u64, child.separator, .little);
@@ -110,7 +117,7 @@ pub fn build(alloc: Allocator, store: *const PageStore, entries: []const Entry) 
                 if (node.isChunkBoundary(node.foldHashPrefix(child.page_hash), INTERNAL_BOUNDARY_MASK)) break;
             }
 
-            node.writePageHeader(&page, node.INTERNAL_PAGE, child_count);
+            node.writePageHeader(&page, INTERNAL_PAGE, child_count);
             const page_hash = try store.put(&page);
             try next.append(alloc, .{
                 .separator = first_separator,
