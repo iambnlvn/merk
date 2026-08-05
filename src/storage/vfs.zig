@@ -1,9 +1,12 @@
 const std = @import("std");
 const testing = std.testing;
 const native_fs = std.fs;
+pub const Dir = native_fs.Dir;
 
 const Allocator = std.mem.Allocator;
 
+/// Composite error set representing all possible failure modes across
+/// diverse backend implementations, ensuring future-proof error handling.
 pub const VfsError = error{
     FileNotFound,
     FileTooBig,
@@ -12,14 +15,15 @@ pub const VfsError = error{
     Unexpected,
 } || native_fs.File.OpenError || native_fs.File.ReadError || native_fs.File.WriteError || native_fs.File.SeekError || native_fs.Dir.StatFileError || native_fs.Dir.DeleteFileError || native_fs.Dir.RenameError || Allocator.Error || native_fs.Dir.MakeError || native_fs.Dir.Iterator.Error;
 
-pub const Dir = native_fs.Dir;
-
 pub const Vfs = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
-    pub const default_max_read_size: usize = 1 << 30; // 1 GiB
+    /// Default safety cap for full-file reads (1 GiB) to prevent
+    /// runaway memory allocations on unexpectedly massive files.
+    pub const default_max_read_size: usize = 1 << 30;
 
+    /// Virtual method table defining the required backend driver functions.
     pub const VTable = struct {
         readFile: *const fn (ptr: *anyopaque, alloc: Allocator, path: []const u8, max_size: usize) VfsError!?[]u8,
         readRange: *const fn (ptr: *anyopaque, alloc: Allocator, path: []const u8, offset: u64, len: usize) VfsError!?[]u8,
@@ -34,55 +38,69 @@ pub const Vfs = struct {
         listFiles: *const fn (ptr: *anyopaque, alloc: Allocator, dir_path: []const u8) VfsError![][]u8,
     };
 
+    /// Reads an entire file into memory using the default size limit.
+    /// Returns `null` if the file does not exist.
     pub fn readFile(self: Vfs, alloc: Allocator, path: []const u8) !?[]u8 {
         return self.vtable.readFile(self.ptr, alloc, path, default_max_read_size);
     }
 
+    /// Reads an entire file into memory enforced by a custom maximum byte limit.
     pub fn readFileLimit(self: Vfs, alloc: Allocator, path: []const u8, max_size: usize) !?[]u8 {
         return self.vtable.readFile(self.ptr, alloc, path, max_size);
     }
 
+    /// Reads a precise byte range from a file starting at the given offset.
     pub fn readRange(self: Vfs, alloc: Allocator, path: []const u8, offset: u64, len: usize) !?[]u8 {
         return self.vtable.readRange(self.ptr, alloc, path, offset, len);
     }
 
+    /// Writes contents to a file at the specified path, creating missing parent directories.
     pub fn writeFile(self: Vfs, alloc: Allocator, path: []const u8, contents: []const u8) !void {
         return self.vtable.writeFile(self.ptr, alloc, path, contents);
     }
 
+    /// Opens a sequential stream handle for reading large files incrementally.
     pub fn openStream(self: Vfs, alloc: Allocator, path: []const u8) !?FileStream {
         return self.vtable.openStream(self.ptr, alloc, path);
     }
 
+    /// Deletes a file at the designated path.
     pub fn deleteFile(self: Vfs, path: []const u8) !void {
         return self.vtable.deleteFile(self.ptr, path);
     }
 
+    /// Checks whether a file exists at the given path.
     pub fn fileExists(self: Vfs, path: []const u8) !bool {
         return self.vtable.fileExists(self.ptr, path);
     }
 
+    /// Retrieves file metadata (size and modification timestamp) without loading contents.
     pub fn statFile(self: Vfs, path: []const u8) !?FileStat {
         return self.vtable.statFile(self.ptr, path);
     }
 
+    /// Renames or moves a file from an old path to a new path.
     pub fn renameFile(self: Vfs, old_path: []const u8, new_path: []const u8) !void {
         return self.vtable.renameFile(self.ptr, old_path, new_path);
     }
 
+    /// Copies a file from an existing path to a destination path.
     pub fn copyFile(self: Vfs, old_path: []const u8, new_path: []const u8) !void {
         return self.vtable.copyFile(self.ptr, old_path, new_path);
     }
 
+    /// Recursively deletes an entire directory tree.
     pub fn deleteDir(self: Vfs, dir_path: []const u8) !void {
         return self.vtable.deleteDir(self.ptr, dir_path);
     }
 
+    /// Recursively lists all file paths contained within a directory.
     pub fn listFiles(self: Vfs, alloc: Allocator, dir_path: []const u8) ![][]u8 {
         return self.vtable.listFiles(self.ptr, alloc, dir_path);
     }
 };
 
+/// A sequential streaming handle abstraction for reading files chunk-by-chunk.
 pub const FileStream = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -92,16 +110,20 @@ pub const FileStream = struct {
         close: *const fn (ptr: *anyopaque) void,
     };
 
+    /// Reads data from the active stream into the provided buffer.
     pub fn read(self: FileStream, buffer: []u8) VfsError!usize {
         return self.vtable.read(self.ptr, buffer);
     }
 
+    /// Closes the stream and releases any allocated handle resources.
     pub fn close(self: FileStream) void {
         self.vtable.close(self.ptr);
     }
 
+    /// Standard library compatibility reader type.
     pub const Reader = std.Io.Reader(FileStream, VfsError, readImpl);
 
+    /// Wraps the stream into a standard library `std.Io.Reader` for high-level parsing utilities.
     pub fn reader(self: FileStream) Reader {
         return .{ .context = self };
     }
@@ -111,11 +133,14 @@ pub const FileStream = struct {
     }
 };
 
+/// Represents core metadata fields for a file.
 pub const FileStat = struct {
     size: u64,
     mtime_ns: i128,
 };
 
+/// Shared test suite used to validate structural conformance across different
+/// VFS backend implementations
 pub fn runVfsTests(fs: Vfs, alloc: Allocator) !void {
     // Write and Read
     const test_path = "subdir/test_file.txt";
