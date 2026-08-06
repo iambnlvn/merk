@@ -1,43 +1,43 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+const testing = std.testing;
+
 const hash_mod = @import("merk").crypto;
-const io = @import("merk").io;
-const object = @import("./object/object.zig");
-const storage = @import("storage");
-const Vfs = storage.Vfs;
-const MemoryFs = storage.MemoryFs;
 const Hash = hash_mod.Hash;
+
+const storage = @import("storage");
+const MemoryFs = storage.MemoryFs;
+const Vfs = storage.Vfs;
+
+const object = @import("./object/object.zig");
 const Store = object.Store;
 
-// Author/committer identity now lives in the shared identity.zig module
-// rather than a commit-local one. Its `SignatureInfo`/`Signature` types
-// (a person + timestamp + timezone) are what `CommitIdentityInfo` /
-// `CommitIdentity` used to be — renamed to `CommitSignaturesInfo` /
-// `CommitSignatures` on that side to make clear they pair an author and
-// a committer, not just one signer.
-pub const identity = @import("./commit/identity.zig");
-const CommitSignaturesInfo = identity.CommitSignaturesInfo;
+const ComponentDir = @import("./commit/dir.zig").ComponentDir;
+
+const identity = @import("./commit/identity.zig");
 const CommitSignatures = identity.CommitSignatures;
-const SignatureInfo = identity.SignatureInfo;
+const CommitSignaturesInfo = identity.CommitSignaturesInfo;
 const PersonInfo = identity.PersonInfo;
+const SignatureInfo = identity.SignatureInfo;
 const Timezone = identity.Timezone;
 
-pub const message = @import("./commit/message.zig");
+const message = @import("./commit/message.zig");
 const Message = message.Message;
 const MessageInfo = message.MessageInfo;
 
-pub const metadata = @import("./commit/metadata.zig");
+const metadata = @import("./commit/metadata.zig");
 const CommitMetadata = metadata.CommitMetadata;
 const CommitMetadataInfo = metadata.CommitMetadataInfo;
 
-pub const snapshot = @import("./commit/snapshot.zig");
-
-pub const parent = @import("./commit/parent.zig");
+const parent = @import("./commit/parent.zig");
 const ParentInfo = parent.ParentInfo;
+
+const snapshot = @import("./commit/snapshot.zig");
 
 // Logical (change_id-keyed) dependency edges for stacked changes —
 // see `commit/dependency.zig`'s doc comment for why this is a distinct
 // concept from `parent`/`ParentInfo`'s physical (hash-keyed) ancestry.
-pub const dependency = @import("./commit/dependency.zig");
+const dependency = @import("./commit/dependency.zig");
 const DependencyInfo = dependency.DependencyInfo;
 
 // `commit/signature.zig` is the *cryptographic* signature sidecar
@@ -45,11 +45,11 @@ const DependencyInfo = dependency.DependencyInfo;
 // — a completely different concept from identity.zig's `SignatureInfo`/
 // `Signature` (who authored/committed, and when). Bound under `Crypto*`
 // names here so the two don't collide.
-pub const signature = @import("./commit/signature.zig");
-const CryptoSignatureInfo = signature.SignatureInfo;
+const signature = @import("./commit/signature.zig");
 const CryptoSignature = signature.Signature;
+const CryptoSignatureInfo = signature.SignatureInfo;
 
-pub const COMMIT_MAGIC = 0x4E_4F_44_55;
+pub const COMMIT_MAGIC = 0x4D_45_52_4B;
 
 pub const COMMIT_VERSION: u8 = 1;
 
@@ -97,7 +97,7 @@ const CommitInfo = struct {
 
     fn validate(self: @This()) !void {
         try parent.validate(self.parents);
-        try dependency.validate(self.dependencies);
+        try dependency.validate(self.dependencies, self.metadata.change_id);
         for (self.dependencies) |d| {
             if (std.mem.eql(u8, &d.change_id, &self.metadata.change_id))
                 return error.SelfDependency;
@@ -158,13 +158,13 @@ pub const Commit = struct {
     /// Just the hashes, dropping `ParentKind` — for callers doing plain
     /// graph traversal (e.g. a log walker) that don't care why an edge
     /// exists, only that it does. Caller frees with `alloc.free`
-    pub fn parentHashesAlloc(self: Commit, alloc: std.mem.Allocator) ![]Hash {
+    pub fn parentHashesAlloc(self: Commit, alloc: Allocator) ![]Hash {
         const hashes = try alloc.alloc(Hash, self.parents.len);
         for (self.parents, 0..) |p, i| hashes[i] = p.hash;
         return hashes;
     }
 
-    pub fn deinit(self: *Commit, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Commit, alloc: Allocator) void {
         alloc.free(self.parents);
         alloc.free(self.dependencies);
         self.identity.deinit(alloc);
@@ -179,7 +179,7 @@ pub const Commit = struct {
 /// this, so every commit written by merk goes through the builder's
 /// validation and default-filling, never a hand-assembled `CommitInfo`
 fn writeCommit(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     store: *const Store,
     info: CommitInfo,
 ) !Hash {
@@ -195,7 +195,7 @@ fn writeCommit(
 
     try snapshot.serialize(info.snapshot, writer);
     try parent.serializeAll(info.parents, writer);
-    try dependency.serializeAll(info.dependencies, writer);
+    try dependency.serializeAll(info.dependencies, info.metadata.change_id, writer);
     try info.identity.serialize(writer);
     try info.metadata.serialize(writer);
     try info.message.serialize(writer);
@@ -208,7 +208,7 @@ fn writeCommit(
 /// `error.CorruptCommit` / `error.UnsupportedCommitVersion` if the stored
 /// bytes don't parse as one merk understands
 pub fn read(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     store: *const Store,
     commit_hash: Hash,
 ) !Commit {
@@ -267,14 +267,14 @@ pub fn read(
 /// only. Verifying `sig.bytes` against `sig.key_id` for a given
 /// `commit_hash` is the caller's job (a CLI command, CI policy, ...).
 pub const CommitSignatureStore = struct {
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     fs: Vfs,
-    /// Directory signature sidecar files live under, e.g.
-    /// "merk/history/signatures".
-    signatures_dir: []const u8,
+    /// Where signature sidecar files live, relative to `fs`'s root.
+    /// Typically ".merk/history/signatures".
+    dir: ComponentDir,
 
-    pub fn init(alloc: std.mem.Allocator, fs: Vfs, signatures_dir: []const u8) CommitSignatureStore {
-        return .{ .alloc = alloc, .fs = fs, .signatures_dir = signatures_dir };
+    pub fn init(alloc: Allocator, fs: Vfs, signatures_dir: []const u8) CommitSignatureStore {
+        return .{ .alloc = alloc, .fs = fs, .dir = ComponentDir.init(signatures_dir) };
     }
 
     /// Attach (or replace) the signature for `commit_hash`. Doesn't
@@ -318,15 +318,15 @@ pub const CommitSignatureStore = struct {
     /// Sharded by the commit hash itself. Unlike `PathHistory` (which
     /// hashes an arbitrary path first), `commit_hash` is already a
     /// uniformly distributed content hash, so no extra hashing step is
-    /// needed to get good directory fan-out
+    /// needed to get good directory fan-out. Delegates to
+    /// `ComponentDir.shardedPath` rather than formatting the
+    /// "<dir>/xx/yy/<hex>" path by hand — the same sharding logic
+    /// `object.Store.objectPath` uses, so both stay in sync through one
+    /// shared implementation instead of two copies drifting apart.
     fn sigPath(self: CommitSignatureStore, commit_hash: Hash) ![]u8 {
         var hex_buf: [64]u8 = undefined;
         const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{commit_hash}) catch unreachable;
-
-        if (self.signatures_dir.len == 0) {
-            return std.fmt.allocPrint(self.alloc, "{s}/{s}/{s}", .{ hex[0..2], hex[2..4], hex });
-        }
-        return std.fmt.allocPrint(self.alloc, "{s}/{s}/{s}/{s}", .{ self.signatures_dir, hex[0..2], hex[2..4], hex });
+        return self.dir.shardedPath(self.alloc, hex);
     }
 };
 
@@ -435,7 +435,7 @@ pub const CommitRequest = struct {
 /// Signing a commit happens *after* `.write()`, against the returned
 /// hash, via `CommitSignatureStore` — see its doc comment.
 pub const CommitBuilder = struct {
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     snapshot_root: Hash,
     parents: std.ArrayListUnmanaged(ParentInfo) = .{},
     dependencies: std.ArrayListUnmanaged(DependencyInfo) = .{},
@@ -457,7 +457,7 @@ pub const CommitBuilder = struct {
     /// structure represents this commit's full state — resolve it from
     /// your tree/index implementation before calling this. See the
     /// module doc comment: this builder never looks past this one hash.
-    pub fn init(alloc: std.mem.Allocator, snapshot_root: Hash) CommitBuilder {
+    pub fn init(alloc: Allocator, snapshot_root: Hash) CommitBuilder {
         return .{ .alloc = alloc, .snapshot_root = snapshot_root };
     }
 
@@ -469,7 +469,7 @@ pub const CommitBuilder = struct {
     /// since `CommitRequest` deliberately doesn't carry them (see its
     /// doc comment).
     pub fn fromRequest(
-        alloc: std.mem.Allocator,
+        alloc: Allocator,
         snapshot_root: Hash,
         request: CommitRequest,
     ) !CommitBuilder {
@@ -732,7 +732,7 @@ pub const CommitBuilder = struct {
 };
 
 fn testCommit(
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     store: *const Store,
     snapshot_hash: Hash,
     name: []const u8,
@@ -749,7 +749,7 @@ fn testCommit(
 }
 
 test "CommitBuilder.applyRequest populates author, committer default, and trailers" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -773,16 +773,16 @@ test "CommitBuilder.applyRequest populates author, committer default, and traile
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
 
-    try std.testing.expectEqualStrings("Ada Lovelace", c.identity.author.person.name);
-    try std.testing.expect(c.identity.isAuthorCommitter());
-    try std.testing.expectEqualStrings("via applyRequest", c.message.title);
-    try std.testing.expectEqualStrings("#5", c.message.trailer("closes").?);
-    try std.testing.expectEqual(@as(usize, 1), c.metadata.labels.len);
-    try std.testing.expectEqualStrings("core", c.metadata.labels[0]);
+    try testing.expectEqualStrings("Ada Lovelace", c.identity.author.person.name);
+    try testing.expect(c.identity.isAuthorCommitter());
+    try testing.expectEqualStrings("via applyRequest", c.message.title);
+    try testing.expectEqualStrings("#5", c.message.trailer("closes").?);
+    try testing.expectEqual(@as(usize, 1), c.metadata.labels.len);
+    try testing.expectEqualStrings("core", c.metadata.labels[0]);
 }
 
 test "CommitBuilder.fromRequest is equivalent to init + applyRequest" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -803,14 +803,14 @@ test "CommitBuilder.fromRequest is equivalent to init + applyRequest" {
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
 
-    try std.testing.expectEqualStrings("Grace Hopper", c.identity.author.person.name);
-    try std.testing.expectEqualStrings("via fromRequest", c.message.title);
-    try std.testing.expect(c.isRoot());
-    try std.testing.expect(!c.isMerge());
+    try testing.expectEqualStrings("Grace Hopper", c.identity.author.person.name);
+    try testing.expectEqualStrings("via fromRequest", c.message.title);
+    try testing.expect(c.isRoot());
+    try testing.expect(!c.isMerge());
 }
 
 test "commit write and read round-trip" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
 
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
@@ -834,34 +834,34 @@ test "commit write and read round-trip" {
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
 
-    try std.testing.expectEqualSlices(u8, &snapshot_hash, &c.snapshot);
-    try std.testing.expectEqual(@as(usize, 0), c.parents.len);
+    try testing.expectEqualSlices(u8, &snapshot_hash, &c.snapshot);
+    try testing.expectEqual(@as(usize, 0), c.parents.len);
 
-    try std.testing.expectEqualStrings("Bruce Wayne", c.identity.author.person.name);
-    try std.testing.expectEqualStrings("bruce@wayne.corp", c.identity.author.person.email);
-    try std.testing.expectEqual(@as(i64, 1_700_000_000_000), c.identity.author.timestamp_ms);
-    try std.testing.expectEqual(@as(i16, 0), c.identity.author.timezone.minutes());
+    try testing.expectEqualStrings("Bruce Wayne", c.identity.author.person.name);
+    try testing.expectEqualStrings("bruce@wayne.corp", c.identity.author.person.email);
+    try testing.expectEqual(@as(i64, 1_700_000_000_000), c.identity.author.timestamp_ms);
+    try testing.expectEqual(@as(i16, 0), c.identity.author.timezone.minutes());
 
-    try std.testing.expectEqualStrings("Bruce Wayne", c.identity.committer.person.name);
-    try std.testing.expect(c.identity.isAuthorCommitter());
+    try testing.expectEqualStrings("Bruce Wayne", c.identity.committer.person.name);
+    try testing.expect(c.identity.isAuthorCommitter());
 
-    try std.testing.expectEqualStrings("Initial commit", c.message.title);
-    try std.testing.expectEqualStrings(
+    try testing.expectEqualStrings("Initial commit", c.message.title);
+    try testing.expectEqualStrings(
         "Create the initial repository structure.",
         c.message.body,
     );
-    try std.testing.expectEqual(Encoding.utf8, c.message.encoding);
+    try testing.expectEqual(Encoding.utf8, c.message.encoding);
 
-    try std.testing.expectEqual(@as(usize, 2), c.message.trailers.len);
-    try std.testing.expectEqualStrings("reviewed-by", c.message.trailers[0].key);
-    try std.testing.expectEqualStrings("alfred@wayne.corp", c.message.trailers[0].value);
+    try testing.expectEqual(@as(usize, 2), c.message.trailers.len);
+    try testing.expectEqualStrings("reviewed-by", c.message.trailers[0].key);
+    try testing.expectEqualStrings("alfred@wayne.corp", c.message.trailers[0].value);
 
-    try std.testing.expectEqualStrings("#1", c.message.trailer("closes").?);
-    try std.testing.expectEqual(@as(?[]const u8, null), c.message.trailer("missing"));
+    try testing.expectEqualStrings("#1", c.message.trailer("closes").?);
+    try testing.expectEqual(@as(?[]const u8, null), c.message.trailer("missing"));
 }
 
 test "commit with explicit committer" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
 
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
@@ -881,15 +881,15 @@ test "commit with explicit committer" {
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
 
-    try std.testing.expectEqualStrings("Ada Lovelace", c.identity.author.person.name);
-    try std.testing.expectEqualStrings("merk Bot", c.identity.committer.person.name);
-    try std.testing.expectEqual(@as(i64, 1_000), c.identity.author.timestamp_ms);
-    try std.testing.expectEqual(@as(i64, 2_000), c.identity.committer.timestamp_ms);
-    try std.testing.expect(!c.identity.isAuthorCommitter());
+    try testing.expectEqualStrings("Ada Lovelace", c.identity.author.person.name);
+    try testing.expectEqualStrings("merk Bot", c.identity.committer.person.name);
+    try testing.expectEqual(@as(i64, 1_000), c.identity.author.timestamp_ms);
+    try testing.expectEqual(@as(i64, 2_000), c.identity.committer.timestamp_ms);
+    try testing.expect(!c.identity.isAuthorCommitter());
 }
 
 test "author/committer with distinct timezone offsets round-trips" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -907,12 +907,12 @@ test "author/committer with distinct timezone offsets round-trips" {
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
 
-    try std.testing.expectEqual(@as(i16, -300), c.identity.author.timezone.minutes());
-    try std.testing.expectEqual(@as(i16, 0), c.identity.committer.timezone.minutes());
+    try testing.expectEqual(@as(i16, -300), c.identity.author.timezone.minutes());
+    try testing.expectEqual(@as(i16, 0), c.identity.committer.timezone.minutes());
 }
 
 test "authorWithTz/committerWithTz reject a tz offset outside the civil range" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -924,20 +924,20 @@ test "authorWithTz/committerWithTz reject a tz offset outside the civil range" {
     // +18:00 isn't a real UTC offset — Timezone's civil range tops out
     // at +14:00 (Kiribati). This used to be silently accepted and only
     // surface (if at all) when something downstream tried to format it.
-    try std.testing.expectError(
+    try testing.expectError(
         error.InvalidTimezoneOffset,
         b.authorWithTz("Dev A", "a@merk.dev", 1_000, 18 * 60),
     );
 
     _ = b.author("Dev A", "a@merk.dev", 1_000);
-    try std.testing.expectError(
+    try testing.expectError(
         error.InvalidTimezoneOffset,
         b.committerWithTz("Dev B", "b@merk.dev", 1_000, -13 * 60),
     );
 }
 
 test "change_id is generated when unset, and carried forward across a rebase-like rewrite" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -965,8 +965,8 @@ test "change_id is generated when unset, and carried forward across a rebase-lik
     var rebased = try read(alloc, &store, rebased_hash);
     defer rebased.deinit(alloc);
 
-    try std.testing.expect(!std.mem.eql(u8, &original_hash, &rebased_hash));
-    try std.testing.expect(original.isSameChange(rebased));
+    try testing.expect(!std.mem.eql(u8, &original_hash, &rebased_hash));
+    try testing.expect(original.isSameChange(rebased));
 
     // An unrelated commit gets its own, different change_id.
     var b3 = CommitBuilder.init(alloc, snapshot_hash);
@@ -979,11 +979,11 @@ test "change_id is generated when unset, and carried forward across a rebase-lik
     var unrelated = try read(alloc, &store, unrelated_hash);
     defer unrelated.deinit(alloc);
 
-    try std.testing.expect(!original.isSameChange(unrelated));
+    try testing.expect(!original.isSameChange(unrelated));
 }
 
 test "encoding tag round-trips through write and read" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1001,11 +1001,11 @@ test "encoding tag round-trips through write and read" {
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
 
-    try std.testing.expectEqual(Encoding.latin1, c.message.encoding);
+    try testing.expectEqual(Encoding.latin1, c.message.encoding);
 }
 
 test "CommitSignatureStore: unsigned commit has no signature, attach/get/remove round-trip" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1020,7 +1020,7 @@ test "CommitSignatureStore: unsigned commit has no signature, attach/get/remove 
     const commit_hash = try b.write(&store);
 
     // Unsigned by default.
-    try std.testing.expectEqual(@as(?CryptoSignature, null), try sig_store.get(commit_hash));
+    try testing.expectEqual(@as(?CryptoSignature, null), try sig_store.get(commit_hash));
 
     // The commit's hash is exactly what gets signed — attach doesn't
     // touch or require re-deriving anything from the commit object.
@@ -1032,8 +1032,8 @@ test "CommitSignatureStore: unsigned commit has no signature, attach/get/remove 
 
     var sig = (try sig_store.get(commit_hash)).?;
     defer sig.deinit(alloc);
-    try std.testing.expectEqual(SignatureAlgorithm.ssh_ed25519, sig.algorithm);
-    try std.testing.expectEqualStrings("SHA256:abc123", sig.key_id);
+    try testing.expectEqual(SignatureAlgorithm.ssh_ed25519, sig.algorithm);
+    try testing.expectEqualStrings("SHA256:abc123", sig.key_id);
 
     // Re-signing (e.g. a second signer) replaces, doesn't append
     try sig_store.attach(commit_hash, .{
@@ -1043,14 +1043,14 @@ test "CommitSignatureStore: unsigned commit has no signature, attach/get/remove 
     });
     var resigned = (try sig_store.get(commit_hash)).?;
     defer resigned.deinit(alloc);
-    try std.testing.expectEqual(SignatureAlgorithm.pgp_rsa, resigned.algorithm);
+    try testing.expectEqual(SignatureAlgorithm.pgp_rsa, resigned.algorithm);
 
     try sig_store.remove(commit_hash);
-    try std.testing.expectEqual(@as(?CryptoSignature, null), try sig_store.get(commit_hash));
+    try testing.expectEqual(@as(?CryptoSignature, null), try sig_store.get(commit_hash));
 }
 
 test "signing a commit does not change its hash" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1082,20 +1082,20 @@ test "signing a commit does not change its hash" {
     _ = b2.changeId([_]u8{0x11} ** 16);
     const hash_again = try b2.write(&store);
 
-    try std.testing.expectEqualSlices(u8, &hash_before, &hash_again);
+    try testing.expectEqualSlices(u8, &hash_before, &hash_again);
 }
 
 test "wrong object type returns error" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
     const blob_hash = try store.put(.blob, "not a commit");
-    try std.testing.expectError(error.WrongObjectType, read(alloc, &store, blob_hash));
+    try testing.expectError(error.WrongObjectType, read(alloc, &store, blob_hash));
 }
 
 test "commit with a normal parent" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1120,20 +1120,20 @@ test "commit with a normal parent" {
     var c = try read(alloc, &store, child_hash);
     defer c.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), c.parents.len);
-    try std.testing.expectEqualSlices(u8, &parent_hash, &c.parents[0].hash);
-    try std.testing.expectEqual(ParentKind.normal, c.parents[0].kind);
-    try std.testing.expectEqualStrings("second", c.message.title);
-    try std.testing.expectEqualStrings(
+    try testing.expectEqual(@as(usize, 1), c.parents.len);
+    try testing.expectEqualSlices(u8, &parent_hash, &c.parents[0].hash);
+    try testing.expectEqual(ParentKind.normal, c.parents[0].kind);
+    try testing.expectEqualStrings("second", c.message.title);
+    try testing.expectEqualStrings(
         "abc1234",
         c.message.trailer("cherry-picked").?,
     );
-    try std.testing.expect(!c.isRoot());
-    try std.testing.expect(!c.isMerge());
+    try testing.expect(!c.isRoot());
+    try testing.expect(!c.isMerge());
 }
 
 test "commit records why a parent edge exists: merge and cherry-pick" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1154,16 +1154,16 @@ test "commit records why a parent edge exists: merge and cherry-pick" {
     var mc = try read(alloc, &store, merge_hash);
     defer mc.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), mc.parents.len);
-    try std.testing.expectEqual(ParentKind.normal, mc.parents[0].kind);
-    try std.testing.expectEqual(ParentKind.merge, mc.parents[1].kind);
-    try std.testing.expectEqualSlices(u8, &branch_hash, &mc.parents[1].hash);
-    try std.testing.expect(mc.isMerge());
-    try std.testing.expect(!mc.isRoot());
+    try testing.expectEqual(@as(usize, 2), mc.parents.len);
+    try testing.expectEqual(ParentKind.normal, mc.parents[0].kind);
+    try testing.expectEqual(ParentKind.merge, mc.parents[1].kind);
+    try testing.expectEqualSlices(u8, &branch_hash, &mc.parents[1].hash);
+    try testing.expect(mc.isMerge());
+    try testing.expect(!mc.isRoot());
 }
 
 test "parentsWithKind adds several parents sharing one kind" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1184,18 +1184,18 @@ test "parentsWithKind adds several parents sharing one kind" {
     var oc = try read(alloc, &store, octopus_hash);
     defer oc.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 3), oc.parents.len);
-    for (oc.parents) |p| try std.testing.expectEqual(ParentKind.merge, p.kind);
+    try testing.expectEqual(@as(usize, 3), oc.parents.len);
+    for (oc.parents) |p| try testing.expectEqual(ParentKind.merge, p.kind);
 
     const hashes = try oc.parentHashesAlloc(alloc);
     defer alloc.free(hashes);
-    try std.testing.expectEqualSlices(u8, &a_hash, &hashes[0]);
-    try std.testing.expectEqualSlices(u8, &b_hash, &hashes[1]);
-    try std.testing.expectEqualSlices(u8, &c_hash, &hashes[2]);
+    try testing.expectEqualSlices(u8, &a_hash, &hashes[0]);
+    try testing.expectEqualSlices(u8, &b_hash, &hashes[1]);
+    try testing.expectEqualSlices(u8, &c_hash, &hashes[2]);
 }
 
 test "CommitBuilder rejects a commit with an unset (zero) snapshot" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1206,11 +1206,11 @@ test "CommitBuilder rejects a commit with an unset (zero) snapshot" {
     _ = b.intent(.chore);
     _ = b.title("no snapshot");
 
-    try std.testing.expectError(error.MissingSnapshot, b.write(&store));
+    try testing.expectError(error.MissingSnapshot, b.write(&store));
 }
 
 test "CommitBuilder rejects a commit with no author" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1222,11 +1222,11 @@ test "CommitBuilder rejects a commit with no author" {
     _ = b.intent(.chore);
     _ = b.title("no author");
 
-    try std.testing.expectError(error.MissingAuthor, b.write(&store));
+    try testing.expectError(error.MissingAuthor, b.write(&store));
 }
 
 test "CommitBuilder rejects a commit with no title" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1238,11 +1238,11 @@ test "CommitBuilder rejects a commit with no title" {
     _ = b.author("No Title", "notitle@merk.dev", 1);
     _ = b.intent(.chore);
 
-    try std.testing.expectError(error.MissingTitle, b.write(&store));
+    try testing.expectError(error.MissingTitle, b.write(&store));
 }
 
 test "CommitBuilder rejects a commit with no intent" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1254,11 +1254,11 @@ test "CommitBuilder rejects a commit with no intent" {
     _ = b.author("No Intent", "nointent@merk.dev", 1);
     _ = b.title("no intent");
 
-    try std.testing.expectError(error.MissingIntent, b.write(&store));
+    try testing.expectError(error.MissingIntent, b.write(&store));
 }
 
 test "commit is deterministic given the same explicit change_id" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
 
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
@@ -1268,7 +1268,7 @@ test "commit is deterministic given the same explicit change_id" {
     const fixed_change_id: ChangeId = [_]u8{0x42} ** 16;
 
     const make_commit = struct {
-        fn f(s: *const Store, a: std.mem.Allocator, sh: Hash, cid: ChangeId) !Hash {
+        fn f(s: *const Store, a: Allocator, sh: Hash, cid: ChangeId) !Hash {
             var b = CommitBuilder.init(a, sh);
             defer b.deinit();
             _ = b.author("Test User", "test@merk.dev", 42);
@@ -1285,11 +1285,11 @@ test "commit is deterministic given the same explicit change_id" {
 
     const h1 = try make_commit(&store, alloc, snapshot_hash, fixed_change_id);
     const h2 = try make_commit(&store, alloc, snapshot_hash, fixed_change_id);
-    try std.testing.expectEqualSlices(u8, &h1, &h2);
+    try testing.expectEqualSlices(u8, &h1, &h2);
 }
 
 test "commit is non-deterministic across calls when change_id is left to auto-generate" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
 
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
@@ -1297,7 +1297,7 @@ test "commit is non-deterministic across calls when change_id is left to auto-ge
     const snapshot_hash = try store.put(.tree, &[_]u8{0} ** 4);
 
     const make_commit = struct {
-        fn f(s: *const Store, a: std.mem.Allocator, sh: Hash) !Hash {
+        fn f(s: *const Store, a: Allocator, sh: Hash) !Hash {
             var b = CommitBuilder.init(a, sh);
             defer b.deinit();
             _ = b.author("Test User", "test@merk.dev", 42);
@@ -1309,11 +1309,11 @@ test "commit is non-deterministic across calls when change_id is left to auto-ge
 
     const h1 = try make_commit(&store, alloc, snapshot_hash);
     const h2 = try make_commit(&store, alloc, snapshot_hash);
-    try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
+    try testing.expect(!std.mem.eql(u8, &h1, &h2));
 }
 
 test "commit with dependencies round-trips via write/read" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1333,16 +1333,16 @@ test "commit with dependencies round-trips via write/read" {
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), c.dependencies.len);
-    try std.testing.expect(c.dependsOnChange(base_change_id));
-    try std.testing.expect(c.dependsOnChange(other_change_id));
-    try std.testing.expect(!c.dependsOnChange([_]u8{0xFF} ** 16));
+    try testing.expectEqual(@as(usize, 2), c.dependencies.len);
+    try testing.expect(c.dependsOnChange(base_change_id));
+    try testing.expect(c.dependsOnChange(other_change_id));
+    try testing.expect(!c.dependsOnChange([_]u8{0xFF} ** 16));
 
-    try std.testing.expect(c.isRoot());
+    try testing.expect(c.isRoot());
 }
 
 test "a commit with no dependencies round-trips an empty list, not null" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1358,11 +1358,11 @@ test "a commit with no dependencies round-trips an empty list, not null" {
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 0), c.dependencies.len);
+    try testing.expectEqual(@as(usize, 0), c.dependencies.len);
 }
 
 test "CommitBuilder rejects a commit that depends on its own change_id" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1378,11 +1378,11 @@ test "CommitBuilder rejects a commit that depends on its own change_id" {
     _ = b.intent(.feature);
     _ = b.title("oops");
 
-    try std.testing.expectError(error.SelfDependency, b.write(&store));
+    try testing.expectError(error.SelfDependency, b.write(&store));
 }
 
 test "CommitBuilder rejects a duplicate dependency" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1398,11 +1398,11 @@ test "CommitBuilder rejects a duplicate dependency" {
     _ = b.intent(.feature);
     _ = b.title("oops");
 
-    try std.testing.expectError(error.DuplicateDependency, b.write(&store));
+    try testing.expectError(error.DuplicateDependency, b.write(&store));
 }
 
 test "CommitRequest.dependencies is threaded through applyRequest" {
-    const alloc = std.testing.allocator;
+    const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
     const store = Store.init(alloc, mem_fs.fs(), "objects");
@@ -1425,7 +1425,7 @@ test "CommitRequest.dependencies is threaded through applyRequest" {
     var c = try read(alloc, &store, commit_hash);
     defer c.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), c.dependencies.len);
-    try std.testing.expect(c.dependsOnChange(dep_a));
-    try std.testing.expect(c.dependsOnChange(dep_b));
+    try testing.expectEqual(@as(usize, 2), c.dependencies.len);
+    try testing.expect(c.dependsOnChange(dep_a));
+    try testing.expect(c.dependsOnChange(dep_b));
 }
