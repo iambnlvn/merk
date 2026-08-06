@@ -1,10 +1,10 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
+const Io = std.Io;
 
 const wire = @import("wire.zig");
-const MockReader = @import("testing.zig").MockReader;
+const testing_io = @import("testing.zig");
 
 /// The validation failures that can occur when a person record's name or
 /// email is checked. These errors stay intentionally specific so callers can
@@ -77,16 +77,16 @@ pub const PersonInfo = struct {
         const at_idx = std.mem.indexOfScalar(u8, t.email, '@') orelse
             return error.MissingEmailAtSign;
 
-        // Ensure local part exists and domain part exists
+        // Ensure local part exists and domain part exists.
         if (at_idx == 0 or at_idx == t.email.len - 1)
             return error.InvalidEmailBounds;
 
-        // Ensure there is no second '@' and no consecutive dots or empty domain labels right after
+        // Ensure there is no second '@' and no consecutive dots or empty domain labels right after.
         const domain = t.email[at_idx + 1 ..];
         if (std.mem.indexOfScalar(u8, domain, '@') != null)
             return error.EmailContainsIllegalCharacters;
 
-        // Optional hardening: ensure domain contains at least one dot for a valid TLD structure
+        // Optional hardening: ensure domain contains at least one dot for a valid TLD structure.
         if (std.mem.indexOfScalar(u8, domain, '.') == null)
             return error.InvalidEmailBounds;
     }
@@ -101,7 +101,7 @@ pub const PersonInfo = struct {
         };
     }
 
-    pub fn serialize(self: PersonInfo, writer: anytype) !void {
+    pub fn serialize(self: PersonInfo, writer: *Io.Writer) !void {
         try self.validate();
 
         const t = self.trimmed();
@@ -131,7 +131,7 @@ pub const Person = struct {
         return .{ .name = name, .email = email };
     }
 
-    pub fn deserialize(alloc: Allocator, reader: anytype) !Person {
+    pub fn deserialize(alloc: Allocator, reader: *Io.Reader) !Person {
         const name = try wire.readBytesAlloc(u16, alloc, reader);
         errdefer alloc.free(name);
 
@@ -216,10 +216,7 @@ pub const Timezone = union(enum) {
     /// `.unknown`, this returns `null` rather than inventing a fake UTC offset.
     /// The caller supplies a 5-byte buffer whose backing slice is returned.
     pub fn format(self: Timezone, buf: *[5]u8) ?[]const u8 {
-        switch (self) {
-            .unknown => return null,
-            else => {},
-        }
+        if (self == .unknown) return null;
 
         const m = self.minutes();
         const sign: u8 = if (m < 0) '-' else '+';
@@ -259,7 +256,7 @@ pub const Timezone = union(enum) {
         return Timezone.init(sign * (hours * 60 + mins));
     }
 
-    pub fn serialize(self: Timezone, writer: anytype) !void {
+    pub fn serialize(self: Timezone, writer: *Io.Writer) !void {
         const tag: u8 = switch (self) {
             .utc => tag_utc,
             .offset => tag_offset,
@@ -269,7 +266,7 @@ pub const Timezone = union(enum) {
         try writer.writeInt(i16, self.minutes(), .little);
     }
 
-    pub fn deserialize(reader: anytype) !Timezone {
+    pub fn deserialize(reader: *Io.Reader) !Timezone {
         const tag = try reader.takeByte();
         const raw = try reader.takeInt(i16, .little);
 
@@ -346,7 +343,7 @@ pub const SignatureInfo = struct {
         return self.timezone.format(buf);
     }
 
-    pub fn serialize(self: SignatureInfo, writer: anytype) !void {
+    pub fn serialize(self: SignatureInfo, writer: *Io.Writer) !void {
         try self.validate();
 
         const r = self.resolved();
@@ -375,7 +372,7 @@ pub const Signature = struct {
         };
     }
 
-    pub fn deserialize(alloc: Allocator, reader: anytype) !Signature {
+    pub fn deserialize(alloc: Allocator, reader: *Io.Reader) !Signature {
         var person = try Person.deserialize(alloc, reader);
         errdefer person.deinit(alloc);
 
@@ -420,9 +417,9 @@ pub const Signature = struct {
     }
 };
 
-// `CommitSignatures` is the author/committer pairing for a commit. The
-// committer is never optional: callers choose at construction time whether it
-// mirrors the author (`.soloAuthor`) or is distinct (`.init`), so every
+// `CommitSignaturesInfo` bundles the author and committer signature for a
+// commit. The two are kept separate from the start (rather than a single
+// signature the caller might mistakenly reuse for both roles) so that
 // `CommitSignaturesInfo` is complete up front rather than filling in a hidden
 // default during serialization.
 
@@ -446,7 +443,7 @@ pub const CommitSignaturesInfo = struct {
         try self.committer.validate();
     }
 
-    pub fn serialize(self: CommitSignaturesInfo, writer: anytype) !void {
+    pub fn serialize(self: CommitSignaturesInfo, writer: *Io.Writer) !void {
         try self.validate();
         try self.author.serialize(writer);
         try self.committer.serialize(writer);
@@ -463,7 +460,7 @@ pub const CommitSignatures = struct {
         return self.author.eql(self.committer);
     }
 
-    pub fn deserialize(alloc: Allocator, reader: anytype) !CommitSignatures {
+    pub fn deserialize(alloc: Allocator, reader: *Io.Reader) !CommitSignatures {
         var author = try Signature.deserialize(alloc, reader);
         errdefer author.deinit(alloc);
 
@@ -532,23 +529,23 @@ test "PersonInfo validation - email bounds and at-sign checks" {
 test "PersonInfo serialization" {
     const info = PersonInfo.init("  Nodus Dev  ", "dev@nodus.internal  ");
     const alloc = testing.allocator;
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
 
-    try info.serialize(buf.writer(alloc));
+    try info.serialize(sink.writer());
 
     const expected_slice = "\x09\x00Nodus Dev\x12\x00dev@nodus.internal";
-    try testing.expectEqualSlices(u8, expected_slice, buf.items);
+    try testing.expectEqualSlices(u8, expected_slice, sink.bytes());
 }
 
 test "Person deserialization round-trip" {
     const alloc = testing.allocator;
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try PersonInfo.init("User", "user@email.com").serialize(buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try PersonInfo.init("User", "user@email.com").serialize(sink.writer());
 
-    var mock_reader = MockReader{ .buffer = buf.items };
-    var person = try Person.deserialize(alloc, &mock_reader);
+    var reader = testing_io.fixedReader(sink.bytes());
+    var person = try Person.deserialize(alloc, &reader);
     defer person.deinit(alloc);
 
     try testing.expectEqualStrings("User", person.name);
@@ -576,7 +573,7 @@ test "Timezone.init rejects offsets outside the civil range" {
     try testing.expectEqual(Timezone{ .offset = 840 }, try Timezone.init(840)); // +14:00, valid (Kiribati)
     try testing.expectEqual(Timezone{ .offset = -720 }, try Timezone.init(-720)); // -12:00, valid (Baker Island)
 
-    // +18:00 isn't real — the old +/-1440 bound would have let this through
+    // +18:00 isn't real — the old +/-1440 bound would have let this through.
     try testing.expectError(error.InvalidTimezoneOffset, Timezone.init(18 * 60));
     try testing.expectError(error.InvalidTimezoneOffset, Timezone.init(841));
     try testing.expectError(error.InvalidTimezoneOffset, Timezone.init(-721));
@@ -619,15 +616,15 @@ test "Timezone serialization round-trips utc, offset, and unknown" {
     const cases = [_]Timezone{ .utc, .{ .offset = 330 }, .{ .offset = -300 }, .unknown };
 
     for (cases) |tz| {
-        var buf: ArrayList(u8) = .empty;
-        defer buf.deinit(alloc);
-        try tz.serialize(buf.writer(alloc));
+        var sink = testing_io.ByteSink.init(alloc);
+        defer sink.deinit();
+        try tz.serialize(sink.writer());
 
         // tag(1) + minutes(2)
-        try testing.expectEqual(@as(usize, 3), buf.items.len);
+        try testing.expectEqual(@as(usize, 3), sink.bytes().len);
 
-        var mock_reader = MockReader{ .buffer = buf.items };
-        const back = try Timezone.deserialize(&mock_reader);
+        var reader = testing_io.fixedReader(sink.bytes());
+        const back = try Timezone.deserialize(&reader);
         try testing.expectEqual(tz, back);
     }
 }
@@ -666,15 +663,15 @@ test "Signature serialization round-trips person, timestamp, and timezone" {
         .timezone = try Timezone.init(-300), // US Eastern
     };
 
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try info.serialize(buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try info.serialize(sink.writer());
 
     // name_len(2)+name(12) + email_len(2)+email(13) + timestamp(8) + tz_tag(1)+tz_minutes(2)
-    try testing.expectEqual(@as(usize, 2 + 12 + 2 + 13 + 8 + 1 + 2), buf.items.len);
+    try testing.expectEqual(@as(usize, 2 + 12 + 2 + 13 + 8 + 1 + 2), sink.bytes().len);
 
-    var mock_reader = MockReader{ .buffer = buf.items };
-    var sig = try Signature.deserialize(alloc, &mock_reader);
+    var reader = testing_io.fixedReader(sink.bytes());
+    var sig = try Signature.deserialize(alloc, &reader);
     defer sig.deinit(alloc);
 
     try testing.expectEqualStrings("Ada Lovelace", sig.person.name);
@@ -688,17 +685,17 @@ test "Signature serialization round-trips person, timestamp, and timezone" {
 
 test "Signature deserialize rejects an out-of-range timezone offset" {
     const alloc = testing.allocator;
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
 
-    try wire.writeBytes(u16, buf.writer(alloc), "User");
-    try wire.writeBytes(u16, buf.writer(alloc), "user@email.com");
-    try buf.writer(alloc).writeInt(i64, 1_000, .little);
-    try buf.writer(alloc).writeByte(1); // tag_offset
-    try buf.writer(alloc).writeInt(i16, 2000, .little); // out of civil range
+    try wire.writeBytes(u16, sink.writer(), "User");
+    try wire.writeBytes(u16, sink.writer(), "user@email.com");
+    try sink.writer().writeInt(i64, 1_000, .little);
+    try sink.writer().writeByte(1); // tag_offset
+    try sink.writer().writeInt(i16, 2000, .little); // out of civil range
 
-    var mock_reader = MockReader{ .buffer = buf.items };
-    try testing.expectError(error.InvalidTimezoneOffset, Signature.deserialize(alloc, &mock_reader));
+    var reader = testing_io.fixedReader(sink.bytes());
+    try testing.expectError(error.InvalidTimezoneOffset, Signature.deserialize(alloc, &reader));
 }
 
 test "Signature.samePerson / sameInstant / eql" {
@@ -739,12 +736,12 @@ test "CommitSignaturesInfo.soloAuthor mirrors author into committer" {
 
     try testing.expectEqualStrings("Bruce Wayne", info.committer.person.name);
 
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try info.serialize(buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try info.serialize(sink.writer());
 
-    var mock_reader = MockReader{ .buffer = buf.items };
-    var sigs = try CommitSignatures.deserialize(alloc, &mock_reader);
+    var reader = testing_io.fixedReader(sink.bytes());
+    var sigs = try CommitSignatures.deserialize(alloc, &reader);
     defer sigs.deinit(alloc);
 
     try testing.expectEqualStrings("Bruce Wayne", sigs.author.person.name);
@@ -768,12 +765,12 @@ test "CommitSignaturesInfo.init keeps a distinct committer with its own timezone
         },
     );
 
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try info.serialize(buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try info.serialize(sink.writer());
 
-    var mock_reader = MockReader{ .buffer = buf.items };
-    var sigs = try CommitSignatures.deserialize(alloc, &mock_reader);
+    var reader = testing_io.fixedReader(sink.bytes());
+    var sigs = try CommitSignatures.deserialize(alloc, &reader);
     defer sigs.deinit(alloc);
 
     try testing.expectEqualStrings("Alan Turing", sigs.author.person.name);
@@ -797,12 +794,12 @@ test "CommitSignatures round-trips a genuinely unknown committer timezone" {
         },
     );
 
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try info.serialize(buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try info.serialize(sink.writer());
 
-    var mock_reader = MockReader{ .buffer = buf.items };
-    var sigs = try CommitSignatures.deserialize(alloc, &mock_reader);
+    var reader = testing_io.fixedReader(sink.bytes());
+    var sigs = try CommitSignatures.deserialize(alloc, &reader);
     defer sigs.deinit(alloc);
 
     try testing.expectEqual(Timezone.unknown, sigs.committer.timezone);
@@ -837,10 +834,6 @@ test "benchmark timezone parsing: parseInt vs manual ASCII" {
         _ = sign * (hours * 60 + mins);
     }
     const elapsed_manual = timer.read();
-
-    // std.debug.print("\n--- Timezone Parsing Benchmark ({d} iterations) ---\n", .{iterations});
-    // std.debug.print("std.fmt.parseInt : {d} ns total ({d} ns/op)\n", .{ elapsed_parseint, elapsed_parseint / iterations });
-    // std.debug.print("Manual ASCII     : {d} ns total ({d} ns/op)\n", .{ elapsed_manual, elapsed_manual / iterations });
 
     try testing.expect(elapsed_manual < elapsed_parseint);
 }

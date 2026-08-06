@@ -1,14 +1,15 @@
-//!NOTE: merk doesn't verify signatures itself; it stores and returns them
-//! opaquely so external tooling (a keyring-aware CLI, `merk verify`,
-//! CI policy checks, ...) can do that against whatever keyring it
-//! trusts.
+//! NOTE: merk doesn't verify signatures itself; it stores and returns
+//! them opaquely so external tooling (a keyring-aware CLI, `merk
+//! verify`, CI policy checks, ...) can do that against whatever
+//! keyring it trusts.
 
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
+const Io = std.Io;
 
 const wire = @import("wire.zig");
+const testing_io = @import("testing.zig");
 
 pub const SignatureError = error{
     EmptyKeyId,
@@ -17,7 +18,7 @@ pub const SignatureError = error{
     SignatureBytesTooLong,
 };
 
-/// Which cryptographic scheme produced the signature bytes
+/// Which cryptographic scheme produced the signature bytes.
 pub const SignatureAlgorithm = enum(u8) {
     ssh_ed25519 = 0,
     ssh_rsa = 1,
@@ -29,12 +30,12 @@ pub const SignatureInfo = struct {
     algorithm: SignatureAlgorithm,
 
     /// Raw signature bytes, in whatever encoding `algorithm` produces
-    /// (e.g. an SSH SIGNATURE blob, a detached OpenPGP signature)
+    /// (e.g. an SSH SIGNATURE blob, a detached OpenPGP signature).
     bytes: []const u8,
 
     /// Fingerprint / key ID / certificate footprint identifying the
     /// signing key. Opaque to merk, just enough for a verifier to know
-    /// which key to check against
+    /// which key to check against.
     key_id: []const u8,
 
     pub fn validate(self: SignatureInfo) SignatureError!void {
@@ -44,7 +45,7 @@ pub const SignatureInfo = struct {
         if (self.bytes.len > std.math.maxInt(u32)) return error.SignatureBytesTooLong;
     }
 
-    pub fn serialize(self: SignatureInfo, writer: anytype) !void {
+    pub fn serialize(self: SignatureInfo, writer: *Io.Writer) !void {
         try self.validate();
         try writer.writeByte(@intFromEnum(self.algorithm));
         try wire.writeBytes(u8, writer, self.key_id);
@@ -53,17 +54,16 @@ pub const SignatureInfo = struct {
 };
 
 /// An owned, deep-copied signature as read back from storage. Free with
-/// `.deinit`
+/// `.deinit`.
 pub const Signature = struct {
     algorithm: SignatureAlgorithm,
     bytes: []u8,
     key_id: []u8,
 
-    pub fn deserialize(alloc: Allocator, reader: anytype) !Signature {
-        const algorithm = std.meta.intToEnum(
-            SignatureAlgorithm,
-            try reader.takeByte(),
-        ) catch return error.CorruptSignature;
+    pub fn deserialize(alloc: Allocator, reader: *Io.Reader) !Signature {
+        const raw_algorithm = try reader.takeByte();
+        const algorithm = std.meta.intToEnum(SignatureAlgorithm, raw_algorithm) catch
+            return error.CorruptSignature;
 
         const key_id = try wire.readBytesAlloc(u8, alloc, reader);
         errdefer alloc.free(key_id);
@@ -100,13 +100,12 @@ test "SignatureInfo serialize/deserialize round-trip" {
         .key_id = "0xDEADBEEF",
     };
 
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try info.serialize(buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try info.serialize(sink.writer());
 
-    const MockReader = @import("testing.zig").MockReader;
-    var mock_reader = MockReader{ .buffer = buf.items };
-    var sig = try Signature.deserialize(alloc, &mock_reader);
+    var reader = testing_io.fixedReader(sink.bytes());
+    var sig = try Signature.deserialize(alloc, &reader);
     defer sig.deinit(alloc);
 
     try testing.expectEqual(SignatureAlgorithm.pgp_ed25519, sig.algorithm);
@@ -116,14 +115,13 @@ test "SignatureInfo serialize/deserialize round-trip" {
 
 test "Signature deserialize rejects an out-of-range algorithm byte" {
     const alloc = testing.allocator;
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
 
-    try buf.append(alloc, 200); // not a valid SignatureAlgorithm
-    try wire.writeBytes(u8, buf.writer(alloc), "key");
-    try wire.writeBytes(u32, buf.writer(alloc), "sig");
+    try sink.writer().writeByte(200); // not a valid SignatureAlgorithm
+    try wire.writeBytes(u8, sink.writer(), "key");
+    try wire.writeBytes(u32, sink.writer(), "sig");
 
-    const MockReader = @import("testing.zig").MockReader;
-    var mock_reader = MockReader{ .buffer = buf.items };
-    try testing.expectError(error.CorruptSignature, Signature.deserialize(alloc, &mock_reader));
+    var reader = testing_io.fixedReader(sink.bytes());
+    try testing.expectError(error.CorruptSignature, Signature.deserialize(alloc, &reader));
 }

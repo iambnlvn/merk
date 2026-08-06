@@ -1,11 +1,11 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
+const Io = std.Io;
 
 const crypto = @import("crypto");
-
 const wire = @import("wire.zig");
+const testing_io = @import("testing.zig");
 
 const Hash = crypto.Hash;
 
@@ -14,7 +14,7 @@ pub const MAX_PARENTS: u8 = 255;
 
 /// Why this parent edge exists. `.normal` is the ordinary
 /// single-parent case and is the default — most commits never need to
-/// think about this at all
+/// think about this at all.
 pub const ParentKind = enum(u8) {
     normal = 0,
     merge = 1,
@@ -27,17 +27,17 @@ pub const ParentInfo = struct {
     hash: Hash,
     kind: ParentKind = .normal,
 
-    pub fn serialize(self: ParentInfo, writer: anytype) !void {
+    pub fn serialize(self: ParentInfo, writer: *Io.Writer) !void {
         try writer.writeAll(&self.hash);
         try writer.writeByte(@intFromEnum(self.kind));
     }
 
-    pub fn deserialize(reader: anytype) !ParentInfo {
-        const hash_bytes = try reader.take(32);
+    pub fn deserialize(reader: *Io.Reader) !ParentInfo {
         var hash: Hash = undefined;
-        @memcpy(&hash, hash_bytes);
+        try reader.readSliceAll(&hash);
 
-        const kind = std.meta.intToEnum(ParentKind, try reader.takeByte()) catch return error.CorruptCommit;
+        const raw_kind = try reader.takeByte();
+        const kind = std.meta.intToEnum(ParentKind, raw_kind) catch return error.CorruptCommit;
 
         return .{ .hash = hash, .kind = kind };
     }
@@ -47,7 +47,7 @@ pub fn validate(parents: []const ParentInfo) ParentError!void {
     if (parents.len > MAX_PARENTS) return error.TooManyParents;
 }
 
-pub fn serializeAll(parents: []const ParentInfo, writer: anytype) !void {
+pub fn serializeAll(parents: []const ParentInfo, writer: *Io.Writer) !void {
     try validate(parents);
     try wire.writeList(ParentInfo, u8, writer, parents);
 }
@@ -56,7 +56,7 @@ pub fn serializeAll(parents: []const ParentInfo, writer: anytype) !void {
 /// `alloc.free`. `ParentInfo` is a fixed-size record with no owned
 /// sub-allocations, so `wire.readListAlloc` (rather than the
 /// allocator-aware `readOwningListAlloc`) is the right fit.
-pub fn deserializeAllAlloc(alloc: Allocator, reader: anytype) ![]ParentInfo {
+pub fn deserializeAllAlloc(alloc: Allocator, reader: *Io.Reader) ![]ParentInfo {
     return wire.readListAlloc(ParentInfo, u8, alloc, reader);
 }
 
@@ -71,16 +71,15 @@ test "ParentInfo serialize/deserialize round-trip preserves kind" {
     const info = ParentInfo{ .hash = hash, .kind = .merge };
 
     const alloc = testing.allocator;
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try info.serialize(buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try info.serialize(sink.writer());
 
     // 32 bytes hash + 1 byte kind
-    try testing.expectEqual(@as(usize, 33), buf.items.len);
+    try testing.expectEqual(@as(usize, 33), sink.bytes().len);
 
-    const MockReader = @import("testing.zig").MockReader;
-    var mock_reader = MockReader{ .buffer = buf.items };
-    const decoded = try ParentInfo.deserialize(&mock_reader);
+    var reader = testing_io.fixedReader(sink.bytes());
+    const decoded = try ParentInfo.deserialize(&reader);
 
     try testing.expectEqualSlices(u8, &hash, &decoded.hash);
     try testing.expectEqual(ParentKind.merge, decoded.kind);
@@ -88,15 +87,14 @@ test "ParentInfo serialize/deserialize round-trip preserves kind" {
 
 test "deserialize rejects an out-of-range kind byte" {
     const alloc = testing.allocator;
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
 
-    try buf.appendSlice(alloc, &([_]u8{0xFF} ** 32));
-    try buf.append(alloc, 99); // not a valid ParentKind
+    try sink.writer().writeAll(&([_]u8{0xFF} ** 32));
+    try sink.writer().writeByte(99); // not a valid ParentKind
 
-    const MockReader = @import("testing.zig").MockReader;
-    var mock_reader = MockReader{ .buffer = buf.items };
-    try testing.expectError(error.CorruptCommit, ParentInfo.deserialize(&mock_reader));
+    var reader = testing_io.fixedReader(sink.bytes());
+    try testing.expectError(error.CorruptCommit, ParentInfo.deserialize(&reader));
 }
 
 test "validate rejects more than MAX_PARENTS, accepts exactly MAX_PARENTS" {
@@ -121,13 +119,12 @@ test "serializeAll/deserializeAllAlloc round-trip with mixed kinds, in order" {
         .{ .hash = [_]u8{3} ** 32, .kind = .cherry_pick },
     };
 
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try serializeAll(&parents, buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try serializeAll(&parents, sink.writer());
 
-    const MockReader = @import("testing.zig").MockReader;
-    var mock_reader = MockReader{ .buffer = buf.items };
-    const decoded = try deserializeAllAlloc(alloc, &mock_reader);
+    var reader = testing_io.fixedReader(sink.bytes());
+    const decoded = try deserializeAllAlloc(alloc, &reader);
     defer alloc.free(decoded);
 
     try testing.expectEqual(@as(usize, 3), decoded.len);
@@ -143,7 +140,7 @@ test "serializeAll rejects TooManyParents before writing anything" {
     defer alloc.free(too_many);
     @memset(too_many, ParentInfo{ .hash = [_]u8{0} ** 32 });
 
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try testing.expectError(error.TooManyParents, serializeAll(too_many, buf.writer(alloc)));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try testing.expectError(error.TooManyParents, serializeAll(too_many, sink.writer()));
 }

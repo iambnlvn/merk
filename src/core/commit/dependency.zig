@@ -1,10 +1,10 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
+const Io = std.Io;
 
 const wire = @import("wire.zig");
-const MockReader = @import("testing.zig").MockReader;
+const testing_io = @import("testing.zig");
 const metadata = @import("./metadata.zig");
 
 const ChangeId = metadata.ChangeId;
@@ -46,18 +46,17 @@ pub const DependencyInfo = struct {
         return self.kind == other.kind and std.mem.eql(u8, &self.change_id, &other.change_id);
     }
 
-    pub fn serialize(self: DependencyInfo, writer: anytype) !void {
+    pub fn serialize(self: DependencyInfo, writer: *Io.Writer) !void {
         try writer.writeByte(@intFromEnum(self.kind));
         try writer.writeAll(&self.change_id);
     }
 
-    pub fn deserialize(reader: anytype) !DependencyInfo {
+    pub fn deserialize(reader: *Io.Reader) !DependencyInfo {
         const raw_kind = try reader.takeByte();
         const kind = std.meta.intToEnum(DependencyKind, raw_kind) catch return error.CorruptCommit;
 
-        const bytes = try reader.take(16);
         var change_id: ChangeId = undefined;
-        @memcpy(&change_id, bytes);
+        try reader.readSliceAll(&change_id);
 
         return .{
             .change_id = change_id,
@@ -91,14 +90,14 @@ pub fn validate(deps: []const DependencyInfo, self_id: ?ChangeId) DependencyErro
 }
 
 /// Validates and writes all dependency entries to the binary stream.
-pub fn serializeAll(deps: []const DependencyInfo, self_id: ?ChangeId, writer: anytype) !void {
+pub fn serializeAll(deps: []const DependencyInfo, self_id: ?ChangeId, writer: *Io.Writer) !void {
     try validate(deps, self_id);
     try wire.writeList(DependencyInfo, u8, writer, deps);
 }
 
 /// Deserializes a list of `DependencyInfo` from the binary stream.
 /// Caller frees the returned slice with `alloc.free`. No per-element frees are needed.
-pub fn deserializeAllAlloc(alloc: Allocator, reader: anytype) ![]DependencyInfo {
+pub fn deserializeAllAlloc(alloc: Allocator, reader: *Io.Reader) ![]DependencyInfo {
     return wire.readListAlloc(DependencyInfo, u8, alloc, reader);
 }
 
@@ -145,24 +144,24 @@ test "DependencyInfo serialize/deserialize preserves kind and change_id" {
     const cid: ChangeId = [_]u8{0x5A} ** 16;
     const info = DependencyInfo.init(cid, .conflicts);
 
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try info.serialize(buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try info.serialize(sink.writer());
 
     // kind (1 byte) + change_id (16 bytes) = 17 bytes
-    try testing.expectEqual(@as(usize, 17), buf.items.len);
-    try testing.expectEqual(@as(u8, @intFromEnum(DependencyKind.conflicts)), buf.items[0]);
+    try testing.expectEqual(@as(usize, 17), sink.bytes().len);
+    try testing.expectEqual(@as(u8, @intFromEnum(DependencyKind.conflicts)), sink.bytes()[0]);
 
-    var mock_reader = MockReader{ .buffer = buf.items };
-    const decoded = try DependencyInfo.deserialize(&mock_reader);
+    var reader = testing_io.fixedReader(sink.bytes());
+    const decoded = try DependencyInfo.deserialize(&reader);
     try testing.expect(info.eql(decoded));
 }
 
 test "DependencyInfo deserialize rejects invalid kind enum tag" {
     const corrupt_data = "\xFF" ** 17; // 0xFF is an invalid DependencyKind enum tag
-    var mock_reader = MockReader{ .buffer = corrupt_data };
+    var reader = testing_io.fixedReader(corrupt_data);
 
-    try testing.expectError(error.CorruptCommit, DependencyInfo.deserialize(&mock_reader));
+    try testing.expectError(error.CorruptCommit, DependencyInfo.deserialize(&reader));
 }
 
 test "serializeAll/deserializeAllAlloc round-trip multiple dependency kinds" {
@@ -174,16 +173,16 @@ test "serializeAll/deserializeAllAlloc round-trip multiple dependency kinds" {
         .init([_]u8{0xCC} ** 16, .obsoletes),
     };
 
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try serializeAll(&deps, null, buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try serializeAll(&deps, null, sink.writer());
 
     // count(1 byte) + 3 * (kind(1 byte) + change_id(16 bytes)) = 1 + 3 * 17 = 52
-    try testing.expectEqual(@as(usize, 1 + 3 * 17), buf.items.len);
-    try testing.expectEqual(@as(u8, 3), buf.items[0]);
+    try testing.expectEqual(@as(usize, 1 + 3 * 17), sink.bytes().len);
+    try testing.expectEqual(@as(u8, 3), sink.bytes()[0]);
 
-    var mock_reader = MockReader{ .buffer = buf.items };
-    const back = try deserializeAllAlloc(alloc, &mock_reader);
+    var reader = testing_io.fixedReader(sink.bytes());
+    const back = try deserializeAllAlloc(alloc, &reader);
     defer alloc.free(back);
 
     try testing.expectEqual(@as(usize, 3), back.len);
@@ -195,15 +194,15 @@ test "serializeAll/deserializeAllAlloc round-trip multiple dependency kinds" {
 test "serializeAll/deserializeAllAlloc round-trip zero dependencies" {
     const alloc = testing.allocator;
 
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try serializeAll(&.{}, null, buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try serializeAll(&.{}, null, sink.writer());
 
-    try testing.expectEqual(@as(usize, 1), buf.items.len);
-    try testing.expectEqual(@as(u8, 0), buf.items[0]);
+    try testing.expectEqual(@as(usize, 1), sink.bytes().len);
+    try testing.expectEqual(@as(u8, 0), sink.bytes()[0]);
 
-    var mock_reader = MockReader{ .buffer = buf.items };
-    const back = try deserializeAllAlloc(alloc, &mock_reader);
+    var reader = testing_io.fixedReader(sink.bytes());
+    const back = try deserializeAllAlloc(alloc, &reader);
     defer alloc.free(back);
 
     try testing.expectEqual(@as(usize, 0), back.len);
@@ -217,10 +216,10 @@ test "serializeAll rejects a duplicate before writing anything" {
         .init(cid, .requires),
     };
 
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try testing.expectError(error.DuplicateDependency, serializeAll(&deps, null, buf.writer(alloc)));
-    try testing.expectEqual(@as(usize, 0), buf.items.len);
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try testing.expectError(error.DuplicateDependency, serializeAll(&deps, null, sink.writer()));
+    try testing.expectEqual(@as(usize, 0), sink.bytes().len);
 }
 
 test "DependencyInfo.eql checks both kind and change_id" {

@@ -1,10 +1,10 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
 const Io = std.Io;
 
 const wire = @import("wire.zig");
+const testing_io = @import("testing.zig");
 
 /// Wire tag for an `Intent`. Variant tags are pinned explicitly so that
 /// on-disk ordering stays consistent regardless of union field sequence.
@@ -316,9 +316,8 @@ pub const CommitMetadataInfo = struct {
         try writer.writeAll(&self.change_id);
 
         const ts = wire.resolveTimestampMs(self.timestamp_ms);
-        var ts_buf: [8]u8 = undefined;
-        std.mem.writeInt(i64, &ts_buf, ts, .little);
-        try writer.writeAll(&ts_buf);
+        try writer.writeInt(i64, ts, .little);
+
         try self.intent.serialize(writer);
         try wire.writeStringArray(u16, u16, writer, self.labels);
     }
@@ -327,8 +326,7 @@ pub const CommitMetadataInfo = struct {
         var change_id: ChangeId = undefined;
         try reader.readSliceAll(&change_id);
 
-        const ts_arr = try reader.takeArray(8);
-        const timestamp_ms = std.mem.readInt(i64, ts_arr, .little);
+        const timestamp_ms = try reader.takeInt(i64, .little);
 
         var commit_intent = try Intent.deserialize(alloc, reader);
         errdefer commit_intent.deinit(alloc);
@@ -620,11 +618,11 @@ test "CommitMetadataInfo serialization layout" {
         .labels = &labels,
     };
 
-    var aw: Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
+    var sink = testing_io.ByteSink.init(allocator);
+    defer sink.deinit();
 
-    try info.serialize(&aw.writer);
-    const payload = aw.written();
+    try info.serialize(sink.writer());
+    const payload = sink.bytes();
 
     try testing.expectEqualSlices(u8, &change_id, payload[0..16]);
 
@@ -635,29 +633,23 @@ test "CommitMetadataInfo serialization layout" {
 test "CommitMetadata deserialization - successful lifecycle" {
     const allocator = std.testing.allocator;
 
-    var aw: Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
+    var sink = testing_io.ByteSink.init(allocator);
+    defer sink.deinit();
 
     const target_change_id: ChangeId = [_]u8{0xCD} ** 16;
     const target_ts: i64 = 987654321;
     const target_intent: Intent = .fix;
     const label_text = "critical-bug";
 
-    const w = &aw.writer;
+    const w = sink.writer();
     try w.writeAll(&target_change_id);
-    var ts_buf: [8]u8 = undefined;
-    std.mem.writeInt(i64, &ts_buf, target_ts, .little);
-    try w.writeAll(&ts_buf);
+    try w.writeInt(i64, target_ts, .little);
     try w.writeByte(@intFromEnum(IntentTag.fix));
-    var count_buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, &count_buf, 1, .little);
-    try w.writeAll(&count_buf);
-    var len_buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, &len_buf, @intCast(label_text.len), .little);
-    try w.writeAll(&len_buf);
+    try w.writeInt(u16, 1, .little);
+    try w.writeInt(u16, @intCast(label_text.len), .little);
     try w.writeAll(label_text);
 
-    var reader: Io.Reader = .fixed(aw.written());
+    var reader = testing_io.fixedReader(sink.bytes());
     var meta = try CommitMetadataInfo.deserialize(allocator, &reader);
     defer meta.deinit(allocator);
 
@@ -671,20 +663,16 @@ test "CommitMetadata deserialization - successful lifecycle" {
 test "CommitMetadata deserialization - corrupt enum safety check" {
     const allocator = std.testing.allocator;
 
-    var aw: Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
+    var sink = testing_io.ByteSink.init(allocator);
+    defer sink.deinit();
 
-    const w = &aw.writer;
+    const w = sink.writer();
     try w.writeAll(&([_]u8{0} ** 16));
-    var ts_buf: [8]u8 = undefined;
-    std.mem.writeInt(i64, &ts_buf, 12345, .little);
-    try w.writeAll(&ts_buf);
+    try w.writeInt(i64, 12345, .little);
     try w.writeByte(99); // 99 is out-of-bounds for IntentTag
-    var count_buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, &count_buf, 0, .little);
-    try w.writeAll(&count_buf);
+    try w.writeInt(u16, 0, .little);
 
-    var reader: Io.Reader = .fixed(aw.written());
+    var reader = testing_io.fixedReader(sink.bytes());
     try testing.expectError(error.CorruptCommit, CommitMetadataInfo.deserialize(allocator, &reader));
 }
 
@@ -699,11 +687,11 @@ test "CommitMetadataInfo serialize -> deserialize round trip" {
         .labels = &labels,
     };
 
-    var aw: Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    try original.serialize(&aw.writer);
+    var sink = testing_io.ByteSink.init(allocator);
+    defer sink.deinit();
+    try original.serialize(sink.writer());
 
-    var reader: Io.Reader = .fixed(aw.written());
+    var reader = testing_io.fixedReader(sink.bytes());
     var round_tripped = try CommitMetadataInfo.deserialize(allocator, &reader);
     defer round_tripped.deinit(allocator);
 
@@ -727,11 +715,11 @@ test "CommitMetadataInfo serialize -> deserialize round trip with custom intent"
         .labels = &labels,
     };
 
-    var aw: Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    try original.serialize(&aw.writer);
+    var sink = testing_io.ByteSink.init(allocator);
+    defer sink.deinit();
+    try original.serialize(sink.writer());
 
-    var reader: Io.Reader = .fixed(aw.written());
+    var reader = testing_io.fixedReader(sink.bytes());
     var round_tripped = try CommitMetadataInfo.deserialize(allocator, &reader);
     defer round_tripped.deinit(allocator);
 
@@ -776,11 +764,11 @@ test "CommitMetadataInfo serialization - zero labels" {
         .labels = &.{},
     };
 
-    var aw: Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    try info.serialize(&aw.writer);
+    var sink = testing_io.ByteSink.init(allocator);
+    defer sink.deinit();
+    try info.serialize(sink.writer());
 
-    var reader: Io.Reader = .fixed(aw.written());
+    var reader = testing_io.fixedReader(sink.bytes());
     var meta = try CommitMetadataInfo.deserialize(allocator, &reader);
     defer meta.deinit(allocator);
 

@@ -12,20 +12,20 @@
 
 const std = @import("std");
 const testing = std.testing;
-const ArrayList = std.ArrayList;
+const Io = std.Io;
 
 const crypto = @import("crypto");
+const testing_io = @import("testing.zig");
 
 const Hash = crypto.Hash;
 
-pub fn serialize(root: Hash, writer: anytype) !void {
+pub fn serialize(root: Hash, writer: *Io.Writer) !void {
     try writer.writeAll(&root);
 }
 
-pub fn deserialize(reader: anytype) !Hash {
-    const bytes = try reader.take(32);
+pub fn deserialize(reader: *Io.Reader) !Hash {
     var root: Hash = undefined;
-    @memcpy(&root, bytes);
+    try reader.readSliceAll(&root);
     return root;
 }
 
@@ -33,36 +33,31 @@ test "serialize writes exactly 32 bytes, unmodified" {
     const root: Hash = [_]u8{0x42} ** 32;
 
     const alloc = testing.allocator;
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try serialize(root, buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try serialize(root, sink.writer());
 
-    try testing.expectEqual(@as(usize, 32), buf.items.len);
-    try testing.expectEqualSlices(u8, &root, buf.items);
+    try testing.expectEqual(@as(usize, 32), sink.bytes().len);
+    try testing.expectEqualSlices(u8, &root, sink.bytes());
 }
 
 test "serialize/deserialize round-trip" {
     const root: Hash = [_]u8{0x7E} ** 32;
 
     const alloc = testing.allocator;
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try serialize(root, buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try serialize(root, sink.writer());
 
-    const MockReader = @import("testing.zig").MockReader;
-    var mock_reader = MockReader{ .buffer = buf.items };
-    const decoded = try deserialize(&mock_reader);
+    var reader = testing_io.fixedReader(sink.bytes());
+    const decoded = try deserialize(&reader);
 
     try testing.expectEqualSlices(u8, &root, &decoded);
 }
 
 test "deserialize rejects truncated input" {
-    const alloc = testing.allocator;
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try buf.appendSlice(alloc, &([_]u8{0} ** 16)); // half a hash
+    const half_hash = [_]u8{0} ** 16;
 
-    const MockReader = @import("testing.zig").MockReader;
-    var mock_reader = MockReader{ .buffer = buf.items };
-    try testing.expectError(error.EndOfStream, deserialize(&mock_reader));
+    var reader = testing_io.fixedReader(&half_hash);
+    try testing.expectError(error.EndOfStream, deserialize(&reader));
 }

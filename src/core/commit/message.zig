@@ -1,12 +1,12 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
+const Io = std.Io;
 
 const wire = @import("wire.zig");
-const MockReader = @import("testing.zig").MockReader;
+const testing_io = @import("testing.zig");
 
-const MessageError = error{
+pub const MessageError = error{
     EmptyCommitMessage,
     TitleTooLong,
     BodyTooLong,
@@ -42,7 +42,7 @@ pub const TrailerInfo = struct {
         }
     }
 
-    pub fn serialize(self: TrailerInfo, writer: anytype) !void {
+    pub fn serialize(self: TrailerInfo, writer: *Io.Writer) !void {
         try self.validate();
         try wire.writeBytes(u8, writer, self.key);
         try wire.writeBytes(u16, writer, self.value);
@@ -53,7 +53,7 @@ pub const Trailer = struct {
     key: []u8,
     value: []u8,
 
-    pub fn deserialize(alloc: Allocator, reader: anytype) !Trailer {
+    pub fn deserialize(alloc: Allocator, reader: *Io.Reader) !Trailer {
         const key = try wire.readBytesAlloc(u8, alloc, reader);
         errdefer alloc.free(key);
 
@@ -78,7 +78,7 @@ pub const Trailer = struct {
 /// anything itself — this is a label so downstream tooling (a UI, a
 /// terminal renderer, an export to some other format) knows how to
 /// interpret the bytes instead of assuming UTF-8 and mangling
-/// legacy/localized commit messages
+/// legacy/localized commit messages.
 pub const Encoding = enum(u8) {
     utf8 = 0,
     ascii = 1,
@@ -93,7 +93,7 @@ pub const MessageInfo = struct {
     body: []const u8 = "",
 
     /// Character encoding of `title`/`body`. Defaults to UTF-8, which
-    /// is what merk assumes unless told otherwise
+    /// is what merk assumes unless told otherwise.
     encoding: Encoding = .utf8,
 
     /// Structured trailers appended after the body.
@@ -101,7 +101,7 @@ pub const MessageInfo = struct {
     trailers: []const TrailerInfo = &.{},
 
     /// Trimmed title/body, computed once so `validate`, `serialize`, and
-    /// `Message.initDupe` all agree on what "trimmed" means
+    /// `Message.initDupe` all agree on what "trimmed" means.
     fn trimmed(self: MessageInfo) struct { title: []const u8, body: []const u8 } {
         return .{
             .title = std.mem.trim(u8, self.title, " \t\r\n"),
@@ -117,7 +117,7 @@ pub const MessageInfo = struct {
         if (t.body.len > std.math.maxInt(u32)) return error.BodyTooLong;
         if (self.trailers.len > std.math.maxInt(u8)) return error.TooManyTrailers;
 
-        // Prevent header injection and malformed commit titles by blocking newlines/nulls
+        // Prevent header injection and malformed commit titles by blocking newlines/nulls.
         const illegal_title_chars = &[_]u8{ '\n', '\r', '\x00' };
         if (std.mem.indexOfAny(u8, t.title, illegal_title_chars) != null)
             return error.TitleContainsIllegalCharacters;
@@ -125,7 +125,7 @@ pub const MessageInfo = struct {
         for (self.trailers) |trailer_info| try trailer_info.validate();
     }
 
-    pub fn serialize(self: MessageInfo, writer: anytype) !void {
+    pub fn serialize(self: MessageInfo, writer: *Io.Writer) !void {
         try self.validate();
 
         try writer.writeByte(@intFromEnum(self.encoding));
@@ -181,11 +181,9 @@ pub const Message = struct {
         };
     }
 
-    pub fn deserialize(alloc: Allocator, reader: anytype) !Message {
-        const encoding = std.meta.intToEnum(
-            Encoding,
-            try reader.takeByte(),
-        ) catch return error.CorruptCommit;
+    pub fn deserialize(alloc: Allocator, reader: *Io.Reader) !Message {
+        const raw_encoding = try reader.takeByte();
+        const encoding = std.meta.intToEnum(Encoding, raw_encoding) catch return error.CorruptCommit;
 
         const title = try wire.readBytesAlloc(u16, alloc, reader);
         errdefer alloc.free(title);
@@ -277,15 +275,15 @@ test "MessageInfo serialization format - no trailers" {
         .body = " resolved ",
     };
     const alloc = testing.allocator;
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
 
-    try info.serialize(buf.writer(alloc));
+    try info.serialize(sink.writer());
 
     // encoding byte (utf8 = 0) + u16 title len + title + u32 body len + body
     // + u8 trailer count (0)
     const expected = "\x00\x16\x00fix(core): memory leak\x08\x00\x00\x00resolved\x00";
-    try testing.expectEqualSlices(u8, expected, buf.items);
+    try testing.expectEqualSlices(u8, expected, sink.bytes());
 }
 
 test "MessageInfo serialization records a non-default encoding" {
@@ -294,14 +292,14 @@ test "MessageInfo serialization records a non-default encoding" {
         .encoding = .latin1,
     };
     const alloc = testing.allocator;
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try info.serialize(buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try info.serialize(sink.writer());
 
-    try testing.expectEqual(@as(u8, 2), buf.items[0]);
+    try testing.expectEqual(@as(u8, 2), sink.bytes()[0]);
 
-    var mock_reader = MockReader{ .buffer = buf.items };
-    var msg = try Message.deserialize(alloc, &mock_reader);
+    var reader = testing_io.fixedReader(sink.bytes());
+    var msg = try Message.deserialize(alloc, &reader);
     defer msg.deinit(alloc);
     try testing.expectEqual(Encoding.latin1, msg.encoding);
 }
@@ -317,13 +315,13 @@ test "MessageInfo serialization format - with trailers" {
         .trailers = &trailers,
     };
     const alloc = testing.allocator;
-    var buf: ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    try info.serialize(buf.writer(alloc));
+    var sink = testing_io.ByteSink.init(alloc);
+    defer sink.deinit();
+    try info.serialize(sink.writer());
 
     // Deserialise and check round-trip
-    var mock_reader = MockReader{ .buffer = buf.items };
-    var msg = try Message.deserialize(alloc, &mock_reader);
+    var reader = testing_io.fixedReader(sink.bytes());
+    var msg = try Message.deserialize(alloc, &reader);
     defer msg.deinit(alloc);
 
     try testing.expectEqualStrings("fix: patch the thing", msg.title);
@@ -421,8 +419,8 @@ test "Message deserialization from binary stream - legacy no trailers" {
 
     const serialized_data = "\x00\x11\x00refactor: storage\x04\x00\x00\x00done\x00";
 
-    var mock_reader = MockReader{ .buffer = serialized_data };
-    var msg = try Message.deserialize(allocator, &mock_reader);
+    var reader = testing_io.fixedReader(serialized_data);
+    var msg = try Message.deserialize(allocator, &reader);
     defer msg.deinit(allocator);
 
     try std.testing.expectEqualStrings("refactor: storage", msg.title);
