@@ -49,20 +49,15 @@ pub fn validate(parents: []const ParentInfo) ParentError!void {
 
 pub fn serializeAll(parents: []const ParentInfo, writer: anytype) !void {
     try validate(parents);
-    try wire.writeCount(u8, writer, parents.len);
-    for (parents) |p| try p.serialize(writer);
+    try wire.writeList(ParentInfo, u8, writer, parents);
 }
 
 /// Deserialize into a freshly allocated, owned slice. Caller frees with
-/// `alloc.free`.
+/// `alloc.free`. `ParentInfo` is a fixed-size record with no owned
+/// sub-allocations, so `wire.readListAlloc` (rather than the
+/// allocator-aware `readOwningListAlloc`) is the right fit.
 pub fn deserializeAllAlloc(alloc: Allocator, reader: anytype) ![]ParentInfo {
-    const len = try wire.readCount(u8, reader);
-    const parents = try alloc.alloc(ParentInfo, len);
-    errdefer alloc.free(parents);
-
-    for (parents) |*p| p.* = try ParentInfo.deserialize(reader);
-
-    return parents;
+    return wire.readListAlloc(ParentInfo, u8, alloc, reader);
 }
 
 test "ParentInfo defaults to .normal when not specified" {

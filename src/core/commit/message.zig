@@ -135,8 +135,7 @@ pub const MessageInfo = struct {
         try wire.writeBytes(u32, writer, t.body);
 
         // trailers (u8 count, then each key/value)
-        try wire.writeCount(u8, writer, self.trailers.len);
-        for (self.trailers) |trailer_info| try trailer_info.serialize(writer);
+        try wire.writeList(TrailerInfo, u8, writer, self.trailers);
     }
 };
 
@@ -194,16 +193,16 @@ pub const Message = struct {
         const body = try wire.readBytesAlloc(u32, alloc, reader);
         errdefer alloc.free(body);
 
-        const trailer_count = try wire.readCount(u8, reader);
-        const trailers = try alloc.alloc(Trailer, trailer_count);
-        var initialized: usize = 0;
+        // Same "count-prefixed, self-deserializing, owning items" shape
+        // as any other wire list of allocation-owning elements — see
+        // `wire.readOwningListAlloc`'s doc comment. The `errdefer` here
+        // covers the `info.validate()` call below: if that fails after
+        // every trailer already decoded successfully, they still need
+        // freeing, which is outside `readOwningListAlloc`'s own scope.
+        const trailers = try wire.readOwningListAlloc(Trailer, u8, alloc, reader);
         errdefer {
-            for (trailers[0..initialized]) |*t| t.deinit(alloc);
+            for (trailers) |*t| t.deinit(alloc);
             alloc.free(trailers);
-        }
-
-        while (initialized < trailer_count) : (initialized += 1) {
-            trailers[initialized] = try Trailer.deserialize(alloc, reader);
         }
 
         // Re-validate title after allocation (body and trailers already validated
@@ -418,16 +417,16 @@ test "Message lifecycle via initDupe" {
 }
 
 test "Message deserialization from binary stream - legacy no trailers" {
-    const allocator = testing.allocator;
-    // Wire format with encoding byte (utf8 = 0) and 0 trailers
-    const serialized_data = "\x00\x0c\x00refactor: io\x04\x00\x00\x00done\x00";
+    const allocator = std.testing.allocator;
+
+    const serialized_data = "\x00\x11\x00refactor: storage\x04\x00\x00\x00done\x00";
 
     var mock_reader = MockReader{ .buffer = serialized_data };
     var msg = try Message.deserialize(allocator, &mock_reader);
     defer msg.deinit(allocator);
 
-    try testing.expectEqualStrings("refactor: io", msg.title);
-    try testing.expectEqualStrings("done", msg.body);
-    try testing.expectEqual(Encoding.utf8, msg.encoding);
-    try testing.expectEqual(@as(usize, 0), msg.trailers.len);
+    try std.testing.expectEqualStrings("refactor: storage", msg.title);
+    try std.testing.expectEqualStrings("done", msg.body);
+    try std.testing.expectEqual(Encoding.utf8, msg.encoding);
+    try std.testing.expectEqual(@as(usize, 0), msg.trailers.len);
 }
