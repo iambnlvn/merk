@@ -72,6 +72,59 @@ pub fn readStringArrayAlloc(
     return items;
 }
 
+/// Write a `CountT`-counted array of self-serializing items — each `T`
+/// exposes `fn serialize(self: T, writer: anytype) !void`. Writing
+/// never allocates, so this works the same whether `T` is a fixed-size
+/// record like `ParentInfo`/`DependencyInfo` or a borrowing view like
+/// `TrailerInfo` — the allocation-free/owning distinction below only
+/// matters for the read side (`readListAlloc` vs `readOwningListAlloc`),
+/// where materializing an owned copy is unavoidable.
+pub fn writeList(comptime T: type, comptime CountT: type, writer: anytype, items: []const T) !void {
+    try writeCount(CountT, writer, items.len);
+    for (items) |item| try item.serialize(writer);
+}
+
+/// Read a `CountT`-counted array of allocation-free items, each read via
+/// its own `fn deserialize(reader: anytype) !T`. `T` must not own any
+/// memory itself (a fixed-size record like `ParentInfo` or
+/// `DependencyInfo`) — there's nothing to unwind per-element on a
+/// partial failure, only the outer slice, which `errdefer` covers.
+/// For element types that *do* own memory, see `readOwningListAlloc`.
+pub fn readListAlloc(comptime T: type, comptime CountT: type, alloc: Allocator, reader: anytype) ![]T {
+    const len = try readCount(CountT, reader);
+    const items = try alloc.alloc(T, len);
+    errdefer alloc.free(items);
+
+    for (items) |*item| item.* = try T.deserialize(reader);
+
+    return items;
+}
+
+/// Read a `CountT`-counted array of owning items, each read via its own
+/// `fn deserialize(alloc: Allocator, reader: anytype) !T` and unwound via
+/// `fn deinit(self: *T, alloc: Allocator) void` if a later element (or a
+/// caller's own follow-up validation) fails. The allocator-aware
+/// counterpart to `readListAlloc`, for element types that hold their own
+/// allocations — e.g. `Trailer`, whose `key`/`value` are owned slices.
+/// Generalizes the same "allocate N, fill, unwind what's filled so far
+/// on error" shape `readStringArrayAlloc` already uses for raw byte
+/// strings, to any self-deserializing owning type.
+pub fn readOwningListAlloc(comptime T: type, comptime CountT: type, alloc: Allocator, reader: anytype) ![]T {
+    const len = try readCount(CountT, reader);
+    const items = try alloc.alloc(T, len);
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |*item| item.deinit(alloc);
+        alloc.free(items);
+    }
+
+    while (initialized < len) : (initialized += 1) {
+        items[initialized] = try T.deserialize(alloc, reader);
+    }
+
+    return items;
+}
+
 test "wire: writeBytes and readBytesAlloc standard roundtrip" {
     const alloc = testing.allocator;
     var buf: ArrayList(u8) = .empty;
@@ -165,4 +218,90 @@ test "wire: readStringArrayAlloc frees partial allocations on truncation" {
 
     var mock_reader = MockReader{ .buffer = buf.items };
     try testing.expectError(error.EndOfStream, readStringArrayAlloc(u16, u16, alloc, &mock_reader));
+}
+
+const ListItem = struct {
+    value: u8,
+
+    fn init(value: u8) ListItem {
+        return .{ .value = value };
+    }
+
+    fn serialize(self: ListItem, writer: anytype) !void {
+        try writer.writeByte(self.value);
+    }
+
+    fn deserialize(reader: anytype) !ListItem {
+        return .{ .value = try reader.takeByte() };
+    }
+};
+
+test "wire: writeList and readListAlloc roundtrip allocation-free items" {
+    const alloc = testing.allocator;
+    var buf: ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    const items = [_]ListItem{ .init(1), .init(2), .init(3) };
+    try writeList(ListItem, u8, buf.writer(alloc), &items);
+
+    // count(1) + 3 * value(1)
+    try testing.expectEqual(@as(usize, 4), buf.items.len);
+
+    var mock_reader = MockReader{ .buffer = buf.items };
+    const decoded = try readListAlloc(ListItem, u8, alloc, &mock_reader);
+    defer alloc.free(decoded);
+
+    try testing.expectEqual(@as(usize, 3), decoded.len);
+    for (items, decoded) |expected, actual| {
+        try testing.expectEqual(expected.value, actual.value);
+    }
+}
+
+const OwningListItem = struct {
+    value: []u8,
+
+    fn deserialize(alloc: Allocator, reader: anytype) !OwningListItem {
+        return .{ .value = try readBytesAlloc(u8, alloc, reader) };
+    }
+
+    fn deinit(self: *OwningListItem, alloc: Allocator) void {
+        alloc.free(self.value);
+        self.* = undefined;
+    }
+};
+
+test "wire: readOwningListAlloc frees every already-read element on a later failure" {
+    const alloc = testing.allocator;
+    var buf: ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    // Claims 2 elements, but only supplies one well-formed one — the
+    // second read fails partway through, and the first element (already
+    // allocated) must not leak.
+    try writeCount(u8, buf.writer(alloc), 2);
+    try writeBytes(u8, buf.writer(alloc), "first");
+
+    var mock_reader = MockReader{ .buffer = buf.items };
+    try testing.expectError(error.EndOfStream, readOwningListAlloc(OwningListItem, u8, alloc, &mock_reader));
+}
+
+test "wire: readOwningListAlloc roundtrips owning items" {
+    const alloc = testing.allocator;
+    var buf: ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try writeCount(u8, buf.writer(alloc), 2);
+    try writeBytes(u8, buf.writer(alloc), "alpha");
+    try writeBytes(u8, buf.writer(alloc), "beta");
+
+    var mock_reader = MockReader{ .buffer = buf.items };
+    const decoded = try readOwningListAlloc(OwningListItem, u8, alloc, &mock_reader);
+    defer {
+        for (decoded) |*item| item.deinit(alloc);
+        alloc.free(decoded);
+    }
+
+    try testing.expectEqual(@as(usize, 2), decoded.len);
+    try testing.expectEqualStrings("alpha", decoded[0].value);
+    try testing.expectEqualStrings("beta", decoded[1].value);
 }
