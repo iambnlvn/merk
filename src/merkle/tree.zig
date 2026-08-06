@@ -24,6 +24,8 @@ const INTERNAL_HEADER_LEN = node.INTERNAL_HEADER_LEN;
 const CHILD_REF_LEN = node.CHILD_REF_LEN;
 const INTERNAL_PAGE = node.INTERNAL_PAGE;
 
+const hashEq = node.hashEq;
+
 /// Content-defined chunking threshold for leaf pages.
 /// When the low bits of an entry's key are all zero, the page is cut here
 const LEAF_BOUNDARY_MASK: u64 = 0x1F;
@@ -136,6 +138,7 @@ pub fn build(alloc: Allocator, store: *const PageStore, entries: []const Entry) 
 /// in on-disk (key-sorted) order. Paths are freshly duplicated;
 /// NOTE:  the caller owns them via whatever owns `out`.
 pub fn collect(alloc: Allocator, store: *const PageStore, page_hash: Hash, out: *ArrayList(Entry)) !void {
+    if (hashEq(page_hash, zero_hash)) return;
     var page = try store.get(page_hash);
     defer page.deinit(alloc);
 
