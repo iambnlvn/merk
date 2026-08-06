@@ -1,28 +1,45 @@
+//! There are exactly two recurring needs in those tests: a growable
+//! in-memory sink to serialize into, and a fixed-buffer source to
+//! deserialize back out of. Both already exist on `std.Io` — this file
+//! adds no protocol of its own, it just gives call sites short, named
+//! wrappers instead of re-deriving the `Io.Writer.Allocating` /
+//! `Io.Reader.fixed` boilerplate at every test.
+
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
 
-pub const MockReader = struct {
-    buffer: []const u8,
-    pos: usize = 0,
+/// A growable in-memory `Io.Writer` for a test to serialize into.
+///
+///     var sink = ByteSink.init(alloc);
+///     defer sink.deinit();
+///     try value.serialize(sink.writer());
+///     try testing.expectEqualSlices(u8, expected, sink.bytes());
+pub const ByteSink = struct {
+    allocating: Io.Writer.Allocating,
 
-    pub fn takeInt(self: *@This(), comptime T: type, endian: std.builtin.Endian) !T {
-        const size = @sizeOf(T);
-        if (self.pos + size > self.buffer.len) return error.EndOfStream;
-        const bytes = self.buffer[self.pos .. self.pos + size][0..size];
-        self.pos += size;
-        return std.mem.readInt(T, bytes, endian);
+    pub fn init(alloc: Allocator) ByteSink {
+        return .{ .allocating = Io.Writer.Allocating.init(alloc) };
     }
 
-    pub fn take(self: *@This(), len: usize) ![]const u8 {
-        if (self.pos + len > self.buffer.len) return error.EndOfStream;
-        const slice = self.buffer[self.pos .. self.pos + len];
-        self.pos += len;
-        return slice;
+    pub fn deinit(self: *ByteSink) void {
+        self.allocating.deinit();
     }
 
-    pub fn takeByte(self: *@This()) !u8 {
-        if (self.pos >= self.buffer.len) return error.EndOfStream;
-        const byte = self.buffer[self.pos];
-        self.pos += 1;
-        return byte;
+    /// The writer to pass into a `serialize` call. Borrows from `self`;
+    /// valid only until the next call to `.deinit()`.
+    pub fn writer(self: *ByteSink) *Io.Writer {
+        return &self.allocating.writer;
+    }
+
+    /// Borrows from `self`.
+    pub fn bytes(self: *ByteSink) []const u8 {
+        return self.allocating.written();
     }
 };
+
+/// A fixed-buffer `Io.Reader` over `bytes`, for a test to deserialize
+/// from. `bytes` must outlive the returned reader.
+pub fn fixedReader(bytes: []const u8) Io.Reader {
+    return Io.Reader.fixed(bytes);
+}
