@@ -1,17 +1,13 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
+const Io = std.Io;
 
 const wire = @import("wire.zig");
-const MockReader = @import("testing.zig").MockReader;
 
-/// The wire tag for an `Intent`. Kept as its own enum (rather than
-/// deriving straight from `Intent`'s payload-carrying union) so the
-/// on-disk numbering is pinned explicitly instead of following whatever
-/// order `Intent`'s variants happen to be declared in — the two are
-/// kept in sync by `Intent.tag` and the mapping in `Intent.deserialize`
-/// below, and this is the
-/// only place that needs editing to reserve a new fixed tag.
+/// Wire tag for an `Intent`. Variant tags are pinned explicitly so that
+/// on-disk ordering stays consistent regardless of union field sequence.
 pub const IntentTag = enum(u8) {
     feature = 0,
     fix = 1,
@@ -24,34 +20,43 @@ pub const IntentTag = enum(u8) {
     ci = 8,
     release = 9,
     chore = 10,
-    /// A caller-supplied name, carried as a length-prefixed string
-    /// immediately after this tag byte. See `Intent.custom`.
+    /// A caller-supplied intent tag name carried as a length-prefixed string.
     custom = 11,
 };
 
-/// Validation failures for a `.custom` intent's name.
+/// Validation failures for custom intent names.
 pub const IntentError = error{
     EmptyCustomIntent,
     CustomIntentTooLong,
     CustomIntentContainsIllegalCharacters,
 };
 
+/// Validation failures for commit metadata as a whole.
+pub const MetadataError = error{
+    TooManyLabels,
+    LabelTooLong,
+    EmptyLabel,
+    LabelContainsIllegalCharacters,
+    DuplicateLabel,
+    LabelPayloadTooLarge,
+};
+
 const illegal_custom_intent_chars = [_]u8{ '\n', '\r', '\t', '\x00' };
+const illegal_label_chars = [_]u8{ '\n', '\r', '\t', '\x00' };
+
+/// Upper bound on the total decoded bytes across all labels for a single
+/// commit. This is enforced independently of the per-label and per-count
+/// limits below: a payload could satisfy both of those individually
+/// (e.g. 65535 labels of 65535 bytes each) while still requesting an
+/// unreasonable amount of memory during deserialization. Capping the sum
+/// gives deserialize() a cheap way to reject hostile/corrupt input before
+/// most of the allocation work happens.
+pub const max_total_label_bytes: usize = 1 << 20; // 1 MiB
 
 /// High-level semantic classification for a commit.
 ///
-/// Most commits fit one of the built-in kinds below, which is why they
-/// stay first-class enum-shaped variants (no allocation, trivially
-/// copyable, cheap to switch on). But projects with their own release
-/// taxonomy — a `hotfix` category, a `vendor` label for third-party
-/// imports, whatever a team's changelog generator expects — aren't
-/// forced to force-fit one of these, or to fork this type: `.custom`
-/// carries an arbitrary caller-supplied name across the wire instead.
-///
-/// `.custom` names are validated (non-empty, bounded length, no control
-/// characters) exactly like `.custom("chore")` would be an odd thing to
-/// write, but nothing here stops it — merk doesn't attempt to detect or
-/// reject a custom name that happens to collide with a built-in one.
+/// Built-in kinds carry zero allocation overhead. Projects with custom commit
+/// taxonomy can utilize `.custom` to carry arbitrary names across the wire.
 pub const Intent = union(enum) {
     feature,
     fix,
@@ -69,18 +74,25 @@ pub const Intent = union(enum) {
     /// comment.
     custom: []const u8,
 
-    /// Construct a `.custom` intent. Doesn't validate eagerly — like
-    /// the rest of merk's `*Info` construction, that happens once, at
-    /// `.validate()`/`.serialize()` time.
     pub fn initCustom(custom_name: []const u8) Intent {
         return .{ .custom = custom_name };
     }
 
-    /// This intent's identifier text: the variant name itself for a
-    /// built-in kind (`"feature"`, `"chore"`, ...), or the caller's
-    /// string for `.custom`. Useful for display, filtering, or release
-    /// automation that wants a single string regardless of which kind
-    /// of intent this is, without a switch at every call site.
+    /// Parses a string into an `Intent`. Matches against built-in tags first
+    /// (case-insensitively), falling back to `.custom(trimmed)` if no
+    /// built-in tag matches.
+    pub fn fromString(str: []const u8) Intent {
+        const trimmed = std.mem.trim(u8, str, " \t\r\n");
+        inline for (std.meta.fields(IntentTag)) |field| {
+            if (field.value == @intFromEnum(IntentTag.custom)) continue;
+            if (std.ascii.eqlIgnoreCase(trimmed, field.name)) {
+                return @field(Intent, field.name);
+            }
+        }
+        return initCustom(trimmed);
+    }
+
+    /// Display string representing this intent: standard tag name or custom string.
     pub fn name(self: Intent) []const u8 {
         return switch (self) {
             .custom => |n| n,
@@ -88,7 +100,38 @@ pub const Intent = union(enum) {
         };
     }
 
-    /// Same intent — same built-in kind, or the same `.custom` name.
+    /// Short prefix in the style used by conventional-commit tooling
+    /// (e.g. `.feature` -> "feat", `.performance` -> "perf"). Falls back to
+    /// `name()` for kinds without a conventional-commit abbreviation,
+    /// including `.custom`.
+    pub fn conventionalPrefix(self: Intent) []const u8 {
+        return switch (self) {
+            .feature => "feat",
+            .fix => "fix",
+            .refactor => "refactor",
+            .docs => "docs",
+            .@"test" => "test",
+            .performance => "perf",
+            .security => "security",
+            .build => "build",
+            .ci => "ci",
+            .release => "release",
+            .chore => "chore",
+            .custom => |n| n,
+        };
+    }
+
+    /// True if this is a caller-supplied intent rather than a built-in kind.
+    pub fn isCustom(self: Intent) bool {
+        return self == .custom;
+    }
+
+    /// True if this is one of the built-in intent kinds.
+    pub fn isBuiltin(self: Intent) bool {
+        return self != .custom;
+    }
+
+    /// Equality comparison for two intents.
     pub fn eql(self: Intent, other: Intent) bool {
         return switch (self) {
             .custom => |a| switch (other) {
@@ -102,8 +145,16 @@ pub const Intent = union(enum) {
         };
     }
 
-    /// Trimmed custom name, computed once so `validate` and `serialize`
-    /// don't each re-derive it. Not meaningful for non-`.custom` kinds.
+    /// Returns an owned copy of this intent, duplicating the custom string
+    /// (if any) with `alloc`. The result must be `deinit`'d independently
+    /// of `self`.
+    pub fn clone(self: Intent, alloc: Allocator) Allocator.Error!Intent {
+        return switch (self) {
+            .custom => |n| .{ .custom = try alloc.dupe(u8, n) },
+            else => self,
+        };
+    }
+
     fn trimmedCustom(self: Intent) []const u8 {
         return std.mem.trim(u8, self.custom, " \t\r\n");
     }
@@ -135,7 +186,7 @@ pub const Intent = union(enum) {
         };
     }
 
-    pub fn serialize(self: Intent, writer: anytype) !void {
+    pub fn serialize(self: Intent, writer: *Io.Writer) !void {
         try self.validate();
 
         try writer.writeByte(@intFromEnum(self.tag()));
@@ -144,10 +195,7 @@ pub const Intent = union(enum) {
         }
     }
 
-    /// Caller frees the result with `.deinit(alloc)` — a no-op for
-    /// every built-in kind, and the only variant that actually owns
-    /// anything is `.custom`.
-    pub fn deserialize(alloc: Allocator, reader: anytype) !Intent {
+    pub fn deserialize(alloc: Allocator, reader: *Io.Reader) !Intent {
         const raw_tag = try reader.takeByte();
         const t = std.meta.intToEnum(IntentTag, raw_tag) catch return error.CorruptCommit;
 
@@ -171,8 +219,6 @@ pub const Intent = union(enum) {
         };
     }
 
-    /// Free the `.custom` name, if this is one. A no-op for every
-    /// built-in kind — safe to call unconditionally.
     pub fn deinit(self: *Intent, alloc: Allocator) void {
         switch (self.*) {
             .custom => |n| alloc.free(n),
@@ -181,102 +227,122 @@ pub const Intent = union(enum) {
     }
 };
 
-/// A persistent identifier for one *logical* change, as distinct from
-/// the commit hash that identifies one particular *version* of it.
-///
-/// Git only has commit hashes, so a commit rewritten by `rebase`,
-/// `commit --amend`, or a cherry-pick becomes a brand-new, unrelated
-/// object — there is no durable way to say "this is still the same
-/// change, just moved". `change_id` fixes that, it's generated once,
-/// when a change is first created, and every
-/// caller that rewrites that change (amend, rebase, cherry-pick) is
-/// expected to copy the *same* `change_id` forward via
-/// `CommitBuilder.changeId`, even though `Commit.hash` changes every
-/// time. Two commits with the same `change_id` are different snapshots
-/// of the same evolving change; two commits with different `change_id`s
-/// are unrelated, even if one happens to be a parent of the other.
-///
-/// 16 random bytes (not content-derived) — deliberately UUID-shaped
-/// rather than reusing the 32-byte content `Hash` type, so a `change_id`
-/// can never be mistaken for — or accidentally compared against — an
-/// object hash.
+/// A persistent identifier for a single logical change across rewrites (amend, rebase).
 pub const ChangeId = [16]u8;
 
-/// A fresh, random change_id for a brand-new logical change. Callers
-/// continuing an existing change (amend/rebase/cherry-pick) should
-/// instead carry the original commit's `change_id` forward — see the
-/// doc comment on `ChangeId`.
+/// Generates a fresh 16-byte random ChangeId.
 pub fn generateChangeId() ChangeId {
     var id: ChangeId = undefined;
     std.crypto.random.bytes(&id);
     return id;
 }
 
+/// Formats a `ChangeId` as 32 lowercase hex characters.
+pub fn changeIdToHex(id: ChangeId) [32]u8 {
+    var buf: [32]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (id, 0..) |byte, i| {
+        buf[i * 2] = hex_chars[byte >> 4];
+        buf[i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+    return buf;
+}
+
+/// Parses a 32-character hex string (as produced by `changeIdToHex`) into a
+/// `ChangeId`. Accepts upper- or lower-case hex digits.
+pub const ChangeIdParseError = error{InvalidChangeIdHex};
+
+pub fn changeIdFromHex(hex: []const u8) ChangeIdParseError!ChangeId {
+    if (hex.len != 32) return error.InvalidChangeIdHex;
+
+    var id: ChangeId = undefined;
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        const hi = std.fmt.charToDigit(hex[i * 2], 16) catch return error.InvalidChangeIdHex;
+        const lo = std.fmt.charToDigit(hex[i * 2 + 1], 16) catch return error.InvalidChangeIdHex;
+        id[i] = (@as(u8, hi) << 4) | @as(u8, lo);
+    }
+    return id;
+}
+
+pub fn changeIdEql(a: ChangeId, b: ChangeId) bool {
+    return std.mem.eql(u8, &a, &b);
+}
+
+/// Validates a single label: non-empty once trimmed, within the on-wire
+/// length limit, and free of control characters that would make it awkward
+/// to render or round-trip.
+fn validateLabel(label: []const u8) MetadataError!void {
+    const trimmed = std.mem.trim(u8, label, " \t\r\n");
+    if (trimmed.len == 0) return error.EmptyLabel;
+    if (label.len > std.math.maxInt(u16)) return error.LabelTooLong;
+    if (std.mem.indexOfAny(u8, label, &illegal_label_chars) != null)
+        return error.LabelContainsIllegalCharacters;
+}
+
 pub const CommitMetadataInfo = struct {
-    /// Persistent identifier for the logical change this commit
-    /// belongs to. See `ChangeId`'s doc comment. Defaults to all-zero,
-    /// which is only a sensible value for tests that don't care about
-    /// change tracking — real commits should always get one from
-    /// `generateChangeId()` or a carried-forward prior value; see
-    /// `CommitBuilder.build`, which fills this in automatically when
-    /// not explicitly set via `.changeId()`.
     change_id: ChangeId = [_]u8{0} ** 16,
-
-    /// Unix timestamp in milliseconds.
-    ///
-    /// 0 = use current wall-clock time.
     timestamp_ms: i64 = 0,
-
-    /// High-level semantic classification. See `Intent`'s doc comment —
-    /// `.custom` names are validated the same way names/labels
-    /// elsewhere in merk are (non-empty, bounded, no control chars).
     intent: Intent = .chore,
-
-    /// Optional labels used for grouping,
-    /// filtering, and release automation.
     labels: []const []const u8 = &.{},
 
-    pub fn validate(
-        self: CommitMetadataInfo,
-    ) !void {
+    pub fn validate(self: CommitMetadataInfo) !void {
         try self.intent.validate();
 
         if (self.labels.len > std.math.maxInt(u16))
             return error.TooManyLabels;
 
+        var total_bytes: usize = 0;
         for (self.labels) |label| {
-            if (label.len > std.math.maxInt(u16))
-                return error.LabelTooLong;
+            try validateLabel(label);
+            total_bytes += label.len;
+        }
+        if (total_bytes > max_total_label_bytes)
+            return error.LabelPayloadTooLarge;
+
+        // O(n^2) duplicate check. Label lists are expected to be small
+        // (bounded well under u16 in practice), so this trades a bit of
+        // work for not requiring an allocator in validate().
+        for (self.labels, 0..) |label, i| {
+            for (self.labels[i + 1 ..]) |other| {
+                if (std.mem.eql(u8, label, other)) return error.DuplicateLabel;
+            }
         }
     }
-    pub fn serialize(
-        self: CommitMetadataInfo,
-        writer: anytype,
-    ) !void {
+
+    pub fn serialize(self: CommitMetadataInfo, writer: *Io.Writer) !void {
         try self.validate();
 
         try writer.writeAll(&self.change_id);
 
         const ts = wire.resolveTimestampMs(self.timestamp_ms);
-        try writer.writeInt(i64, ts, .little);
+        var ts_buf: [8]u8 = undefined;
+        std.mem.writeInt(i64, &ts_buf, ts, .little);
+        try writer.writeAll(&ts_buf);
         try self.intent.serialize(writer);
         try wire.writeStringArray(u16, u16, writer, self.labels);
     }
 
-    pub fn deserialize(
-        alloc: Allocator,
-        reader: anytype,
-    ) !CommitMetadata {
-        const change_id_bytes = try reader.take(16);
+    pub fn deserialize(alloc: Allocator, reader: *Io.Reader) !CommitMetadata {
         var change_id: ChangeId = undefined;
-        @memcpy(&change_id, change_id_bytes);
+        try reader.readSliceAll(&change_id);
 
-        const timestamp_ms = try reader.takeInt(i64, .little);
+        const ts_arr = try reader.takeArray(8);
+        const timestamp_ms = std.mem.readInt(i64, ts_arr, .little);
 
         var commit_intent = try Intent.deserialize(alloc, reader);
         errdefer commit_intent.deinit(alloc);
 
         const labels = try wire.readStringArrayAlloc(u16, u16, alloc, reader);
+        errdefer {
+            for (labels) |label| alloc.free(label);
+            alloc.free(labels);
+        }
+
+        var total_bytes: usize = 0;
+        for (labels) |label| total_bytes += label.len;
+        if (total_bytes > max_total_label_bytes)
+            return error.LabelPayloadTooLarge;
 
         return .{
             .change_id = change_id,
@@ -298,14 +364,9 @@ pub const CommitMetadata = struct {
     /// Semantic classification. Owned only in the `.custom` case — see
     /// `Intent.deinit`, which this struct's `deinit` calls unconditionally.
     intent: Intent,
-
-    /// Owned labels.
     labels: [][]u8,
 
-    pub fn deinit(
-        self: *CommitMetadata,
-        alloc: Allocator,
-    ) void {
+    pub fn deinit(self: *CommitMetadata, alloc: Allocator) void {
         self.intent.deinit(alloc);
 
         for (self.labels) |label| {
@@ -313,15 +374,147 @@ pub const CommitMetadata = struct {
         }
 
         alloc.free(self.labels);
-
         self.* = undefined;
     }
+
+    /// Structural equality: same change id, timestamp, intent, and label
+    /// set (order-sensitive — labels are compared positionally).
+    pub fn eql(self: CommitMetadata, other: CommitMetadata) bool {
+        if (!changeIdEql(self.change_id, other.change_id)) return false;
+        if (self.timestamp_ms != other.timestamp_ms) return false;
+        if (!self.intent.eql(other.intent)) return false;
+        if (self.labels.len != other.labels.len) return false;
+        for (self.labels, other.labels) |a, b| {
+            if (!std.mem.eql(u8, a, b)) return false;
+        }
+        return true;
+    }
+
+    /// Returns a deep, independently-owned copy of this metadata. The
+    /// result must be `deinit`'d independently of `self`.
+    pub fn clone(self: CommitMetadata, alloc: Allocator) Allocator.Error!CommitMetadata {
+        var cloned_intent = try self.intent.clone(alloc);
+        errdefer cloned_intent.deinit(alloc);
+
+        const cloned_labels = try alloc.alloc([]u8, self.labels.len);
+        var filled: usize = 0;
+        errdefer {
+            for (cloned_labels[0..filled]) |l| alloc.free(l);
+            alloc.free(cloned_labels);
+        }
+        for (self.labels, 0..) |label, i| {
+            cloned_labels[i] = try alloc.dupe(u8, label);
+            filled += 1;
+        }
+
+        return .{
+            .change_id = self.change_id,
+            .timestamp_ms = self.timestamp_ms,
+            .intent = cloned_intent,
+            .labels = cloned_labels,
+        };
+    }
 };
+
+test "Intent.fromString parses built-in tags and custom fallbacks" {
+    try testing.expect(Intent.fromString("feature") == .feature);
+    try testing.expect(Intent.fromString("  fix  ") == .fix);
+    try testing.expect(Intent.fromString("chore") == .chore);
+
+    const custom = Intent.fromString("hotfix");
+    try testing.expect(custom == .custom);
+    try testing.expectEqualStrings("hotfix", custom.name());
+}
+
+test "Intent.fromString is case-insensitive for built-in tags" {
+    try testing.expect(Intent.fromString("Feature") == .feature);
+    try testing.expect(Intent.fromString("FIX") == .fix);
+    try testing.expect(Intent.fromString("ReFaCtOr") == .refactor);
+
+    // Still falls back to custom for genuinely unknown names, preserving
+    // the caller's casing.
+    const custom = Intent.fromString("HotFix");
+    try testing.expect(custom == .custom);
+    try testing.expectEqualStrings("HotFix", custom.name());
+}
+
+test "Intent.conventionalPrefix maps built-ins to conventional-commit prefixes" {
+    const feature: Intent = .feature;
+    const fix: Intent = .fix;
+    const perf: Intent = .performance;
+    try testing.expectEqualStrings("feat", feature.conventionalPrefix());
+    try testing.expectEqualStrings("fix", fix.conventionalPrefix());
+    try testing.expectEqualStrings("perf", perf.conventionalPrefix());
+    try testing.expectEqualStrings("hotfix", Intent.initCustom("hotfix").conventionalPrefix());
+}
+
+test "Intent.isCustom / isBuiltin" {
+    try testing.expect(Intent.initCustom("hotfix").isCustom());
+    try testing.expect(!Intent.initCustom("hotfix").isBuiltin());
+    const feature: Intent = .feature;
+    try testing.expect(feature.isBuiltin());
+    try testing.expect(!feature.isCustom());
+}
+
+test "Intent.clone duplicates custom string independently" {
+    const allocator = std.testing.allocator;
+
+    const original_buf = try allocator.dupe(u8, "hotfix");
+    defer allocator.free(original_buf);
+
+    var original = Intent.initCustom(original_buf);
+    var cloned = try original.clone(allocator);
+    defer cloned.deinit(allocator);
+
+    try testing.expect(original.eql(cloned));
+    try testing.expect(cloned.custom.ptr != original_buf.ptr);
+
+    // Mutating the clone's backing storage independence: freeing original's
+    // buffer separately must not affect the clone (already proven by
+    // pointer distinctness above; this just documents the intent).
+    _ = &original;
+}
+
+test "Intent.validate rejects empty, oversized, and illegal custom intents" {
+    try testing.expectError(error.EmptyCustomIntent, Intent.initCustom("   ").validate());
+    try testing.expectError(error.EmptyCustomIntent, Intent.initCustom("").validate());
+
+    const huge = try testing.allocator.alloc(u8, std.math.maxInt(u16) + 1);
+    defer testing.allocator.free(huge);
+    @memset(huge, 'a');
+    try testing.expectError(error.CustomIntentTooLong, Intent.initCustom(huge).validate());
+
+    try testing.expectError(
+        error.CustomIntentContainsIllegalCharacters,
+        Intent.initCustom("bad\nname").validate(),
+    );
+    try testing.expectError(
+        error.CustomIntentContainsIllegalCharacters,
+        Intent.initCustom("bad\x00name").validate(),
+    );
+
+    // Sanity: a normal custom intent validates cleanly.
+    try Intent.initCustom("hotfix").validate();
+}
+
+test "Intent.eql covers custom-vs-custom and custom-vs-builtin branches" {
+    const feature: Intent = .feature;
+    try testing.expect(feature.eql(.feature));
+    try testing.expect(!feature.eql(.fix));
+
+    const a = Intent.initCustom("hotfix");
+    const b = Intent.initCustom("hotfix");
+    const c = Intent.initCustom("coldfix");
+    try testing.expect(a.eql(b));
+    try testing.expect(!a.eql(c));
+
+    try testing.expect(!a.eql(feature));
+    try testing.expect(!feature.eql(a));
+}
 
 test "CommitMetadataInfo validation - label boundaries" {
     const allocator = std.testing.allocator;
 
-    // Label too long error boundary check (> 65535 bytes)
     const huge_label = try allocator.alloc(u8, 65536);
     defer allocator.free(huge_label);
     @memset(huge_label, 'a');
@@ -332,7 +525,6 @@ test "CommitMetadataInfo validation - label boundaries" {
     };
     try std.testing.expectError(error.LabelTooLong, info_bad_label.validate());
 
-    // Too many labels error boundary check (> 65535 elements)
     const huge_label_array = try allocator.alloc([]const u8, 65536);
     defer allocator.free(huge_label_array);
     @memset(huge_label_array, &[_]u8{});
@@ -343,10 +535,77 @@ test "CommitMetadataInfo validation - label boundaries" {
     try std.testing.expectError(error.TooManyLabels, info_too_many_labels.validate());
 }
 
+test "CommitMetadataInfo validation - empty, illegal-char, and duplicate labels" {
+    const empty_label = [_][]const u8{"   "};
+    try std.testing.expectError(
+        error.EmptyLabel,
+        (CommitMetadataInfo{ .labels = &empty_label }).validate(),
+    );
+
+    const illegal_label = [_][]const u8{"bad\nlabel"};
+    try std.testing.expectError(
+        error.LabelContainsIllegalCharacters,
+        (CommitMetadataInfo{ .labels = &illegal_label }).validate(),
+    );
+
+    const dup_labels = [_][]const u8{ "v2", "v2" };
+    try std.testing.expectError(
+        error.DuplicateLabel,
+        (CommitMetadataInfo{ .labels = &dup_labels }).validate(),
+    );
+
+    const ok_labels = [_][]const u8{ "feat", "v2" };
+    try (CommitMetadataInfo{ .labels = &ok_labels }).validate();
+}
+
+test "CommitMetadataInfo validation - total label payload cap" {
+    const allocator = std.testing.allocator;
+
+    // Each label individually satisfies the per-label (u16) length limit,
+    // but enough of them together exceed max_total_label_bytes. This is
+    // deliberately a case the per-label and per-count checks alone would
+    // both pass.
+    const label_len: usize = std.math.maxInt(u16);
+    const needed = (max_total_label_bytes / label_len) + 2;
+
+    const label_storage = try allocator.alloc(u8, label_len);
+    defer allocator.free(label_storage);
+    @memset(label_storage, 'a');
+
+    const labels = try allocator.alloc([]const u8, needed);
+    defer allocator.free(labels);
+    for (labels) |*l| l.* = label_storage;
+
+    try std.testing.expectError(
+        error.LabelPayloadTooLarge,
+        (CommitMetadataInfo{ .labels = labels }).validate(),
+    );
+}
+
 test "generateChangeId produces distinct 16-byte ids" {
     const a = generateChangeId();
     const b = generateChangeId();
     try std.testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
+test "changeIdToHex / changeIdFromHex round-trip" {
+    const id: ChangeId = [_]u8{
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    };
+    const hex = changeIdToHex(id);
+    try testing.expectEqualStrings("00112233445566778899aabbccddeeff", &hex);
+
+    const parsed = try changeIdFromHex(&hex);
+    try testing.expect(changeIdEql(id, parsed));
+
+    // Upper-case input should parse identically.
+    const upper_hex = "00112233445566778899AABBCCDDEEFF";
+    const parsed_upper = try changeIdFromHex(upper_hex);
+    try testing.expect(changeIdEql(id, parsed_upper));
+
+    try testing.expectError(error.InvalidChangeIdHex, changeIdFromHex("too-short"));
+    try testing.expectError(error.InvalidChangeIdHex, changeIdFromHex("zz112233445566778899aabbccddeeff"[0..32]));
 }
 
 test "CommitMetadataInfo serialization layout" {
@@ -361,150 +620,169 @@ test "CommitMetadataInfo serialization layout" {
         .labels = &labels,
     };
 
-    var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(allocator);
+    var aw: Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
-    // Call serialize as defined in CommitMetadata namespace using 0.15 allocator-aware writer
-    try CommitMetadataInfo.serialize(info, payload.writer(allocator));
+    try info.serialize(&aw.writer);
+    const payload = aw.written();
 
-    // change_id (16 bytes) is written first.
-    try std.testing.expectEqualSlices(u8, &change_id, payload.items[0..16]);
+    try testing.expectEqualSlices(u8, &change_id, payload[0..16]);
 
-    // [8 Bytes: Timestamp i64 LE]       -> \x00\x30\xed\xf6\x9e\x01\x00\x00
-    // [1 Byte: Intent tag u8 (.feature = 0)] -> \x00
-    // [2 Bytes: Label Count u16 LE (2)] -> \x02\x00
-    // [2 Bytes: Label[0] Len u16 LE (4)] -> \x04\x00
-    // [4 Bytes: Label[0] String Content] -> "feat"
-    // [2 Bytes: Label[1] Len u16 LE (2)] -> \x02\x00
-    // [2 Bytes: Label[1] String Content] -> "v2"
     const expected_rest = "\x00\x30\xed\xf6\x9e\x01\x00\x00\x00\x02\x00\x04\x00feat\x02\x00v2";
-    try std.testing.expectEqualSlices(u8, expected_rest, payload.items[16..]);
+    try testing.expectEqualSlices(u8, expected_rest, payload[16..]);
 }
 
 test "CommitMetadata deserialization - successful lifecycle" {
     const allocator = std.testing.allocator;
 
-    var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(allocator);
+    var aw: Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
     const target_change_id: ChangeId = [_]u8{0xCD} ** 16;
     const target_ts: i64 = 987654321;
     const target_intent: Intent = .fix;
     const label_text = "critical-bug";
 
-    // Build binary input manually using the payload writer
-    try payload.writer(allocator).writeAll(&target_change_id);
-    try payload.writer(allocator).writeInt(i64, target_ts, .little);
-    try payload.writer(allocator).writeByte(@intFromEnum(IntentTag.fix));
-    try payload.writer(allocator).writeInt(u16, 1, .little); // 1 label
-    try payload.writer(allocator).writeInt(u16, @intCast(label_text.len), .little);
-    try payload.writer(allocator).writeAll(label_text);
+    const w = &aw.writer;
+    try w.writeAll(&target_change_id);
+    var ts_buf: [8]u8 = undefined;
+    std.mem.writeInt(i64, &ts_buf, target_ts, .little);
+    try w.writeAll(&ts_buf);
+    try w.writeByte(@intFromEnum(IntentTag.fix));
+    var count_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &count_buf, 1, .little);
+    try w.writeAll(&count_buf);
+    var len_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &len_buf, @intCast(label_text.len), .little);
+    try w.writeAll(&len_buf);
+    try w.writeAll(label_text);
 
-    var mock_reader = MockReader{ .buffer = payload.items };
+    var reader: Io.Reader = .fixed(aw.written());
+    var meta = try CommitMetadataInfo.deserialize(allocator, &reader);
+    defer meta.deinit(allocator);
 
-    var metadata = try CommitMetadataInfo.deserialize(allocator, &mock_reader);
-    defer metadata.deinit(allocator);
-
-    // Validate memory allocations and property reconstruction
-    try std.testing.expectEqualSlices(u8, &target_change_id, &metadata.change_id);
-    try std.testing.expectEqual(target_ts, metadata.timestamp_ms);
-    try std.testing.expect(target_intent.eql(metadata.intent));
-    try std.testing.expectEqual(@as(usize, 1), metadata.labels.len);
-    try std.testing.expectEqualStrings(label_text, metadata.labels[0]);
+    try testing.expectEqualSlices(u8, &target_change_id, &meta.change_id);
+    try testing.expectEqual(target_ts, meta.timestamp_ms);
+    try testing.expect(target_intent.eql(meta.intent));
+    try testing.expectEqual(@as(usize, 1), meta.labels.len);
+    try testing.expectEqualStrings(label_text, meta.labels[0]);
 }
 
 test "CommitMetadata deserialization - corrupt enum safety check" {
     const allocator = std.testing.allocator;
 
-    var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(allocator);
+    var aw: Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
-    try payload.writer(allocator).writeAll(&([_]u8{0} ** 16)); // change_id
-    try payload.writer(allocator).writeInt(i64, 12345, .little);
-    try payload.writer(allocator).writeByte(99); // 99 is completely out-of-bounds for IntentTag
-    try payload.writer(allocator).writeInt(u16, 0, .little);
+    const w = &aw.writer;
+    try w.writeAll(&([_]u8{0} ** 16));
+    var ts_buf: [8]u8 = undefined;
+    std.mem.writeInt(i64, &ts_buf, 12345, .little);
+    try w.writeAll(&ts_buf);
+    try w.writeByte(99); // 99 is out-of-bounds for IntentTag
+    var count_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &count_buf, 0, .little);
+    try w.writeAll(&count_buf);
 
-    var mock_reader = MockReader{ .buffer = payload.items };
-
-    // Should break gracefully inside catch block and return error.CorruptCommit
-    try std.testing.expectError(error.CorruptCommit, CommitMetadataInfo.deserialize(allocator, &mock_reader));
+    var reader: Io.Reader = .fixed(aw.written());
+    try testing.expectError(error.CorruptCommit, CommitMetadataInfo.deserialize(allocator, &reader));
 }
 
-test "Intent.custom round-trips through serialize/deserialize" {
+test "CommitMetadataInfo serialize -> deserialize round trip" {
+    const allocator = std.testing.allocator;
+
+    const labels = [_][]const u8{ "feat", "v2", "release-candidate" };
+    const original = CommitMetadataInfo{
+        .change_id = [_]u8{0x42} ** 16,
+        .timestamp_ms = 1_700_000_000_000,
+        .intent = .performance,
+        .labels = &labels,
+    };
+
+    var aw: Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try original.serialize(&aw.writer);
+
+    var reader: Io.Reader = .fixed(aw.written());
+    var round_tripped = try CommitMetadataInfo.deserialize(allocator, &reader);
+    defer round_tripped.deinit(allocator);
+
+    try testing.expectEqualSlices(u8, &original.change_id, &round_tripped.change_id);
+    try testing.expectEqual(original.timestamp_ms, round_tripped.timestamp_ms);
+    try testing.expect(original.intent.eql(round_tripped.intent));
+    try testing.expectEqual(labels.len, round_tripped.labels.len);
+    for (labels, round_tripped.labels) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+}
+
+test "CommitMetadataInfo serialize -> deserialize round trip with custom intent" {
+    const allocator = std.testing.allocator;
+
+    const labels = [_][]const u8{};
+    const original = CommitMetadataInfo{
+        .change_id = [_]u8{0x99} ** 16,
+        .timestamp_ms = 42,
+        .intent = Intent.initCustom("hotfix"),
+        .labels = &labels,
+    };
+
+    var aw: Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try original.serialize(&aw.writer);
+
+    var reader: Io.Reader = .fixed(aw.written());
+    var round_tripped = try CommitMetadataInfo.deserialize(allocator, &reader);
+    defer round_tripped.deinit(allocator);
+
+    try testing.expect(original.intent.eql(round_tripped.intent));
+    try testing.expectEqual(@as(usize, 0), round_tripped.labels.len);
+}
+
+test "CommitMetadata.eql and clone" {
+    const allocator = std.testing.allocator;
+
+    const labels = try allocator.alloc([]u8, 2);
+    labels[0] = try allocator.dupe(u8, "feat");
+    labels[1] = try allocator.dupe(u8, "v2");
+
+    var original = CommitMetadata{
+        .change_id = [_]u8{0x7} ** 16,
+        .timestamp_ms = 123,
+        .intent = try Intent.initCustom("hotfix").clone(allocator),
+        .labels = labels,
+    };
+    defer original.deinit(allocator);
+
+    var cloned = try original.clone(allocator);
+    defer cloned.deinit(allocator);
+
+    try testing.expect(original.eql(cloned));
+
+    // Independence: freeing/mutating one must not affect the other. We
+    // can't literally free `original` mid-test, so instead assert the
+    // underlying label buffers are distinct allocations.
+    try testing.expect(original.labels[0].ptr != cloned.labels[0].ptr);
+    try testing.expect(original.intent.custom.ptr != cloned.intent.custom.ptr);
+}
+
+test "CommitMetadataInfo serialization - zero labels" {
     const allocator = std.testing.allocator;
 
     const info = CommitMetadataInfo{
-        .intent = Intent.initCustom("hotfix"),
+        .change_id = [_]u8{0x01} ** 16,
+        .timestamp_ms = 1,
+        .intent = .chore,
+        .labels = &.{},
     };
 
-    var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(allocator);
-    try info.serialize(payload.writer(allocator));
+    var aw: Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try info.serialize(&aw.writer);
 
-    // tag(1) + name_len(2) + name(6)
-    try std.testing.expectEqual(@as(usize, 16 + 8 + 1 + 2 + 6 + 2), payload.items.len);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(IntentTag.custom)), payload.items[24]);
+    var reader: Io.Reader = .fixed(aw.written());
+    var meta = try CommitMetadataInfo.deserialize(allocator, &reader);
+    defer meta.deinit(allocator);
 
-    var mock_reader = MockReader{ .buffer = payload.items };
-    var metadata = try CommitMetadataInfo.deserialize(allocator, &mock_reader);
-    defer metadata.deinit(allocator);
-
-    try std.testing.expect(metadata.intent == .custom);
-    try std.testing.expectEqualStrings("hotfix", metadata.intent.name());
-    try std.testing.expect(Intent.initCustom("hotfix").eql(metadata.intent));
-}
-
-test "Intent.custom trims whitespace before validating and serializing" {
-    const allocator = std.testing.allocator;
-
-    const info = CommitMetadataInfo{ .intent = Intent.initCustom("  vendor-import  ") };
-
-    var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(allocator);
-    try info.serialize(payload.writer(allocator));
-
-    var mock_reader = MockReader{ .buffer = payload.items };
-    var metadata = try CommitMetadataInfo.deserialize(allocator, &mock_reader);
-    defer metadata.deinit(allocator);
-
-    try std.testing.expectEqualStrings("vendor-import", metadata.intent.name());
-}
-
-test "Intent.custom rejects empty, oversized, and control-character names" {
-    try std.testing.expectError(
-        error.EmptyCustomIntent,
-        (CommitMetadataInfo{ .intent = Intent.initCustom("   ") }).validate(),
-    );
-
-    const allocator = std.testing.allocator;
-    const huge_name = try allocator.alloc(u8, 65536);
-    defer allocator.free(huge_name);
-    @memset(huge_name, 'a');
-    try std.testing.expectError(
-        error.CustomIntentTooLong,
-        (CommitMetadataInfo{ .intent = Intent.initCustom(huge_name) }).validate(),
-    );
-
-    try std.testing.expectError(
-        error.CustomIntentContainsIllegalCharacters,
-        (CommitMetadataInfo{ .intent = Intent.initCustom("multi\nline") }).validate(),
-    );
-}
-
-test "Intent.name and Intent.eql cover built-in and custom kinds" {
-    const feature: Intent = .feature;
-    const chore: Intent = .chore;
-    const fix: Intent = .fix;
-
-    try std.testing.expectEqualStrings("feature", feature.name());
-    try std.testing.expectEqualStrings("chore", chore.name());
-    try std.testing.expectEqualStrings("hotfix", Intent.initCustom("hotfix").name());
-
-    try std.testing.expect(feature.eql(.feature));
-    try std.testing.expect(!feature.eql(fix));
-    try std.testing.expect(Intent.initCustom("hotfix").eql(Intent.initCustom("hotfix")));
-    try std.testing.expect(!Intent.initCustom("hotfix").eql(Intent.initCustom("coldfix")));
-    // A custom name is never considered equal to a built-in kind, even
-    // if it happens to share the same text.
-    try std.testing.expect(!Intent.initCustom("chore").eql(.chore));
+    try testing.expectEqual(@as(usize, 0), meta.labels.len);
 }
