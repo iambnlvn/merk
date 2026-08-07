@@ -23,7 +23,7 @@ const MemoryFs = storage.MemoryFs;
 
 const CommitBuilder = commit_mod.CommitBuilder;
 const CommitRequest = commit_mod.CommitRequest;
-const ParentInfo = commit_mod.parent.ParentInfo;
+const ParentInfo = commit_mod.ParentInfo;
 const ParentKind = commit_mod.ParentKind;
 const ReferenceStore = refs_mod.ReferenceStore;
 const ChannelName = refs_mod.ChannelName;
