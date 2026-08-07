@@ -87,11 +87,15 @@ pub const Repository = struct {
         if (already_initialized) {
             // Reinitializing over an existing repo: start from an empty
             // staging area rather than whatever `openInternal`'s
-            // `staging.load()` just picked up from the old one.
-            try self.staging.resetTo(&self.page_store, crypto.zero_hash);
+            // `staging.load()` just picked up from the old one. This is
+            // a plain list clear now — no zero_hash, no store lookup,
+            // nothing that can fail with NotFound. `replaceAll` persists
+            // on its own, so no separate `save()` is needed here.
+            try self.staging.replaceAll(&.{});
+        } else {
+            try self.staging.save();
         }
 
-        try self.staging.save();
         try self.ref_store.setCurrentToChannel(self.current_track);
 
         return self;
@@ -129,9 +133,11 @@ pub const Repository = struct {
         self.page_store = merkle_mod.PageStore.init(alloc, fs, "index/pages");
 
         // fs is already rooted at the control directory; the staging
-        // area gets its own "staging/{root,pages/}" subtree there,
-        // separate from the "index/pages" tree `page_store` above uses
-        // for commit snapshots.
+        // area's on-disk state is just "staging/entries" — a flat list,
+        // no tree, no pages of its own. Any Merkle tree built from
+        // staged content is built directly into `self.page_store`
+        // below, on demand (see `stagingTreeRoot`) — there is
+        // deliberately only ever one page store in this repository.
         self.staging = Staging.init(alloc, fs, "staging");
         errdefer self.staging.deinit();
         try self.staging.load();
@@ -245,6 +251,20 @@ pub const Repository = struct {
         try self.staging.save();
     }
 
+    /// Builds a Merkle tree from the current staging entries directly
+    /// into `self.page_store` — the repository's one permanent page
+    /// store — and returns its root hash. There is no cached tree on
+    /// `Staging` to go stale: this rebuilds from `staging.allEntries()`
+    /// every call. That's cheap, not wasteful — `PageStore.put` skips
+    /// any page whose hash already exists on disk, so a rebuild against
+    /// unchanged content touches no new storage. Every caller that needs
+    /// a hash for the staged tree (commit, status, diffStaged) goes
+    /// through this, so there is exactly one place staged content ever
+    /// becomes a tree, and it's always the permanent store.
+    fn stagingTreeRoot(self: *Repository) !Hash {
+        return merkle_mod.build(self.alloc, &self.page_store, self.staging.allEntries());
+    }
+
     /// Commit the currently-staged area as a child of the current
     /// track's HEAD (or as a root commit if the track has none yet).
     pub fn commit(self: *Repository, request: CommitRequest) !Hash {
@@ -256,14 +276,14 @@ pub const Repository = struct {
             break :blk parent_buf[0..1];
         } else &.{};
 
-        const tree_root = try merkle_mod.build(self.alloc, &self.page_store, self.staging.allEntries());
-
+        const tree_root = try self.stagingTreeRoot();
         return self.history.commit(self.current_track, tree_root, parents, request);
     }
 
     pub fn status(self: *Repository) !Status {
         const head_snapshot = try self.headSnapshot();
-        const staged = try self.staging.diffAgainst(head_snapshot);
+        const staged_root = try self.stagingTreeRoot();
+        const staged = try merkle_mod.diffRoots(self.alloc, &self.page_store, head_snapshot, staged_root);
         errdefer merkle_mod.freeChanges(self.alloc, staged);
 
         var unstaged: std.ArrayList(WorktreeEntryStatus) = .empty;
@@ -285,7 +305,8 @@ pub const Repository = struct {
     /// Diff HEAD against the currently staged area — same data as
     /// `status().staged`, exposed directly for a plain `merk diff --staged`.
     pub fn diffStaged(self: *Repository) ![]EntryChange {
-        return self.staging.diffAgainst(try self.headSnapshot());
+        const staged_root = try self.stagingTreeRoot();
+        return merkle_mod.diffRoots(self.alloc, &self.page_store, try self.headSnapshot(), staged_root);
     }
 
     /// Move the current track to `reset_options.target` per
@@ -297,7 +318,18 @@ pub const Repository = struct {
         var c = try commit_mod.read(self.alloc, &self.store, reset_options.target);
         defer c.deinit(self.alloc);
 
-        try self.staging.resetTo(&self.page_store, c.snapshot);
+        // Collect the target commit's entries from the shared store —
+        // the only store any commit's pages ever live in — then hand
+        // ownership straight to staging as a plain list. No tree gets
+        // rebuilt or persisted for staging itself.
+        var collected: std.ArrayList(merkle_mod.Entry) = .empty;
+        errdefer {
+            for (collected.items) |*e| e.deinit(self.alloc);
+            collected.deinit(self.alloc);
+        }
+        try merkle_mod.collect(self.alloc, &self.page_store, c.snapshot, &collected);
+        try self.staging.replaceAll(collected.items);
+        collected.deinit(self.alloc);
 
         if (reset_options.mode == .hard) try self.writeEntriesToWorktree();
     }
