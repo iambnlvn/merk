@@ -27,7 +27,7 @@ pub const MARKERS_DIR = "refs/markers";
 pub const PEERS_DIR = "refs/peers";
 
 /// This module's own error conditions. Every public function below can
-/// also return whatever `io.FileSystem` produces for a bad read/write
+/// also return whatever `storage.FileSystem` produces for a bad read/write
 /// (e.g. `error.FileNotFound`, permission errors) — those propagate
 /// through unchanged and aren't repeated here; only errors that
 /// originate in this module are named.
@@ -274,7 +274,7 @@ pub const RefStore = ReferenceStore;
 
 test "resolveCurrent - detached current with malformed hex propagates an error" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     try mem_fs.fs().writeFile(allocator, CURRENT_FILE, "not-a-valid-hash");
@@ -287,7 +287,7 @@ test "resolveCurrent - detached current with malformed hex propagates an error" 
 
 test "resolveCurrent - empty current file is treated as corrupt, not missing" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     try mem_fs.fs().writeFile(allocator, CURRENT_FILE, "");
@@ -300,7 +300,7 @@ test "resolveCurrent - empty current file is treated as corrupt, not missing" {
 
 test "resolveCurrent - symbolic current with malformed hex in target file errors" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -316,7 +316,7 @@ test "resolveCurrent - symbolic current with malformed hex in target file errors
 
 test "currentChannel - symbolic current with empty channel name" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     try mem_fs.fs().writeFile(allocator, CURRENT_FILE, current_mod.symbolic_prefix);
@@ -330,7 +330,7 @@ test "currentChannel - symbolic current with empty channel name" {
 
 test "updateChannel overwrites previous hash on the same channel" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -355,7 +355,7 @@ test "updateChannel overwrites previous hash on the same channel" {
 
 test "readChannel returns null for a channel that was never created" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -367,7 +367,7 @@ test "readChannel returns null for a channel that was never created" {
 
 test "switching current from detached to symbolic changes currentChannel result" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -388,7 +388,7 @@ test "switching current from detached to symbolic changes currentChannel result"
 
 test "switching channels via setCurrentToChannel changes what resolveCurrent follows" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -419,7 +419,7 @@ test "switching channels via setCurrentToChannel changes what resolveCurrent fol
 
 test "updateChannel handles deeply nested channel names with multiple path segments" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -442,7 +442,7 @@ test "updateChannel handles deeply nested channel names with multiple path segme
 
 test "hash round-trip preserves non-uniform byte patterns" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -461,7 +461,7 @@ test "hash round-trip preserves non-uniform byte patterns" {
 
 test "distinct channels with distinct hashes do not clobber each other" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -492,7 +492,7 @@ test "distinct channels with distinct hashes do not clobber each other" {
 
 test "setCurrentToChannel followed by setDetachedCurrent correctly overwrites symbolic state" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -520,7 +520,7 @@ test "setCurrentToChannel followed by setDetachedCurrent correctly overwrites sy
 
 test "currentState distinguishes symbolic from detached without resolving" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -550,7 +550,7 @@ test "currentState distinguishes symbolic from detached without resolving" {
 
 test "channelExists reflects whether a channel has ever been committed to" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -567,7 +567,7 @@ test "channelExists reflects whether a channel has ever been committed to" {
 
 test "deleteChannel removes the reference and errors on a repeat delete" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -586,7 +586,7 @@ test "deleteChannel removes the reference and errors on a repeat delete" {
 
 test "deleteChannelIfExists reports whether it actually deleted anything" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -605,7 +605,7 @@ test "deleteChannelIfExists reports whether it actually deleted anything" {
 
 test "renameChannel moves the hash and removes the old reference file" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -626,7 +626,7 @@ test "renameChannel moves the hash and removes the old reference file" {
 
 test "renameChannel errors on a missing source and on an existing destination without force" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -654,7 +654,7 @@ test "renameChannel errors on a missing source and on an existing destination wi
 
 test "listChannels finds nested channels and is empty for a fresh repo" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -702,7 +702,7 @@ test "reference layout is unified under a single refs/ root" {
 
 test "isCurrentChannel is true only for the channel Current symbolically points at" {
     const allocator = testing.allocator;
-    var mem_fs = storage.mem_fs.init(allocator);
+    var mem_fs = storage.MemoryFs.init(allocator);
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
@@ -729,7 +729,7 @@ test "os_fs: RefStore end-to-end with real filesystem" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var real_fs = storage.os_fs.init(tmp.dir);
+    var real_fs = storage.OsFs.init(tmp.dir);
     const store = RefStore.init(allocator, real_fs.fs());
     const main = try ChannelName.parse("main");
 
@@ -747,7 +747,7 @@ test "os_fs: current round-trips between symbolic and detached on real disk" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var real_fs = storage.os_fs.init(tmp.dir);
+    var real_fs = storage.OsFs.init(tmp.dir);
     const store = RefStore.init(allocator, real_fs.fs());
     const main = try ChannelName.parse("main");
 
@@ -771,7 +771,7 @@ test "os_fs: listChannels with nested paths on real disk" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var real_fs = storage.os_fs.init(tmp.dir);
+    var real_fs = storage.OsFs.init(tmp.dir);
     const store = RefStore.init(allocator, real_fs.fs());
 
     const main = try ChannelName.parse("main");
