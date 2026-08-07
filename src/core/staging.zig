@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
 
 const crypto = @import("crypto");
 const storage = @import("storage");
@@ -15,35 +16,49 @@ const OsFs = storage.OsFs;
 const Hash = crypto.Hash;
 const Entry = merkle_mod.Entry;
 const WorktreeState = merkle_mod.WorktreeState;
-const EntryChange = merkle_mod.EntryChange;
-const hashEq = merkle_mod.hashEq;
-const PageStore = merkle_mod.PageStore;
 
 pub const EntryIndex = @import("./staging/entry_index.zig").EntryIndex;
 
 /// The staging area: tracks files staged for the next commit.
+// NOTE:
+/// Deliberately holds no Merkle tree and no page store of its own.
+/// Earlier versions built and persisted a tree on every `save()`, into a
+/// private "staging/pages" directory separate from the repository's
+/// permanent "index/pages" store. That meant a staged tree's hash was
+/// only ever resolvable in the store it was built into — committing had
+/// to remember to re-materialize it into the permanent store, and any
+/// path that forgot (or that read a staged hash before that step ran)
+/// hit `error.NotFound` looking up pages that only existed in the other
+/// store.
+///
+/// A flat, in-memory (persisted as a plain list, not a tree) entry list
+/// removes the hazard entirely: there is nothing here that can be valid
+/// in one store and missing from another, because nothing here is
+/// store-addressed at all. The one Merkle tree Merk ever needs from
+/// staged content is built on demand — directly into the repository's
+/// shared, permanent `PageStore` — at the two moments that actually need
+/// a hash: committing, and diffing staged vs. HEAD (see
+/// `Repository.stagingTreeRoot`, `Repository.commit`, `Repository.status`
+/// in repo.zig). Because pages are content-addressed, rebuilding the same
+/// entries repeatedly is cheap — `PageStore.put` skips any page that's
+/// already on disk — so there's no real cost to never caching the root
+/// here.
 ///
 /// On-disk layout, rooted at `staging_dir`:
 /// ```md
 /// staging/
-/// ├── root   <- BLAKE3 hash of the root page of the serialized B-tree
-/// └── pages/ <- the B-tree's serialized pages, keyed by hash
+/// └── entries   <- flat, length-prefixed serialization of the entry list
 /// ```
 ///
 /// In-memory bookkeeping — the sorted entry list and the path -> index
-/// lookup map — is delegated to `EntryIndex`. `Staging` itself owns
-/// disk I/O (loading/persisting `root` and the page store) and the
-/// Merkle-tree operations (build/collect/diff) layered on top of it.
 pub const Staging = struct {
     alloc: Allocator,
     fs: Vfs,
-    /// Where the staging area's on-disk state (`root` file, page
-    /// store) lives, relative to `fs`'s root. Typically ".merk/staging"
-    /// when `fs` is rooted at the repo root.
+    /// Where the staging area's on-disk state (the `entries` file)
+    /// lives, relative to `fs`'s root. Typically ".merk/staging" when
+    /// `fs` is rooted at the repo root.
     dir: ComponentDir,
     index: EntryIndex,
-    /// The BLAKE3 hash of the root page of the serialized B-tree.
-    root: Hash = crypto.zero_hash,
 
     pub fn init(alloc: Allocator, fs: Vfs, staging_dir: []const u8) Staging {
         return .{
@@ -61,44 +76,33 @@ pub const Staging = struct {
     /// Load the staging area from disk. If none exists yet, starts empty.
     pub fn load(self: *Staging) !void {
         self.index.clear();
-        self.root = crypto.zero_hash;
 
-        const root_path = try self.dir.join(self.alloc, "root");
-        defer self.alloc.free(root_path);
+        const entries_path = try self.dir.join(self.alloc, "entries");
+        defer self.alloc.free(entries_path);
 
-        const root = (try readRoot(self.fs, self.alloc, root_path)) orelse {
+        const bytes = (try self.fs.readFile(self.alloc, entries_path)) orelse {
             // Nothing on disk yet — ensure in-memory state is consistent.
             try self.index.sortAndReindex();
             return;
         };
+        defer self.alloc.free(bytes);
 
-        self.root = root;
-        if (hashEq(root, crypto.zero_hash)) return;
-
-        const pages_dir = try self.dir.join(self.alloc, "pages");
-        defer self.alloc.free(pages_dir);
-        const store = PageStore.init(self.alloc, self.fs, pages_dir);
-
-        try merkle_mod.collect(self.alloc, &store, root, &self.index.entries);
+        try deserializeEntries(self.alloc, bytes, &self.index.entries);
         try self.index.sortAndReindex();
     }
 
-    /// Persist the current entries to disk as a Merkle B-tree.
+    /// Persist the current entries to disk as a flat list. No Merkle
+    /// tree is built or written here — see the type doc comment above.
     pub fn save(self: *Staging) !void {
         // Ensure path-sorted order for deterministic output and path_index consistency.
         try self.index.sortAndReindex();
 
-        const pages_dir = try self.dir.join(self.alloc, "pages");
-        defer self.alloc.free(pages_dir);
-        const store = PageStore.init(self.alloc, self.fs, pages_dir);
+        const bytes = try serializeEntries(self.alloc, self.index.allEntries());
+        defer self.alloc.free(bytes);
 
-        const root = try merkle_mod.build(self.alloc, &store, self.index.entries.items);
-
-        const root_path = try self.dir.join(self.alloc, "root");
-        defer self.alloc.free(root_path);
-        try self.fs.writeFile(self.alloc, root_path, &root);
-
-        self.root = root;
+        const entries_path = try self.dir.join(self.alloc, "entries");
+        defer self.alloc.free(entries_path);
+        try self.fs.writeFile(self.alloc, entries_path, bytes);
     }
 
     /// Look up a staged entry by its repository-relative path.
@@ -209,106 +213,100 @@ pub const Staging = struct {
         try self.index.upsert(entry);
     }
 
-    /// Discard current entries and reload from a commit snapshot's
-    /// Merkle root, then persist — the "jump the staging area to match
-    /// this snapshot" step behind `reset --mixed`/`--hard`. `page_store`
-    /// is the store the snapshot's tree pages live in (may differ from
-    /// the staging area's own on-disk page store).
-    pub fn resetTo(self: *Staging, page_store: *const PageStore, snapshot_root: Hash) !void {
+    /// Discard current entries and replace with `entries`, then persist.
+    /// Takes ownership of `entries` (each `Entry.path` is freed by this
+    /// `Staging`'s later `deinit`/`remove`/replace, same as any other
+    /// staged entry) — callers should not free `entries[i].path`
+    /// themselves after this call, and must not reuse the backing slice.
+    pub fn replaceAll(self: *Staging, entries: []Entry) !void {
         self.index.clear();
-        try merkle_mod.collect(self.alloc, page_store, snapshot_root, &self.index.entries);
+        for (entries) |e| try self.index.entries.append(self.alloc, e);
         try self.index.sortAndReindex();
         try self.save();
     }
-
-    /// Compute entry-level changes between `other_root` and the current
-    /// staging root. Caller owns the returned slice; free with `freeChanges`.
-    pub fn diffAgainst(self: *const Staging, other_root: Hash) merkle_mod.DiffError![]EntryChange {
-        const pages_dir = try self.dir.join(self.alloc, "pages");
-        defer self.alloc.free(pages_dir);
-        const store = PageStore.init(self.alloc, self.fs, pages_dir);
-        return merkle_mod.diffRoots(self.alloc, &store, other_root, self.root);
-    }
 };
 
-fn readRoot(fs: Vfs, alloc: Allocator, path: []const u8) !?Hash {
-    const bytes = (try fs.readFile(alloc, path)) orelse return null;
-    defer alloc.free(bytes);
+/// Flat serialization: `u32` entry count, then per entry —
+/// `u32` path length, path bytes, 32-byte blob hash, `u64` size (LE),
+/// `u64` mode (LE), `i128` mtime (LE). Field widths match `Entry`'s own
+/// types exactly (and the same widths `node.zig`'s leaf-entry wire
+/// format already uses for size/mode/mtime) — no narrowing casts. No
+/// tree structure, no page chunking — this is just "the list," written
+/// out plainly.
+fn serializeEntries(alloc: Allocator, entries: []const Entry) ![]u8 {
+    var out: ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
 
-    if (bytes.len != @sizeOf(Hash)) return error.CorruptIndex;
+    var count_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_buf, @intCast(entries.len), .little);
+    try out.appendSlice(alloc, &count_buf);
 
-    var root: Hash = undefined;
-    @memcpy(&root, bytes[0..@sizeOf(Hash)]);
-    return root;
+    for (entries) |e| {
+        var len_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(e.path.len), .little);
+        try out.appendSlice(alloc, &len_buf);
+        try out.appendSlice(alloc, e.path);
+        try out.appendSlice(alloc, &e.blob_hash);
+
+        var size_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &size_buf, e.size, .little);
+        try out.appendSlice(alloc, &size_buf);
+
+        var mode_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &mode_buf, e.mode, .little);
+        try out.appendSlice(alloc, &mode_buf);
+
+        var mtime_buf: [16]u8 = undefined;
+        std.mem.writeInt(i128, &mtime_buf, e.mtime, .little);
+        try out.appendSlice(alloc, &mtime_buf);
+    }
+
+    return try out.toOwnedSlice(alloc);
 }
 
-test "staging save and load round-trip through page store" {
-    const alloc = testing.allocator;
-    var mem_fs = MemoryFs.init(alloc);
-    defer mem_fs.deinit();
+fn deserializeEntries(alloc: Allocator, bytes: []const u8, out: *ArrayList(Entry)) !void {
+    if (bytes.len < 4) return error.CorruptStagingEntries;
+    var pos: usize = 0;
 
-    var staging = Staging.init(alloc, mem_fs.fs(), "merk");
-    defer staging.deinit();
-    try staging.index.entries.append(alloc, .{
-        .path = try alloc.dupe(u8, "src/main.zig"),
-        .blob_hash = crypto.blake3("main"),
-        .size = 4,
-        .mode = 0o100644,
-        .mtime = 123,
-    });
-    try staging.save();
+    const entry_count = std.mem.readInt(u32, bytes[0..4], .little);
+    pos += 4;
 
-    try testing.expect(mem_fs.hasFile("merk/root"));
-    try testing.expect(!hashEq(staging.root, crypto.zero_hash));
+    var i: u32 = 0;
+    while (i < entry_count) : (i += 1) {
+        if (pos + 4 > bytes.len) return error.CorruptStagingEntries;
+        const path_len = std.mem.readInt(u32, bytes[pos..][0..4], .little);
+        pos += 4;
 
-    var loaded = Staging.init(alloc, mem_fs.fs(), "merk");
-    defer loaded.deinit();
-    try loaded.load();
+        if (pos + path_len > bytes.len) return error.CorruptStagingEntries;
+        const path = try alloc.dupe(u8, bytes[pos..][0..path_len]);
+        errdefer alloc.free(path);
+        pos += path_len;
 
-    try testing.expectEqualSlices(u8, &staging.root, &loaded.root);
-    try testing.expectEqual(@as(usize, 1), loaded.index.entries.items.len);
-    try testing.expectEqualStrings("src/main.zig", loaded.index.entries.items[0].path);
-    try testing.expectEqualSlices(u8, &crypto.blake3("main"), &loaded.index.entries.items[0].blob_hash);
-    try testing.expectEqual(@as(u64, 4), loaded.index.entries.items[0].size);
-    try testing.expectEqual(@as(u64, 0o100644), loaded.index.entries.items[0].mode);
-    try testing.expectEqual(@as(i128, 123), loaded.index.entries.items[0].mtime);
-}
+        if (pos + 32 > bytes.len) return error.CorruptStagingEntries;
+        var blob_hash: Hash = undefined;
+        @memcpy(&blob_hash, bytes[pos..][0..32]);
+        pos += 32;
 
-test "staging writes multiple leaves behind internal root" {
-    const alloc = testing.allocator;
-    var mem_fs = MemoryFs.init(alloc);
-    defer mem_fs.deinit();
+        if (pos + 8 > bytes.len) return error.CorruptStagingEntries;
+        const size = std.mem.readInt(u64, bytes[pos..][0..8], .little);
+        pos += 8;
 
-    var staging = Staging.init(alloc, mem_fs.fs(), "merk");
-    defer staging.deinit();
+        if (pos + 8 > bytes.len) return error.CorruptStagingEntries;
+        const mode = std.mem.readInt(u64, bytes[pos..][0..8], .little);
+        pos += 8;
 
-    for (0..140) |i| {
-        const path = try std.fmt.allocPrint(alloc, "src/file-{d:0>3}.zig", .{i});
-        try staging.index.entries.append(alloc, .{
+        if (pos + 16 > bytes.len) return error.CorruptStagingEntries;
+        const mtime = std.mem.readInt(i128, bytes[pos..][0..16], .little);
+        pos += 16;
+
+        try out.append(alloc, .{
             .path = path,
-            .blob_hash = crypto.blake3(path),
-            .size = i,
-            .mode = 0o100644,
-            .mtime = @intCast(i),
+            .blob_hash = blob_hash,
+            .size = size,
+            .mode = mode,
+            .mtime = mtime,
         });
     }
-
-    try staging.save();
-
-    const store = PageStore.init(alloc, mem_fs.fs(), "merk/pages");
-    var root_page = try store.get(staging.root);
-    defer root_page.deinit(alloc);
-
-    switch (root_page) {
-        .internal => |children| try testing.expect(children.items.len > 1),
-        .leaf => return error.ExpectedInternalRoot,
-    }
-
-    var loaded = Staging.init(alloc, mem_fs.fs(), "merk");
-    defer loaded.deinit();
-    try loaded.load();
-    try testing.expectEqual(@as(usize, 140), loaded.index.entries.items.len);
-    try testing.expect(loaded.lookup("src/file-042.zig") != null);
 }
 
 test "staging addFile stores blob and upserts entry" {
@@ -330,7 +328,7 @@ test "staging addFile stores blob and upserts entry" {
     try tmp_dir.dir.writeFile(.{ .sub_path = "note.txt", .data = "second" });
     const hash2 = try staging.addFileFromDir(&object_store, tmp_dir.dir, "note.txt", "note.txt");
     try testing.expectEqual(@as(usize, 1), staging.count());
-    try testing.expect(!hashEq(hash1, hash2));
+    try testing.expect(!std.mem.eql(u8, &hash1, &hash2));
     try testing.expect(object_store.exists(hash2));
 }
 
@@ -432,7 +430,7 @@ test "staging remove drops a tracked path and reports NotFound afterward" {
     try testing.expectError(error.NotFound, staging.remove("drop.txt"));
 }
 
-test "staging diffAgainst short-circuits on identical roots" {
+test "staging save and load round-trip as a flat list" {
     const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
@@ -440,6 +438,103 @@ test "staging diffAgainst short-circuits on identical roots" {
     var staging = Staging.init(alloc, mem_fs.fs(), "merk");
     defer staging.deinit();
     try staging.index.entries.append(alloc, .{
+        .path = try alloc.dupe(u8, "src/main.zig"),
+        .blob_hash = crypto.blake3("main"),
+        .size = 4,
+        .mode = 0o100644,
+        .mtime = 123,
+    });
+    try staging.save();
+
+    try testing.expect(mem_fs.hasFile("merk/entries"));
+    try testing.expect(!mem_fs.hasFile("merk/root"));
+
+    var loaded = Staging.init(alloc, mem_fs.fs(), "merk");
+    defer loaded.deinit();
+    try loaded.load();
+
+    try testing.expectEqual(@as(usize, 1), loaded.index.entries.items.len);
+    try testing.expectEqualStrings("src/main.zig", loaded.index.entries.items[0].path);
+    try testing.expectEqualSlices(u8, &crypto.blake3("main"), &loaded.index.entries.items[0].blob_hash);
+    try testing.expectEqual(@as(u64, 4), loaded.index.entries.items[0].size);
+    try testing.expectEqual(@as(u64, 0o100644), loaded.index.entries.items[0].mode);
+    try testing.expectEqual(@as(i128, 123), loaded.index.entries.items[0].mtime);
+}
+
+test "staging save and load round-trip many entries out of insertion order" {
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+
+    var staging = Staging.init(alloc, mem_fs.fs(), "merk");
+    defer staging.deinit();
+
+    for (0..140) |i| {
+        const path = try std.fmt.allocPrint(alloc, "src/file-{d:0>3}.zig", .{i});
+        try staging.index.entries.append(alloc, .{
+            .path = path,
+            .blob_hash = crypto.blake3(path),
+            .size = i,
+            .mode = 0o100644,
+            .mtime = @intCast(i),
+        });
+    }
+
+    try staging.save();
+
+    var loaded = Staging.init(alloc, mem_fs.fs(), "merk");
+    defer loaded.deinit();
+    try loaded.load();
+    try testing.expectEqual(@as(usize, 140), loaded.index.entries.items.len);
+    try testing.expect(loaded.lookup("src/file-042.zig") != null);
+}
+
+test "staging replaceAll discards current entries and persists the replacement" {
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+
+    var staging = Staging.init(alloc, mem_fs.fs(), "merk");
+    defer staging.deinit();
+    try staging.put(.{
+        .path = try alloc.dupe(u8, "old.txt"),
+        .blob_hash = crypto.blake3("old"),
+        .size = 3,
+        .mode = 0o100644,
+        .mtime = 1,
+    });
+    try staging.save();
+
+    var replacement: ArrayList(Entry) = .empty;
+    try replacement.append(alloc, .{
+        .path = try alloc.dupe(u8, "new.txt"),
+        .blob_hash = crypto.blake3("new"),
+        .size = 3,
+        .mode = 0o100644,
+        .mtime = 2,
+    });
+    try staging.replaceAll(replacement.items);
+    replacement.deinit(alloc); // ownership of each entry's .path moved into staging.index
+
+    try testing.expectEqual(@as(usize, 1), staging.count());
+    try testing.expect(staging.lookup("old.txt") == null);
+    try testing.expect(staging.lookup("new.txt") != null);
+
+    var loaded = Staging.init(alloc, mem_fs.fs(), "merk");
+    defer loaded.deinit();
+    try loaded.load();
+    try testing.expectEqual(@as(usize, 1), loaded.count());
+    try testing.expect(loaded.lookup("new.txt") != null);
+}
+
+test "staging replaceAll with an empty slice clears staging (force reinit path)" {
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+
+    var staging = Staging.init(alloc, mem_fs.fs(), "merk");
+    defer staging.deinit();
+    try staging.put(.{
         .path = try alloc.dupe(u8, "a.txt"),
         .blob_hash = crypto.blake3("a"),
         .size = 1,
@@ -448,87 +543,10 @@ test "staging diffAgainst short-circuits on identical roots" {
     });
     try staging.save();
 
-    const changes = try staging.diffAgainst(staging.root);
-    defer merkle_mod.freeChanges(alloc, changes);
-    try testing.expectEqual(@as(usize, 0), changes.len);
-}
+    // This is the exact call `Repository.init(force=true)` makes — no
+    // Merkle tree, no zero_hash, no store lookup involved at all, so
+    // there's nothing here to crash the way the original bug did.
+    try staging.replaceAll(&.{});
 
-test "staging diffAgainst detects added, removed, and modified entries" {
-    const alloc = testing.allocator;
-    var mem_fs = MemoryFs.init(alloc);
-    defer mem_fs.deinit();
-
-    var old_staging = Staging.init(alloc, mem_fs.fs(), "merk");
-    defer old_staging.deinit();
-    try old_staging.index.entries.append(alloc, .{
-        .path = try alloc.dupe(u8, "keep.txt"),
-        .blob_hash = crypto.blake3("keep"),
-        .size = 4,
-        .mode = 0o100644,
-        .mtime = 1,
-    });
-    try old_staging.index.entries.append(alloc, .{
-        .path = try alloc.dupe(u8, "remove.txt"),
-        .blob_hash = crypto.blake3("remove"),
-        .size = 6,
-        .mode = 0o100644,
-        .mtime = 1,
-    });
-    try old_staging.index.entries.append(alloc, .{
-        .path = try alloc.dupe(u8, "change.txt"),
-        .blob_hash = crypto.blake3("before"),
-        .size = 6,
-        .mode = 0o100644,
-        .mtime = 1,
-    });
-    try old_staging.save();
-    const old_root = old_staging.root;
-
-    var new_staging = Staging.init(alloc, mem_fs.fs(), "merk");
-    defer new_staging.deinit();
-    try new_staging.load();
-
-    for (new_staging.index.entries.items, 0..) |entry, i| {
-        if (std.mem.eql(u8, entry.path, "remove.txt")) {
-            var removed = new_staging.index.entries.orderedRemove(i);
-            removed.deinit(alloc);
-            break;
-        }
-    }
-    try new_staging.index.entries.append(alloc, .{
-        .path = try alloc.dupe(u8, "new.txt"),
-        .blob_hash = crypto.blake3("new"),
-        .size = 3,
-        .mode = 0o100644,
-        .mtime = 2,
-    });
-    for (new_staging.index.entries.items) |*entry| {
-        if (std.mem.eql(u8, entry.path, "change.txt")) {
-            entry.deinit(alloc);
-            entry.* = .{
-                .path = try alloc.dupe(u8, "change.txt"),
-                .blob_hash = crypto.blake3("after"),
-                .size = 6,
-                .mode = 0o100644,
-                .mtime = 3,
-            };
-        }
-    }
-    try new_staging.save();
-
-    const changes = try new_staging.diffAgainst(old_root);
-    defer merkle_mod.freeChanges(alloc, changes);
-
-    var saw_added = false;
-    var saw_removed = false;
-    var saw_modified = false;
-    for (changes) |c| {
-        if (c.kind == .added and std.mem.eql(u8, c.path, "new.txt")) saw_added = true;
-        if (c.kind == .removed and std.mem.eql(u8, c.path, "remove.txt")) saw_removed = true;
-        if (c.kind == .modified and std.mem.eql(u8, c.path, "change.txt")) saw_modified = true;
-    }
-    try testing.expect(saw_added);
-    try testing.expect(saw_removed);
-    try testing.expect(saw_modified);
-    try testing.expectEqual(@as(usize, 3), changes.len);
+    try testing.expectEqual(@as(usize, 0), staging.count());
 }
