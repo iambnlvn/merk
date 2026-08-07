@@ -40,10 +40,11 @@ test "Repository.init sets up an empty repo focused on main, and refuses a secon
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
-    const repo = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
-    try std.testing.expectEqualStrings("main", repo.current_track.raw);
+    try std.testing.expectEqualStrings("main", repo.channel.raw);
     try std.testing.expectEqual(@as(usize, 0), repo.staging.count());
 
     try std.testing.expectError(error.AlreadyInitialized, Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{}));
@@ -55,16 +56,18 @@ test "Repository.init with force reinitializes over an existing repo instead of 
     defer mem_fs.deinit();
 
     {
-        const repo = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+        const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+        const repo = init_res.repository;
         defer repo.deinit();
         try stageFakeEntry(repo, "a.txt", "one");
         try std.testing.expectEqual(@as(usize, 1), repo.staging.count());
     }
 
-    const reinit = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{ .force = true });
+    const reinit_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{ .force = true });
+    const reinit = reinit_res.repository;
     defer reinit.deinit();
 
-    try std.testing.expectEqualStrings("main", reinit.current_track.raw);
+    try std.testing.expectEqualStrings("main", reinit.channel.raw);
     try std.testing.expectEqual(@as(usize, 0), reinit.staging.count());
 }
 
@@ -82,13 +85,13 @@ test "Repository.open round-trips an initialized repo's current track" {
     defer mem_fs.deinit();
 
     {
-        const repo = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
-        defer repo.deinit();
+        const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+        defer init_res.repository.deinit();
     }
 
     const reopened = try Repository.open(alloc, mem_fs.fs(), "/tmp/does-not-matter");
     defer reopened.deinit();
-    try std.testing.expectEqualStrings("main", reopened.current_track.raw);
+    try std.testing.expectEqualStrings("main", reopened.channel.raw);
 }
 
 test "commit advances the current track and status goes clean against HEAD" {
@@ -96,7 +99,8 @@ test "commit advances the current track and status goes clean against HEAD" {
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
-    const repo = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try stageFakeEntry(repo, "a.txt", "hello");
@@ -122,7 +126,8 @@ test "commit chains parents across two commits and log walks both" {
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
-    const repo = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try stageFakeEntry(repo, "a.txt", "one");
@@ -148,7 +153,8 @@ test "reset soft moves the track without touching the staging area" {
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
-    const repo = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try stageFakeEntry(repo, "a.txt", "one");
@@ -170,7 +176,8 @@ test "reset mixed rebuilds the staging area to match the target commit's snapsho
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
-    const repo = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try stageFakeEntry(repo, "a.txt", "one");
@@ -194,7 +201,8 @@ test "diffCommits reports the added path between two commit snapshots" {
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
-    const repo = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try stageFakeEntry(repo, "a.txt", "one");
@@ -231,7 +239,8 @@ test "add stages a real worktree file and status reports it, then commit clears 
 
     var control_fs = OsFs.init(control_tmp.dir);
 
-    const repo = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try repo.add(&.{"hello.txt"});
@@ -255,7 +264,8 @@ test "add rejects absolute paths and paths that escape the repo root" {
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
-    const repo = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try std.testing.expectError(error.AbsolutePath, repo.add(&.{"/etc/passwd"}));
@@ -276,7 +286,8 @@ test "restorePaths rewrites a modified worktree file back to the staged blob" {
     const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
 
     var control_fs = OsFs.init(control_tmp.dir);
-    const repo = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try repo.add(&.{"hello.txt"});
@@ -296,12 +307,173 @@ test "restorePaths errors on an untracked path without touching anything" {
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
-    const repo = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try std.testing.expectError(error.NotTracked, repo.restorePaths(&.{"never-added.txt"}));
 }
 
+test "restorePaths rejects path traversal attempts" {
+    const alloc = std.testing.allocator;
+
+    var control_tmp = std.testing.tmpDir(.{});
+    defer control_tmp.cleanup();
+    var worktree_tmp = std.testing.tmpDir(.{});
+    defer worktree_tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
+
+    var control_fs = OsFs.init(control_tmp.dir);
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
+    defer repo.deinit();
+
+    try std.testing.expectError(error.PathEscapesRoot, repo.restorePaths(&.{"../outside.txt"}));
+}
+
+test "restorePaths automatically creates missing parent directories" {
+    const alloc = std.testing.allocator;
+
+    var control_tmp = std.testing.tmpDir(.{});
+    defer control_tmp.cleanup();
+    var worktree_tmp = std.testing.tmpDir(.{});
+    defer worktree_tmp.cleanup();
+
+    // Create a file in a nested subdirectory, stage it, then delete the subdirectory
+    try worktree_tmp.dir.makePath("nested/deep");
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "nested/deep/file.txt", .data = "nested content" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
+
+    var control_fs = OsFs.init(control_tmp.dir);
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
+    defer repo.deinit();
+
+    try repo.add(&.{"nested/deep/file.txt"});
+
+    // Delete the nested directory structure completely from the worktree
+    try worktree_tmp.dir.deleteTree("nested");
+
+    // Restore paths should automatically recreate missing parent directories and write the file
+    try repo.restorePaths(&.{"nested/deep/file.txt"});
+
+    const restored = try worktree_tmp.dir.readFileAlloc(alloc, "nested/deep/file.txt", 1024);
+    defer alloc.free(restored);
+    try std.testing.expectEqualStrings("nested content", restored);
+}
+
+test "restorePaths errors when target path is occupied by a directory" {
+    const alloc = std.testing.allocator;
+
+    var control_tmp = std.testing.tmpDir(.{});
+    defer control_tmp.cleanup();
+    var worktree_tmp = std.testing.tmpDir(.{});
+    defer worktree_tmp.cleanup();
+
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "conflict.txt", .data = "original data" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
+
+    var control_fs = OsFs.init(control_tmp.dir);
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
+    defer repo.deinit();
+
+    try repo.add(&.{"conflict.txt"});
+
+    // Delete the file and replace it with a directory of the exact same name
+    try worktree_tmp.dir.deleteFile("conflict.txt");
+    try worktree_tmp.dir.makeDir("conflict.txt");
+
+    try std.testing.expectError(error.IsADirectory, repo.restorePaths(&.{"conflict.txt"}));
+}
+
+test "restorePaths successfully overwrites read-only files" {
+    const alloc = std.testing.allocator;
+
+    var control_tmp = std.testing.tmpDir(.{});
+    defer control_tmp.cleanup();
+    var worktree_tmp = std.testing.tmpDir(.{});
+    defer worktree_tmp.cleanup();
+
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "locked.txt", .data = "initial content" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
+
+    var control_fs = OsFs.init(control_tmp.dir);
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
+    defer repo.deinit();
+
+    try repo.add(&.{"locked.txt"});
+
+    // Modify content and simulate a read-only permission restriction on Unix systems
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "locked.txt", .data = "unwanted modification" });
+
+    const full_path = try std.fs.path.join(alloc, &.{ worktree_root, "locked.txt" });
+    defer alloc.free(full_path);
+
+    var locked_file = try std.fs.cwd().openFile(full_path, .{ .mode = .read_write });
+    defer locked_file.close();
+    // Set file permissions to read-only (chmod 444 equivalent)
+    try locked_file.chmod(0o444);
+
+    // Restoration should bypass or handle the read-only constraint cleanly by unlinking
+    try repo.restorePaths(&.{"locked.txt"});
+
+    const restored = try worktree_tmp.dir.readFileAlloc(alloc, "locked.txt", 1024);
+    defer alloc.free(restored);
+    try std.testing.expectEqualStrings("initial content", restored);
+}
+
+test "restorePaths errors when blob hash is missing from object store" {
+    const alloc = std.testing.allocator;
+
+    var control_tmp = std.testing.tmpDir(.{});
+    defer control_tmp.cleanup();
+    var worktree_tmp = std.testing.tmpDir(.{});
+    defer worktree_tmp.cleanup();
+
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "ghost.txt", .data = "some content" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
+
+    var control_fs = OsFs.init(control_tmp.dir);
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
+    defer repo.deinit();
+
+    try repo.add(&.{"ghost.txt"});
+
+    const entry = repo.staging.lookup("ghost.txt").?;
+    const blob_hash = entry.blob_hash;
+
+    // delete the backing blob file directly via the store's on-disk
+    // layout: "objects/xx/yy/<64-char hex hash>" (see Store.objectPath /
+    // ComponentDir.shardedPath).
+    var hex_buf: [64]u8 = undefined;
+    const hex = try std.fmt.bufPrint(&hex_buf, "{x}", .{blob_hash});
+
+    const shard_path = try std.fmt.allocPrint(
+        alloc,
+        "objects/{s}/{s}/{s}",
+        .{ hex[0..2], hex[2..4], hex },
+    );
+
+    defer alloc.free(shard_path);
+
+    try control_tmp.dir.deleteFile(shard_path);
+
+    // attempting to restore should now fail because the underlying blob is missing
+    try std.testing.expectError(error.BlobMissing, repo.restorePaths(&.{"ghost.txt"}));
+}
 test "removePaths deletes the worktree file by default, --cached leaves it" {
     const alloc = std.testing.allocator;
 
@@ -317,7 +489,8 @@ test "removePaths deletes the worktree file by default, --cached leaves it" {
     const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
 
     var control_fs = OsFs.init(control_tmp.dir);
-    const repo = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try repo.add(&.{ "a.txt", "b.txt" });
@@ -346,7 +519,8 @@ test "movePath renames on disk and in the staging area, preserving content" {
     const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
 
     var control_fs = OsFs.init(control_tmp.dir);
-    const repo = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try repo.add(&.{"old.txt"});
@@ -376,7 +550,8 @@ test "movePath refuses an already-tracked destination without force" {
     const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
 
     var control_fs = OsFs.init(control_tmp.dir);
-    const repo = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try repo.add(&.{ "a.txt", "b.txt" });
@@ -392,7 +567,8 @@ test "uncommit on a normal commit moves the track to its parent" {
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
-    const repo = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try stageFakeEntry(repo, "a.txt", "one");
@@ -417,7 +593,8 @@ test "uncommit on the root commit deletes the track ref, returning to 'no commit
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
-    const repo = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try stageFakeEntry(repo, "a.txt", "one");
@@ -440,7 +617,8 @@ test "uncommit errors with NoCommits when the track has never been committed to"
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
-    const repo = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try std.testing.expectError(error.NoCommits, repo.uncommit());
@@ -451,7 +629,8 @@ test "resolveRev accepts a full hash and rejects garbage" {
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
 
-    const repo = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const repo = init_res.repository;
     defer repo.deinit();
 
     try stageFakeEntry(repo, "a.txt", "one");
