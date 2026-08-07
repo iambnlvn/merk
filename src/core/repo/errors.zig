@@ -1,83 +1,91 @@
-//! The one error set every `Repository` method promises to use for
-//! ordinary, expected-to-happen conditions (a bad path, an ambiguous
-//! rev, a repo that's already there). It's the seam this module offers
-//! the CLI layer: match on `RepositoryError` and you've covered every
-//! *user-facing* failure a command can hit, without knowing anything
-//! about `Index`, `History`, `ReferenceStore`, or storage internals.
+//! User-facing errors produced by the Repository layer.
 //!
-//! It is NOT the full error union every method returns — Zig's
-//! inferred error sets mean things like `error.OutOfMemory` or a raw
-//! filesystem error can still surface from underneath. Those represent
-//! an environment or storage-layer failure rather than something a user
-//! did, so `describe` deliberately doesn't cover them: a caller that
-//! gets an error not handled by `describe` should treat it as "wrap in
-//! `@errorName` and report it as unexpected," not silently fall back to
-//! a made-up message.
+//! Repository methods may still return lower-level errors such as
+//! `OutOfMemory` or filesystem errors. Those are infrastructure
+//! failures rather than expected repository conditions and should be
+//! handled by the caller as unexpected errors.
+//!
+//! `RepositoryError` is the stable error boundary between the core
+//! repository and higher-level interfaces such as the CLI.
 
 pub const RepositoryError = error{
-    AlreadyInitialized,
-    NotARepository,
-    /// current points directly at a commit rather than a track. Every
-    /// mutating command here (`add`/`commit`/`reset`) needs a track to
-    /// advance, so detached current is out of scope for this facade —
-    /// surface it to the caller instead of guessing which track to use.
-    DetachedFocus,
 
-    // -- path arguments (add/rm/mv/restore) --
-    /// A path argument was already absolute; every path in this API is
-    /// repo-root-relative.
+    /// A repository is already initialized at the requested location.
+    AlreadyInitialized,
+
+    /// The requested path does not contain a valid Merk repository.
+    NotARepository,
+
+    /// The current reference is detached and the operation requires a
+    /// channel that can be advanced.
+    DetachedCurrent,
+
+
+    /// A path argument was absolute. Repository paths must be
+    /// relative to the repository root.
     AbsolutePath,
-    /// A path argument had a `..` segment that would resolve outside root.
+
+    /// A path argument would resolve outside the repository root.
     PathEscapesRoot,
-    /// The path isn't in the index — nothing to restore/remove/move/unstage.
+
+    /// The requested path is not tracked.
     NotTracked,
-    /// `movePath`'s destination is already tracked and `force` wasn't set.
+
+    /// A move destination is already tracked and force was not requested.
     DestinationTracked,
-    /// `movePath` was given the same path for `from` and `to`.
+
+    /// Source and destination refer to the same path.
     SamePath,
 
-    // -- history/rev resolution (show/diff/uncommit) --
-    /// The current track has no commits yet.
+    /// The requested path is tracked, but an existing filesystem entry
+    /// prevents the operation from proceeding.
+    ObstructedPath,
+
+
+    /// The current channel has no commits.
     NoCommits,
-    /// HEAD is a merge commit; `uncommit` only supports linear history.
+
+    /// The current commit has multiple parents, but the operation only
+    /// supports linear history.
     MergeCommit,
-    /// A short hash prefix passed to `resolveRev` matched more than one object.
+
+    /// A revision prefix matches multiple commits.
     AmbiguousRev,
-    /// Neither a full hash nor a known prefix.
+
+    /// No commit matches the requested revision.
     RevNotFound,
-    /// Not valid hex and not a resolvable prefix either.
+
+    /// The supplied revision is neither a valid hash nor a resolvable
+    /// revision prefix.
     InvalidRev,
+
+
+    /// A referenced blob could not be found in the object store.
+    BlobMissing,
 };
 
-/// One-line, user-facing description of each `RepositoryError` variant.
-/// This is the whole pattern for how `Repository` talks to a CLI:
-///
-///   1. A command builds an Options struct from parsed flags/args.
-///   2. It calls exactly one `Repository` method.
-///   3. On failure, if the error is a `RepositoryError`, it prints
-///      `describe(err)`. Anything else is unexpected — print
-///      `@errorName(err)` and treat it as a bug report, not a normal
-///      failure mode.
-///
-/// The switch is exhaustive over `RepositoryError`'s fields on purpose:
-/// adding a new variant is a compile error here until it gets a
-/// description, so the CLI can never silently fall through to a
-/// generic message for a condition this module already knows how to
-/// name.
+
+/// intentionally exhaustive. Adding a new RepositoryError
+/// requires adding its corresponding description here
 pub fn describe(err: RepositoryError) []const u8 {
     return switch (err) {
-        error.AlreadyInitialized => "a repository already exists here",
-        error.NotARepository => "not a merk repository (no current found)",
-        error.DetachedFocus => "current is detached from a track; this command needs one",
+        error.AlreadyInitialized => "repository already initialized",
+        error.NotARepository => "not a merk repository",
+        error.DetachedCurrent => "current is detached; this command requires an active channel",
+
         error.AbsolutePath => "path must be relative to the repository root",
         error.PathEscapesRoot => "path escapes the repository root",
         error.NotTracked => "path is not tracked",
-        error.DestinationTracked => "destination is already tracked (use force to overwrite)",
+        error.DestinationTracked => "destination is already tracked",
         error.SamePath => "source and destination are the same path",
-        error.NoCommits => "the current track has no commits yet",
-        error.MergeCommit => "HEAD is a merge commit; this command only supports linear history",
-        error.AmbiguousRev => "that prefix matches more than one commit",
-        error.RevNotFound => "no commit matches that reference",
-        error.InvalidRev => "not a valid commit hash or prefix",
+        error.ObstructedPath => "path is obstructed by an existing filesystem entry",
+
+        error.NoCommits => "the current channel has no commits",
+        error.MergeCommit => "the current commit is a merge commit; this command only supports linear history",
+        error.AmbiguousRev => "revision prefix matches multiple commits",
+        error.RevNotFound => "no commit matches that revision",
+        error.InvalidRev => "not a valid commit hash or revision prefix",
+
+        error.BlobMissing => "referenced blob is missing from the object store",
     };
 }

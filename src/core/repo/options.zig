@@ -12,7 +12,7 @@ const Hash = crypto.Hash;
 
 /// Options for `Repository.init`.
 pub const InitOptions = struct {
-    /// Bypass `error.AlreadyInitialized` and reinitialize Focus plus
+    /// Bypass `error.AlreadyInitialized` and reinitialize Current plus
     /// the index against a fresh "main" track. Does NOT delete existing
     /// objects, commits, or other tracks already in the control
     /// directory — tearing down a repo's data entirely is a CLI-level
