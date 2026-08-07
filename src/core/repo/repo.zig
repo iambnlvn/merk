@@ -48,6 +48,49 @@ pub const WorktreeEntryStatus = status_mod.WorktreeEntryStatus;
 
 const Vfs = storage.Vfs;
 
+const OwnedChannel = struct {
+    /// Backing storage `parsed` borrows from. Never read directly by
+    /// callers outside this type — go through `get()`.
+    raw: []u8,
+    parsed: ChannelName,
+
+    fn init(alloc: Allocator, name: []const u8) !OwnedChannel {
+        const owned = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned);
+        return .{ .raw = owned, .parsed = try ChannelName.parse(owned) };
+    }
+
+    /// Reparses and swaps in `name` as the new active channel,
+    /// replacing the old backing storage only after the new one has
+    /// been successfully allocated and parsed — so a failed `set`
+    /// (bad allocation or an invalid name) leaves the previous channel
+    /// fully intact rather than half-updated.
+    fn set(self: *OwnedChannel, alloc: Allocator, name: []const u8) !void {
+        const owned = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned);
+        const parsed = try ChannelName.parse(owned);
+
+        alloc.free(self.raw);
+        self.raw = owned;
+        self.parsed = parsed;
+    }
+
+    fn get(self: *const OwnedChannel) ChannelName {
+        return self.parsed;
+    }
+
+    fn deinit(self: *OwnedChannel, alloc: Allocator) void {
+        alloc.free(self.raw);
+    }
+};
+
+pub const InitResult = struct {
+    repository: *Repository,
+    action: Action,
+
+    pub const Action = enum { initialized, reinitialized };
+};
+
 pub const Repository = struct {
     alloc: Allocator,
     fs: Vfs,
@@ -58,21 +101,15 @@ pub const Repository = struct {
     staging: Staging,
     history: History,
     ref_store: ReferenceStore,
-    /// Owned backing storage for `current_track.raw`.
-    current_track_name: []u8,
-    current_track: ChannelName,
+    /// Owned backing storage for `channel.get().raw`.
+    channel: OwnedChannel,
 
     /// Create a repository. `fs` must already be rooted at the control
     /// directory. Fails with `error.AlreadyInitialized` if Focus is
     /// already set there, unless `options.force` is set — see
     /// `InitOptions.force`'s doc comment for exactly what force does
     /// and doesn't touch.
-    ///
-    /// Returns `*Repository`: `History` holds raw `*const Store` /
-    /// `*const PageStore` pointers, so `Repository` must live at one
-    /// fixed heap address for its whole lifetime — never move or copy
-    /// a `Repository` value once one of these has been created.
-    pub fn init(alloc: Allocator, fs: Vfs, root: []const u8, init_options: InitOptions) !*Repository {
+    pub fn init(alloc: Allocator, fs: Vfs, root: []const u8, init_options: InitOptions) !InitResult {
         const probe = ReferenceStore.init(alloc, fs);
         const already_initialized = if (try probe.currentState()) |existing| blk: {
             existing.deinit(alloc);
@@ -96,13 +133,15 @@ pub const Repository = struct {
             try self.staging.save();
         }
 
-        try self.ref_store.setCurrentToChannel(self.current_track);
-
-        return self;
+        try self.ref_store.setCurrentToChannel(self.channel.get());
+        return .{
+            .repository = self,
+            .action = if (already_initialized) .reinitialized else .initialized,
+        };
     }
 
     /// Open an existing repository. `error.NotARepository` if no Focus
-    /// file exists yet; `error.DetachedFocus` if Focus points directly
+    /// file exists yet; `error.DetachedCurrent` if Focus points directly
     /// at a commit rather than a track (see `RepositoryError`).
     pub fn open(alloc: Allocator, fs: Vfs, root: []const u8) !*Repository {
         const ref_store = ReferenceStore.init(alloc, fs);
@@ -111,7 +150,7 @@ pub const Repository = struct {
 
         const channel_name = switch (state) {
             .symbolic => |s| s,
-            .detached => return error.DetachedFocus,
+            .detached => return error.DetachedCurrent,
         };
 
         return openInternal(alloc, fs, root, channel_name);
@@ -145,10 +184,8 @@ pub const Repository = struct {
         self.root = try alloc.dupe(u8, root);
         errdefer alloc.free(self.root);
 
-        self.current_track_name = try alloc.dupe(u8, channel_name);
-        errdefer alloc.free(self.current_track_name);
-        self.current_track = try ChannelName.parse(self.current_track_name);
-
+        self.channel = try OwnedChannel.init(alloc, channel_name);
+        errdefer self.channel.deinit(alloc);
         self.ref_store = ReferenceStore.init(alloc, fs);
 
         self.history = try History.init(alloc, fs, "history", &self.store, &self.page_store);
@@ -160,7 +197,7 @@ pub const Repository = struct {
         self.staging.deinit();
         self.history.deinit();
         self.alloc.free(self.root);
-        self.alloc.free(self.current_track_name);
+        self.channel.deinit(self.alloc);
         self.alloc.destroy(self);
     }
 
@@ -268,7 +305,7 @@ pub const Repository = struct {
     /// Commit the currently-staged area as a child of the current
     /// track's HEAD (or as a root commit if the track has none yet).
     pub fn commit(self: *Repository, request: CommitRequest) !Hash {
-        const repo_head = try self.ref_store.readChannel(self.current_track);
+        const repo_head = try self.ref_store.readChannel(self.channel.get());
 
         var parent_buf: [1]ParentInfo = undefined;
         const parents: []const ParentInfo = if (repo_head) |h| blk: {
@@ -277,7 +314,7 @@ pub const Repository = struct {
         } else &.{};
 
         const tree_root = try self.stagingTreeRoot();
-        return self.history.commit(self.current_track, tree_root, parents, request);
+        return self.history.commit(self.channel.get(), tree_root, parents, request);
     }
 
     pub fn status(self: *Repository) !Status {
@@ -312,7 +349,7 @@ pub const Repository = struct {
     /// Move the current track to `reset_options.target` per
     /// `reset_options.mode`. See `ResetMode` for what each level touches.
     pub fn reset(self: *Repository, reset_options: ResetOptions) !void {
-        try self.ref_store.updateChannel(self.current_track, reset_options.target);
+        try self.ref_store.updateChannel(self.channel.get(), reset_options.target);
         if (reset_options.mode == .soft) return;
 
         var c = try commit_mod.read(self.alloc, &self.store, reset_options.target);
@@ -341,19 +378,30 @@ pub const Repository = struct {
     /// leave some files overwritten and others not.
     pub fn restorePaths(self: *Repository, paths: []const []const u8) !void {
         for (paths) |p| {
-            if (self.staging.lookup(p) == null) return error.NotTracked;
+            try validateRelativePath(p);
+
+            const entry = self.staging.lookup(p) orelse return error.NotTracked;
+            if (!self.store.exists(entry.blob_hash)) return error.BlobMissing;
         }
+
+        // execute restoration. writeBlobToWorktree handles parent
+        // directory creation, the directory-collision check, and atomic
+        // replacement of any existing file
         for (paths) |p| {
             const entry = self.staging.lookup(p).?;
             try self.writeBlobToWorktree(p, entry.blob_hash);
         }
     }
-
-    /// Writes one blob's content to `<root>/<path>` on the real
-    /// filesystem, creating parent directories as needed. The one place
-    /// staged content gets materialized into the worktree —
-    /// `reset(.hard)` and `restorePaths` both go through this instead of
-    /// each having their own copy of the join/mkdir/writeFile sequence.
+    /// Writes one blob's content to `<root>/<path>` on the real filesystem,
+    /// creating parent directories as needed. The one place staged content
+    /// gets materialized into the worktree — `reset(.hard)` and
+    /// `restorePaths` both go through this instead of each having their own
+    /// copy of the join/mkdir/writeFile sequence.
+    ///
+    /// Writes via a temp file + rename so a failure partway through (blob
+    /// missing, disk full, process killed) never destroys content that was
+    /// already at `path` — the old file is only replaced once the new
+    /// content is fully and successfully written.
     fn writeBlobToWorktree(self: *Repository, path: []const u8, blob_hash: Hash) !void {
         const dir = std.fs.cwd();
         const obj = try self.store.get(blob_hash);
@@ -362,10 +410,48 @@ pub const Repository = struct {
         const full_path = try std.fs.path.join(self.alloc, &.{ self.root, path });
         defer self.alloc.free(full_path);
 
-        if (std.fs.path.dirname(full_path)) |d| try dir.makePath(d);
-        try dir.writeFile(.{ .sub_path = full_path, .data = obj.payload });
-    }
+        if (std.fs.path.dirname(full_path)) |d| {
+            dir.makePath(d) catch |err| switch (err) {
+                error.NotDir => return error.ObstructedPath,
+                else => |e| return e,
+            };
+        }
 
+        // Reject only if something *else* occupies the target path.
+        // A stat failure that isn't FileNotFound (permissions, symlink
+        // loops, ...) must propagate rather than being treated as "safe".
+        if (dir.statFile(full_path)) |stat| {
+            if (stat.kind == .directory) return error.IsADirectory;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => |e| return e,
+        }
+
+        const dir_path = std.fs.path.dirname(full_path) orelse ".";
+        const base_name = std.fs.path.basename(full_path);
+
+        var tmp_name_buf: [std.fs.max_name_bytes]u8 = undefined;
+        const tmp_name = try std.fmt.bufPrint(
+            &tmp_name_buf,
+            ".{s}.merk-tmp-{d}",
+            .{ base_name, std.time.nanoTimestamp() },
+        );
+
+        const tmp_path = try std.fs.path.join(self.alloc, &.{ dir_path, tmp_name });
+        defer self.alloc.free(tmp_path);
+
+        {
+            const file = try dir.createFile(tmp_path, .{});
+            defer file.close();
+            try file.writeAll(obj.payload);
+        }
+        errdefer dir.deleteFile(tmp_path) catch {};
+
+        // Atomic on POSIX (rename(2) replaces the destination in one step).
+        // ?TO confime onn windows, Zig's Dir.rename uses MOVEFILE_REPLACE_EXISTING, so it
+        // also replaces an existing target
+        try dir.rename(tmp_path, full_path);
+    }
     fn writeEntriesToWorktree(self: *Repository) !void {
         for (self.staging.allEntries()) |entry| {
             try self.writeBlobToWorktree(entry.path, entry.blob_hash);
@@ -373,7 +459,7 @@ pub const Repository = struct {
     }
 
     pub fn log(self: *Repository, filter: history_mod.EdgeFilter) !?history_mod.RevWalk {
-        return self.history.log(self.current_track, filter);
+        return self.history.log(self.channel.get(), filter);
     }
 
     /// Current track's HEAD commit hash, or `null` if the track has no
@@ -381,7 +467,7 @@ pub const Repository = struct {
     /// `uncommit`) needs this — public so they read it here instead of
     /// reaching into `ref_store` directly.
     pub fn head(self: *Repository) !?Hash {
-        return self.ref_store.readChannel(self.current_track);
+        return self.ref_store.readChannel(self.channel.get());
     }
 
     /// Resolves a commit reference: a full 64-char hex hash, or an 8+
@@ -428,12 +514,12 @@ pub const Repository = struct {
         if (c.parents.len > 1) return error.MergeCommit;
 
         if (c.parents.len == 0) {
-            try self.ref_store.deleteChannel(self.current_track);
+            try self.ref_store.deleteChannel(self.channel.get());
             return .{ .undone = head_hash, .new_head = null };
         }
 
         const parent_hash = c.parents[0].hash;
-        try self.ref_store.updateChannel(self.current_track, parent_hash);
+        try self.ref_store.updateChannel(self.channel.get(), parent_hash);
         return .{ .undone = head_hash, .new_head = parent_hash };
     }
 
