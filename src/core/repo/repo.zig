@@ -469,9 +469,38 @@ pub const Repository = struct {
         try dir.rename(tmp_path, full_path);
     }
     fn writeEntriesToWorktree(self: *Repository) !void {
-        for (self.staging.allEntries()) |entry| {
-            try self.writeBlobToWorktree(entry.path, entry.blob_hash);
+        const Snapshot = struct { path: []const u8, blob_hash: Hash };
+        var snapshot: std.ArrayList(Snapshot) = .empty;
+        defer {
+            for (snapshot.items) |s| self.alloc.free(s.path);
+            snapshot.deinit(self.alloc);
         }
+        for (self.staging.allEntries()) |entry| {
+            try snapshot.append(self.alloc, .{
+                .path = try self.alloc.dupe(u8, entry.path),
+                .blob_hash = entry.blob_hash,
+            });
+        }
+
+        const dir = std.fs.cwd();
+        for (snapshot.items) |s| {
+            try self.writeBlobToWorktree(s.path, s.blob_hash);
+
+            const full_path = try std.fs.path.join(self.alloc, &.{ self.root, s.path });
+            defer self.alloc.free(full_path);
+            const stat = try dir.statFile(full_path);
+
+            const path_copy = try self.alloc.dupe(u8, s.path);
+            errdefer self.alloc.free(path_copy);
+            try self.staging.put(.{
+                .path = path_copy,
+                .blob_hash = s.blob_hash,
+                .size = stat.size,
+                .mode = stat.mode,
+                .mtime = stat.mtime,
+            });
+        }
+        try self.staging.save();
     }
 
     pub fn log(self: *Repository, filter: history_mod.EdgeFilter) !?history_mod.RevWalk {
