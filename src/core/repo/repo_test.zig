@@ -577,7 +577,7 @@ test "uncommit on a normal commit moves the track to its parent" {
     try stageFakeEntry(repo, "b.txt", "two");
     const c2 = try repo.commit(testRequest("add b.txt", 2000));
 
-    const result = try repo.uncommit();
+    const result = try repo.uncommit(.{});
     try std.testing.expect(merkle_mod.hashEq(result.undone, c2));
     try std.testing.expect(result.new_head != null);
     try std.testing.expect(merkle_mod.hashEq(result.new_head.?, c1));
@@ -600,7 +600,7 @@ test "uncommit on the root commit deletes the track ref, returning to 'no commit
     try stageFakeEntry(repo, "a.txt", "one");
     const c1 = try repo.commit(testRequest("add a.txt", 1000));
 
-    const result = try repo.uncommit();
+    const result = try repo.uncommit(.{});
     try std.testing.expect(merkle_mod.hashEq(result.undone, c1));
     try std.testing.expectEqual(@as(?Hash, null), result.new_head);
 
@@ -621,7 +621,233 @@ test "uncommit errors with NoCommits when the track has never been committed to"
     const repo = init_res.repository;
     defer repo.deinit();
 
-    try std.testing.expectError(error.NoCommits, repo.uncommit());
+    try std.testing.expectError(error.NoCommits, repo.uncommit(.{}));
+}
+
+test "uncommit keep preserves a post-commit worktree edit as the new staged content" {
+    const alloc = std.testing.allocator;
+
+    var control_tmp = std.testing.tmpDir(.{});
+    defer control_tmp.cleanup();
+    var worktree_tmp = std.testing.tmpDir(.{});
+    defer worktree_tmp.cleanup();
+
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "hello.txt", .data = "hello" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
+
+    var control_fs = OsFs.init(control_tmp.dir);
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
+    defer repo.deinit();
+
+    try repo.add(&.{"hello.txt"});
+    const c1 = try repo.commit(testRequest("add hello.txt", 1000));
+
+    // Edit made after the commit — this is the change `.keep` must preserve.
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "hello.txt", .data = "hello world" });
+
+    const result = try repo.uncommit(.{ .mode = .keep });
+    try std.testing.expect(merkle_mod.hashEq(result.undone, c1));
+    try std.testing.expectEqual(@as(?Hash, null), result.new_head);
+    try std.testing.expectEqual(@as(?Hash, null), try repo.head());
+
+    try std.testing.expectEqual(@as(usize, 1), repo.staging.count());
+    const entry = repo.staging.lookup("hello.txt").?;
+
+    // Verify by content through the store, not by hand-computing the
+    // hash — `addFile`/`store.putReader` hash type+size+content (or
+    // similar object framing), not raw `blake3(content)`, so those two
+    // will never be equal. Content round-trip is what actually matters.
+    const obj = try repo.store.get(entry.blob_hash);
+    defer alloc.free(obj.payload);
+    try std.testing.expectEqualStrings("hello world", obj.payload);
+
+    // Also confirm it's NOT still pointing at the original "hello" blob.
+    try std.testing.expect(!merkle_mod.hashEq(entry.blob_hash, crypto.blake3("hello")));
+}
+
+test "uncommit keep errors with TrackedPathsMissing and touches nothing when a tracked file was deleted" {
+    const alloc = std.testing.allocator;
+
+    var control_tmp = std.testing.tmpDir(.{});
+    defer control_tmp.cleanup();
+    var worktree_tmp = std.testing.tmpDir(.{});
+    defer worktree_tmp.cleanup();
+
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "one" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
+
+    var control_fs = OsFs.init(control_tmp.dir);
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
+    defer repo.deinit();
+
+    try repo.add(&.{"a.txt"});
+    const c1 = try repo.commit(testRequest("add a.txt", 1000));
+
+    // Simulate a deliberate refactor/cleanup deletion after the commit.
+    try worktree_tmp.dir.deleteFile("a.txt");
+
+    try std.testing.expectError(error.TrackedPathsMissing, repo.uncommit(.{ .mode = .keep }));
+
+    // Nothing moved: ref, staging, and the (already-deleted) file's
+    // tracked status are all exactly as they were before the call.
+    const h = try repo.head();
+    try std.testing.expect(merkle_mod.hashEq(h.?, c1));
+    try std.testing.expectEqual(@as(usize, 1), repo.staging.count());
+    try std.testing.expect(repo.staging.lookup("a.txt") != null);
+}
+
+test "uncommit mixed with a parent rebuilds staging to match the parent's committed tree" {
+    const alloc = std.testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+
+    const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const repo = init_res.repository;
+    defer repo.deinit();
+
+    try stageFakeEntry(repo, "a.txt", "one");
+    const c1 = try repo.commit(testRequest("add a.txt", 1000));
+
+    try stageFakeEntry(repo, "b.txt", "two");
+    const c2 = try repo.commit(testRequest("add b.txt", 2000));
+
+    const result = try repo.uncommit(.{ .mode = .mixed });
+    try std.testing.expect(merkle_mod.hashEq(result.undone, c2));
+    try std.testing.expect(merkle_mod.hashEq(result.new_head.?, c1));
+
+    const h = try repo.head();
+    try std.testing.expect(merkle_mod.hashEq(h.?, c1));
+    try std.testing.expectEqual(@as(usize, 1), repo.staging.count());
+    try std.testing.expectEqualStrings("a.txt", repo.staging.allEntries()[0].path);
+}
+
+test "uncommit mixed on the root commit clears staging entirely (no parent tree to rebuild from)" {
+    const alloc = std.testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+
+    const init_res = try Repository.init(alloc, mem_fs.fs(), "/tmp/does-not-matter", .{});
+    const repo = init_res.repository;
+    defer repo.deinit();
+
+    try stageFakeEntry(repo, "a.txt", "one");
+    const c1 = try repo.commit(testRequest("add a.txt", 1000));
+
+    const result = try repo.uncommit(.{ .mode = .mixed });
+    try std.testing.expect(merkle_mod.hashEq(result.undone, c1));
+    try std.testing.expectEqual(@as(?Hash, null), result.new_head);
+
+    try std.testing.expectEqual(@as(?Hash, null), try repo.head());
+    try std.testing.expectEqual(@as(usize, 0), repo.staging.count());
+}
+
+test "uncommit hard with a parent rewrites the worktree to match the parent's content" {
+    const alloc = std.testing.allocator;
+
+    var control_tmp = std.testing.tmpDir(.{});
+    defer control_tmp.cleanup();
+    var worktree_tmp = std.testing.tmpDir(.{});
+    defer worktree_tmp.cleanup();
+
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "one" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
+
+    var control_fs = OsFs.init(control_tmp.dir);
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
+    defer repo.deinit();
+
+    try repo.add(&.{"a.txt"});
+    const c1 = try repo.commit(testRequest("add a.txt", 1000));
+
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "b.txt", .data = "two" });
+    try repo.add(&.{"b.txt"});
+    _ = try repo.commit(testRequest("add b.txt", 2000));
+
+    const result = try repo.uncommit(.{ .mode = .hard });
+    try std.testing.expect(merkle_mod.hashEq(result.new_head.?, c1));
+
+    // Staging rebuilt from c1's tree: only a.txt is tracked now.
+    try std.testing.expectEqual(@as(usize, 1), repo.staging.count());
+    try std.testing.expect(repo.staging.lookup("a.txt") != null);
+    try std.testing.expect(repo.staging.lookup("b.txt") == null);
+
+    // reset(.hard)'s worktree rewrite only writes currently-staged
+    // entries; it doesn't delete files that fell out of staging, so
+    // b.txt is expected to still exist on disk, just untracked.
+    const a_content = try worktree_tmp.dir.readFileAlloc(alloc, "a.txt", 1024);
+    defer alloc.free(a_content);
+    try std.testing.expectEqualStrings("one", a_content);
+}
+
+test "uncommit hard on the root commit requires confirm_root_hard and otherwise touches nothing" {
+    const alloc = std.testing.allocator;
+
+    var control_tmp = std.testing.tmpDir(.{});
+    defer control_tmp.cleanup();
+    var worktree_tmp = std.testing.tmpDir(.{});
+    defer worktree_tmp.cleanup();
+
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "one" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
+
+    var control_fs = OsFs.init(control_tmp.dir);
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
+    defer repo.deinit();
+
+    try repo.add(&.{"a.txt"});
+    const c1 = try repo.commit(testRequest("add a.txt", 1000));
+
+    try std.testing.expectError(
+        error.RootHardUncommitRequiresConfirmation,
+        repo.uncommit(.{ .mode = .hard }),
+    );
+
+    // Refused before touching the ref, staging, or the worktree file.
+    const h = try repo.head();
+    try std.testing.expect(merkle_mod.hashEq(h.?, c1));
+    try std.testing.expectEqual(@as(usize, 1), repo.staging.count());
+    try worktree_tmp.dir.access("a.txt", .{});
+}
+
+test "uncommit hard on the root commit with confirm_root_hard deletes tracked files and clears state" {
+    const alloc = std.testing.allocator;
+
+    var control_tmp = std.testing.tmpDir(.{});
+    defer control_tmp.cleanup();
+    var worktree_tmp = std.testing.tmpDir(.{});
+    defer worktree_tmp.cleanup();
+
+    try worktree_tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "one" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const worktree_root = try worktree_tmp.dir.realpath(".", &path_buf);
+
+    var control_fs = OsFs.init(control_tmp.dir);
+    const init_res = try Repository.init(alloc, control_fs.fs(), worktree_root, .{});
+    const repo = init_res.repository;
+    defer repo.deinit();
+
+    try repo.add(&.{"a.txt"});
+    _ = try repo.commit(testRequest("add a.txt", 1000));
+
+    const result = try repo.uncommit(.{ .mode = .hard, .confirm_root_hard = true });
+    try std.testing.expectEqual(@as(?Hash, null), result.new_head);
+
+    try std.testing.expectEqual(@as(?Hash, null), try repo.head());
+    try std.testing.expectEqual(@as(usize, 0), repo.staging.count());
+    try std.testing.expectError(error.FileNotFound, worktree_tmp.dir.access("a.txt", .{}));
 }
 
 test "resolveRev accepts a full hash and rejects garbage" {

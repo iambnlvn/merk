@@ -494,32 +494,143 @@ pub const Repository = struct {
         new_head: ?Hash,
     };
 
-    /// Moves the current track back one commit (a soft undo — the
-    /// staging area is left exactly as it was, so the undone commit's changes stay
-    /// staged and ready to edit or re-commit). If HEAD is the root
-    /// commit, there's no parent to move to, so this deletes the track's
-    /// ref entirely instead — the same "no ref file yet" state every
-    /// other command already treats as "no commits" (`head()` returning
-    /// `null`, `commit`'s root-commit path).
+    pub const UncommitMode = enum {
+        /// Default. Only moves/deletes the ref — staging and worktree
+        /// untouched (whatever staging held before uncommit, it still holds).
+        soft,
+        /// Staging rebuilt from the parent commit's tree (or emptied, at
+        /// root); worktree untouched. Delegates to `reset(.mixed)`.
+        mixed,
+        /// Staging AND worktree rewritten to match the parent commit (or
+        /// cleared, at root). Delegates to `reset(.hard)`. Destructive to
+        /// any post-commit edits — see `confirm_root_hard` for the root case.
+        hard,
+        /// Staging rebuilt from CURRENT DISK CONTENT of every tracked path,
+        /// so edits made after the commit are preserved as the new staged
+        /// state. Fails with `error.TrackedPathsMissing` if any tracked
+        /// path was deleted from disk since the commit, rather than
+        /// guessing whether that deletion was intentional.
+        keep,
+    };
+
+    pub const UncommitOptions = struct {
+        mode: UncommitMode = .soft,
+        /// Must be `true` when `mode == .hard` and the commit being undone
+        /// is the repository's root commit. A root has no parent tree to
+        /// fall back to, so hard-uncommitting it deletes tracked files from
+        /// the worktree with nothing left in any reachable ref pointing at
+        /// their content (the blobs survive in the object store, but only
+        /// reachable by raw hash). Defaults to `false` so this never
+        /// happens without explicit confirmation from the caller/CLI.
+        confirm_root_hard: bool = false,
+    };
+
+    /// Rehashes every currently-tracked path from disk and rewrites staging
+    /// to match — the worktree-facing counterpart to `stagingTreeRoot`, used
+    /// by `uncommit(.keep)`. Mirrors `add()`'s mutate-then-save pattern.
     ///
-    /// Errors with `error.NoCommits` if the track has no commits, or
-    /// `error.MergeCommit` if HEAD has more than one parent — uncommit
-    /// only supports linear history right now.
-    pub fn uncommit(self: *Repository) !UncommitResult {
+    /// Snapshots the tracked-path list up front: `staging.addFile` mutates
+    /// `self.staging`'s internal entry list in place, so looping over
+    /// `allEntries()` directly while calling it would walk a slice being
+    /// rewritten out from under us.
+    ///
+    /// Validates that every tracked path still exists before touching
+    /// anything — a path missing from disk returns `error.TrackedPathsMissing`
+    /// rather than silently dropping it from the new staged tree, since a
+    /// missing file might be an intentional cleanup or might not be, and
+    /// only the caller can know which.
+    fn syncStagingFromDisk(self: *Repository) !void {
+        var paths: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (paths.items) |p| self.alloc.free(p);
+            paths.deinit(self.alloc);
+        }
+        for (self.staging.allEntries()) |entry| {
+            try paths.append(self.alloc, try self.alloc.dupe(u8, entry.path));
+        }
+
+        var missing: std.ArrayList([]const u8) = .empty;
+        defer missing.deinit(self.alloc); // items borrowed from `paths`, freed there
+
+        for (paths.items) |p| {
+            const full_path = try std.fs.path.join(self.alloc, &.{ self.root, p });
+            defer self.alloc.free(full_path);
+            std.fs.cwd().access(full_path, .{}) catch |err| switch (err) {
+                error.FileNotFound => try missing.append(self.alloc, p),
+                else => return err,
+            };
+        }
+        if (missing.items.len > 0) return error.TrackedPathsMissing;
+
+        // All present — safe to rehash and persist.
+        for (paths.items) |p| _ = try self.staging.addFile(&self.store, self.root, p);
+        try self.staging.save();
+    }
+
+    /// Deletes every currently-tracked path from the worktree without
+    /// touching staging — the root-commit counterpart to `reset(.hard)`'s
+    /// worktree rewrite, used only when uncommitting a root commit in
+    /// `.hard` mode (there's no parent tree to write instead, only nothing).
+    fn deleteTrackedWorktreeFiles(self: *Repository) !void {
+        const dir = std.fs.cwd();
+        for (self.staging.allEntries()) |entry| {
+            const full_path = try std.fs.path.join(self.alloc, &.{ self.root, entry.path });
+            defer self.alloc.free(full_path);
+            dir.deleteFile(full_path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        }
+    }
+
+    pub fn uncommit(self: *Repository, uncommit_options: UncommitOptions) !UncommitResult {
         const head_hash = (try self.head()) orelse return error.NoCommits;
 
         var c = try commit_mod.read(self.alloc, &self.store, head_hash);
         defer c.deinit(self.alloc);
 
         if (c.parents.len > 1) return error.MergeCommit;
+        const parent_hash: ?Hash = if (c.parents.len == 0) null else c.parents[0].hash;
 
-        if (c.parents.len == 0) {
-            try self.ref_store.deleteChannel(self.channel.get());
-            return .{ .undone = head_hash, .new_head = null };
+        // Everything below validates and mutates staging/worktree BEFORE
+        // touching the ref, so any failure (missing tracked path, missing
+        // confirmation) leaves the repository exactly as it was.
+        switch (uncommit_options.mode) {
+            .soft => {},
+
+            .keep => try self.syncStagingFromDisk(),
+
+            .mixed => {
+                if (parent_hash) |ph| {
+                    try self.reset(.{ .target = ph, .mode = .mixed }); // reset() moves the ref itself
+                } else {
+                    try self.staging.replaceAll(&.{});
+                }
+            },
+
+            .hard => {
+                if (parent_hash) |ph| {
+                    try self.reset(.{ .target = ph, .mode = .hard }); // reset() moves the ref itself
+                } else {
+                    if (!uncommit_options.confirm_root_hard) return error.RootHardUncommitRequiresConfirmation;
+                    try self.deleteTrackedWorktreeFiles();
+                    try self.staging.replaceAll(&.{});
+                }
+            },
         }
 
-        const parent_hash = c.parents[0].hash;
-        try self.ref_store.updateChannel(self.channel.get(), parent_hash);
+        // .mixed/.hard with a parent already moved the ref via reset() above.
+        const ref_already_moved = (parent_hash != null) and
+            (uncommit_options.mode == .mixed or uncommit_options.mode == .hard);
+
+        if (!ref_already_moved) {
+            if (parent_hash) |ph| {
+                try self.ref_store.updateChannel(self.channel.get(), ph);
+            } else {
+                try self.ref_store.deleteChannel(self.channel.get());
+            }
+        }
+
         return .{ .undone = head_hash, .new_head = parent_hash };
     }
 
