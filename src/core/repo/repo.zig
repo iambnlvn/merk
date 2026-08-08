@@ -348,12 +348,24 @@ pub const Repository = struct {
 
     /// Move the current track to `reset_options.target` per
     /// `reset_options.mode`. See `ResetMode` for what each level touches.
+    ///
+    /// The target is always read and validated as a real, readable commit
+    /// BEFORE anything is mutated — for every mode, including `.soft`. A
+    /// bad or unreadable target (typo, wrong-repo hash, corrupt object)
+    /// must fail here with the current track fully untouched, not after
+    /// the ref has already been repointed at something that turns out not
+    /// to exist.
     pub fn reset(self: *Repository, reset_options: ResetOptions) !void {
-        try self.ref_store.updateChannel(self.channel.get(), reset_options.target);
-        if (reset_options.mode == .soft) return;
-
-        var c = try commit_mod.read(self.alloc, &self.store, reset_options.target);
+        var c = commit_mod.read(self.alloc, &self.store, reset_options.target) catch |err| switch (err) {
+            error.NotFound => return error.RevNotFound,
+            else => return err,
+        };
         defer c.deinit(self.alloc);
+
+        if (reset_options.mode == .soft) {
+            try self.ref_store.updateChannel(self.channel.get(), reset_options.target);
+            return;
+        }
 
         // Collect the target commit's entries from the shared store —
         // the only store any commit's pages ever live in — then hand
@@ -365,6 +377,10 @@ pub const Repository = struct {
             collected.deinit(self.alloc);
         }
         try merkle_mod.collect(self.alloc, &self.page_store, c.snapshot, &collected);
+
+        // Only now, with the target proven valid and its entries already
+        // in hand, do we start mutating anything.
+        try self.ref_store.updateChannel(self.channel.get(), reset_options.target);
         try self.staging.replaceAll(collected.items);
         collected.deinit(self.alloc);
 
