@@ -7,9 +7,9 @@ const Allocator = std.mem.Allocator;
 pub const Hash = crypto.Hash;
 
 /// Repo-root-relative path of the file recording what's currently
-/// checked out: `refs/current`, sibling to `refs/channels/`,
+/// checked out: `refs/CURRENT`, sibling to `refs/channels/`,
 /// `refs/markers/`, and `refs/peers/` — see refs.zig for the full layout.
-pub const CURRENT_FILE = "refs/current";
+pub const CURRENT_FILE = "refs/CURRENT";
 
 /// The on-disk prefix marking a symbolic Current. Built from
 /// `ChannelName.CHANNELS_DIR` rather than duplicated as a separate
@@ -42,7 +42,7 @@ pub const Current = union(enum) {
         }
     }
 
-    /// Parse raw `refs/current` bytes into symbolic-or-detached state.
+    /// Parse raw `refs/CURRENT` bytes into symbolic-or-detached state.
     pub fn parse(alloc: Allocator, raw: []const u8) !Current {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
 

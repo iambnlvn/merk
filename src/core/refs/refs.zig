@@ -32,7 +32,7 @@ pub const PEERS_DIR = "refs/peers";
 /// through unchanged and aren't repeated here; only errors that
 /// originate in this module are named.
 pub const RefsError = error{
-    /// `refs/current` exists but its contents parse as neither a
+    /// `refs/CURRENT` exists but its contents parse as neither a
     /// symbolic ref (`ref: refs/channels/<name>`) nor a valid hex hash —
     /// truncated, hand-edited, or empty. Deliberately distinct from
     /// "Current doesn't exist yet", which is `null`, not an error — see
@@ -57,12 +57,12 @@ pub const ReferenceStore = struct {
     /// abstraction
     ///
     /// `fs` is expected to provide the repository's reference root,
-    /// where `refs/current` and `refs/channels/*` are stored
+    /// where `refs/CURRENT` and `refs/channels/*` are stored
     pub fn init(alloc: Allocator, fs: Vfs) ReferenceStore {
         return .{ .alloc = alloc, .fs = fs };
     }
 
-    /// Parses raw `refs/current` bytes into symbolic-or-detached state.
+    /// Parses raw `refs/CURRENT` bytes into symbolic-or-detached state.
     /// Every public method that touches Current is a thin projection of
     /// this single parse — including the translation of a malformed
     /// file into `error.CorruptCurrent`, so callers never need to know
