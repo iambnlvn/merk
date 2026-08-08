@@ -56,6 +56,36 @@ pub const EntryIndex = struct {
         return self.entries.items[i];
     }
 
+    /// Whether `path` is currently staged. Trivial wrapper over
+    /// `lookup`, but every current caller that wants a yes/no answer
+    /// does `lookup(...) != null` itself -- worth having once.
+    pub fn contains(self: *const EntryIndex, path: []const u8) bool {
+        return self.path_index.contains(path);
+    }
+
+    /// The contiguous run of entries whose path begins with `prefix`,
+    /// found in O(log n + k) via a binary search for the run's start
+    /// followed by a linear scan to its end, instead of an O(n) filter
+    /// over the whole list.
+    ///
+    /// REQUIRES `entries` to already be path-sorted -- true immediately
+    /// after `load()`, `save()`, `replaceAll()`, or `sortAndReindex()`,
+    /// but NOT guaranteed at every point in time (see the same caveat
+    /// on `Staging.allEntries()`). Calling this against an unsorted
+    /// list silently returns a wrong (too-small, too-large, or
+    /// discontiguous-in-truth) slice rather than an error -- callers
+    /// that can't guarantee a prior sort should call `sortAndReindex()`
+    /// themselves first.
+    pub fn entriesUnder(self: *const EntryIndex, prefix: []const u8) []const Entry {
+        const entries = self.entries.items;
+        if (prefix.len == 0) return entries;
+
+        const start = lowerBoundByPrefix(entries, prefix);
+        var end = start;
+        while (end < entries.len and std.mem.startsWith(u8, entries[end].path, prefix)) : (end += 1) {}
+        return entries[start..end];
+    }
+
     /// Reserve capacity for at least `additional` more entries in both
     /// the entry list and the path index, so a caller adding many
     /// entries in a row (bulk add, loading from disk) pays for one
@@ -163,6 +193,36 @@ pub const EntryIndex = struct {
         self.path_index.putAssumeCapacity(self.entries.items[i].path, @intCast(i));
     }
 };
+
+/// First index in a path-sorted `entries` slice whose path is `>=
+/// prefix` in the same byte-lexicographic order `pathLessThan` sorts
+/// by. A plain hand-rolled binary search rather than `std.sort` helpers
+/// since the comparison here is asymmetric (`Entry` vs. a raw prefix
+/// slice, not `Entry` vs. `Entry`).
+fn lowerBoundByPrefix(entries: []const Entry, prefix: []const u8) usize {
+    var lo: usize = 0;
+    var hi: usize = entries.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (pathBeforePrefix(entries[mid].path, prefix)) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/// True if `path` sorts strictly before `prefix` itself (treating
+/// `prefix` as a path of its own for comparison purposes).
+fn pathBeforePrefix(path: []const u8, prefix: []const u8) bool {
+    const min_len = @min(path.len, prefix.len);
+    return switch (std.mem.order(u8, path[0..min_len], prefix[0..min_len])) {
+        .lt => true,
+        .gt => false,
+        .eq => path.len < prefix.len,
+    };
+}
 
 fn testEntry(alloc: Allocator, path: []const u8, seed: u8) !Entry {
     return .{
@@ -350,6 +410,46 @@ test "clear frees every entry and leaves the index reusable" {
     // Index must still work normally after clear(), not just be empty.
     try idx.upsert(try testEntry(alloc, "c.txt", 3));
     try testing.expectEqual(@as(usize, 1), idx.count());
+}
+
+test "contains reports presence without needing the caller to unwrap lookup" {
+    const alloc = testing.allocator;
+    var idx = EntryIndex.init(alloc);
+    defer idx.deinit();
+
+    try idx.upsert(try testEntry(alloc, "a.txt", 1));
+
+    try testing.expect(idx.contains("a.txt"));
+    try testing.expect(!idx.contains("b.txt"));
+
+    try idx.remove("a.txt");
+    try testing.expect(!idx.contains("a.txt"));
+}
+
+test "entriesUnder returns only the contiguous run matching a directory prefix" {
+    const alloc = testing.allocator;
+    var idx = EntryIndex.init(alloc);
+    defer idx.deinit();
+
+    try idx.upsert(try testEntry(alloc, "README.md", 1));
+    try idx.upsert(try testEntry(alloc, "src/a.zig", 2));
+    try idx.upsert(try testEntry(alloc, "src/b.zig", 3));
+    try idx.upsert(try testEntry(alloc, "src/sub/c.zig", 4));
+    try idx.upsert(try testEntry(alloc, "srcx/d.zig", 5));
+    try idx.upsert(try testEntry(alloc, "zzz.txt", 6));
+    try idx.sortAndReindex();
+
+    const under_src = idx.entriesUnder("src/");
+    try testing.expectEqual(@as(usize, 3), under_src.len);
+    for (under_src) |e| try testing.expect(std.mem.startsWith(u8, e.path, "src/"));
+
+    // "srcx/d.zig" shares the "src" prefix but not the "src/" one --
+    // must not leak into a directory-prefix query.
+    try testing.expect(idx.lookup("srcx/d.zig") != null);
+    for (under_src) |e| try testing.expect(!std.mem.eql(u8, e.path, "srcx/d.zig"));
+
+    try testing.expectEqual(@as(usize, 0), idx.entriesUnder("missing/").len);
+    try testing.expectEqual(idx.count(), idx.entriesUnder("").len);
 }
 
 test "many upserts and interleaved removals stay internally consistent" {
