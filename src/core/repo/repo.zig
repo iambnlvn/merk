@@ -255,8 +255,8 @@ pub const Repository = struct {
         self: *Repository,
         path: []const u8,
         context: u32,
-        writer: anytype,
-        reader: anytype,
+        writer: *std.Io.Writer,
+        reader: *std.Io.Reader,
     ) !AddPatchOutcome {
         try validateRelativePath(path);
 
@@ -276,7 +276,7 @@ pub const Repository = struct {
         // 100 MiB ceiling matches this being an interactive, human-scale
         // review flow — a file too big to reasonably read hunk-by-hunk
         // in a terminal shouldn't silently OOM instead of failing.
-        const new_src = try dir.readFileAlloc(full_path, self.alloc, 100 * 1024 * 1024);
+        const new_src = try dir.readFileAlloc(self.alloc, full_path, 100 * 1024 * 1024);
         defer self.alloc.free(new_src);
 
         var fd = try diff_mod.diffFile(self.alloc, path, old_src, new_src);
