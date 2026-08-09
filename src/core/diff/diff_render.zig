@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 
 const diff_algorithms = @import("./diff_algorithms.zig");
+const diff_patch = @import("./diff_patch.zig");
 
 const LineDelta = diff_algorithms.LineDelta;
 const FileDiff = diff_algorithms.FileDiff;
@@ -279,43 +280,22 @@ const Hunk = struct {
     }
 };
 
+// Boundary computation itself lives in diff_patch.zig, shared with
+// patch-selection — see that module's top-of-file comment for why this
+// isn't reimplemented here. This iterator is just that shared walk,
+// re-attached to `deltas` so `displayLineNum` (a rendering-only need)
+// has something to index into.
 const HunkIterator = struct {
     deltas: []const LineDelta,
-    context: u32,
-    i: usize,
+    inner: diff_patch.HunkRangeIterator,
 
     fn init(deltas: []const LineDelta, context: u32) HunkIterator {
-        return .{ .deltas = deltas, .context = context, .i = 0 };
+        return .{ .deltas = deltas, .inner = diff_patch.HunkRangeIterator.init(deltas, context) };
     }
 
     fn next(self: *HunkIterator) ?Hunk {
-        while (self.i < self.deltas.len and self.deltas[self.i].op == .eq) self.i += 1;
-        if (self.i >= self.deltas.len) return null;
-
-        const start = if (self.i >= self.context) self.i - self.context else 0;
-        var hunk_end: usize = self.i;
-
-        while (hunk_end < self.deltas.len) {
-            if (self.deltas[hunk_end].op != .eq) {
-                hunk_end = @min(hunk_end + @as(usize, @intCast(self.context)) + 1, self.deltas.len);
-            } else {
-                var lookahead = hunk_end;
-                var eq_run: u32 = 0;
-                while (lookahead < self.deltas.len and self.deltas[lookahead].op == .eq) {
-                    lookahead += 1;
-                    eq_run += 1;
-                }
-                if (eq_run > self.context * 2 or lookahead >= self.deltas.len) {
-                    hunk_end = @min(hunk_end + @as(usize, @intCast(self.context)), self.deltas.len);
-                    break;
-                }
-                hunk_end = lookahead;
-            }
-        }
-
-        const result = Hunk{ .start = start, .end = hunk_end, .deltas = self.deltas };
-        self.i = hunk_end;
-        return result;
+        const r = self.inner.next() orelse return null;
+        return Hunk{ .start = r.start, .end = r.end, .deltas = self.deltas };
     }
 };
 

@@ -16,7 +16,7 @@ const merkle_mod = @import("merkle");
 const MemoryFs = @import("storage").MemoryFs;
 
 const Store = @import("../object.zig").Store;
-const commit_mod = @import("./../commit.zig"); // TODO!: expose what we need from commit.zig only
+const commit_mod = @import("../commit.zig"); // TODO!: expose what we need from commit.zig only
 const diff_algorithms = @import("diff_algorithms.zig");
 
 const Hash = crypto.Hash;
@@ -128,8 +128,6 @@ pub fn diffCommitAgainstParent(
 
     return diffSnapshotRoots(alloc, store, page_store, old_root, new_c.snapshot, algo);
 }
-
-const io = @import("storage");
 
 const FileSeed = struct { path: []const u8, content: []const u8 };
 

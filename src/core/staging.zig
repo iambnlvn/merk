@@ -303,6 +303,60 @@ pub const Staging = struct {
         return blob_hash;
     }
 
+    /// Stage `content` verbatim for `path`, without reading it from the
+    /// worktree at all. This is the primitive interactive/partial
+    /// staging (`git add -p`-style hunk selection) needs at this layer:
+    /// a higher-level patch step reconstructs the exact bytes that
+    /// should end up staged — the currently-staged (or HEAD) blob with
+    /// only the selected hunks applied on top of the worktree's current
+    /// version — and this just stores that reconstruction, the same way
+    /// `addFileFromDir` stores whatever bytes it read from disk. It
+    /// does not know or care that `content` might be a partial
+    /// reconstruction rather than a full file read.
+    ///
+    /// `mode` and `mtime` are still the real worktree file's current
+    /// values, passed through by the caller (typically from the same
+    /// `stat` the diff step already needed to read the file) — NOT
+    /// synthesized to "match" `content`. That mismatch is deliberate:
+    /// `content.len` will not equal the real on-disk file size whenever
+    /// only some hunks were selected, and it's exactly that size
+    /// mismatch that makes the next `stateOf` call correctly report
+    /// `.modified` — "this file still has unstaged changes" — even
+    /// though the `mtime` alone matches. Don't "fix" that by
+    /// synthesizing a different mtime or size; a partially-staged file
+    /// is *supposed* to show up as still-modified.
+    ///
+    /// ASSUMES `Store.putReader` accepts anything exposing a
+    /// `std.io.Reader`-shaped `read` (verify against the concrete
+    /// signature in `object.zig` — this file wraps `content` in a
+    /// `std.io.fixedBufferStream` reader rather than guessing at a
+    /// separate byte-slice `put` method that may or may not exist).
+    pub fn addContent(
+        self: *Staging,
+        store: *const Store,
+        path: []const u8,
+        content: []const u8,
+        mode: u64,
+        mtime: i128,
+    ) !Hash {
+        try merkle_mod.validatePath(path);
+        // TODO: this wont work on zig 0.16 it is already deprecated, currently on zig v 0.15
+        // fix this ASAP
+        var stream = std.Io.fixedBufferStream(content);
+        const blob_hash = try store.putReader(.blob, content.len, stream.reader());
+
+        try self.index.upsert(.{
+            .path = try self.alloc.dupe(u8, path),
+            .blob_hash = blob_hash,
+            .size = content.len,
+            .mode = mode,
+            .mtime = mtime,
+        });
+        self.dirty = true;
+
+        return blob_hash;
+    }
+
     /// Add multiple files as a single all-or-nothing operation: either
     /// every path in `paths` ends up staged, or the staging area's
     /// in-memory state is left exactly as it was before the call.
@@ -493,7 +547,7 @@ pub const Staging = struct {
     }
 
     /// Sum of `entry.size` across every staged entry. Cheap, and useful
-    /// for a something like a progress bar or a "you're about to commit 4GB across
+    /// for a progress bar or a "you're about to commit 4GB across
     /// 12,000 files, continue?" guard before an expensive
     /// `stagingTreeRoot()` build.
     pub fn totalStagedSize(self: *const Staging) u64 {
@@ -628,6 +682,25 @@ fn serializeEntries(alloc: Allocator, entries: []const Entry) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
+/// Parses `bytes` into `index`, taking each entry through
+/// `EntryIndex.appendUnique` (not a bare append) and validating each
+/// path via `merkle_mod.validatePath` before accepting it. Both checks
+/// exist because `entries` is a trust boundary, not just a cache: a
+/// hand-edited, corrupted, or otherwise tampered file could otherwise
+/// smuggle in a path-traversal-style path (later fed straight into
+/// worktree writes by `Repository.restorePaths`/`reset(.hard)`), or a
+/// repeated path that would silently become an unreachable "ghost"
+/// entry once `reindex()` overwrites its `path_index` slot with the
+/// second occurrence's position (see `EntryIndex.reindex`) — a ghost
+/// entry that `Repository.stagingTreeRoot()` would still feed into tree
+/// construction as a duplicate record. Both failure modes collapse to
+/// `error.CorruptStagingEntries`, same as any other malformed input
+/// here — corrupt is corrupt, regardless of which check caught it.
+///
+/// `index` is caller-owned scratch state — on any error, the caller is
+/// responsible for `deinit`ing whatever was accumulated so far (`load()`
+/// does this via `errdefer`); this function never partially commits into
+/// a `Staging`'s live `self.index` itself.
 fn deserializeEntries(alloc: Allocator, bytes: []const u8, index: *EntryIndex) !void {
     if (bytes.len < 1) return error.CorruptStagingEntries;
     var pos: usize = 0;
@@ -649,6 +722,19 @@ fn deserializeEntries(alloc: Allocator, bytes: []const u8, index: *EntryIndex) !
         pos += 4;
 
         if (pos + path_len > bytes.len) return error.CorruptStagingEntries;
+        // Validate against the raw slice — NOT a duped copy — so a
+        // validation failure here has nothing to free. `path` is only
+        // ever allocated right before the `appendUnique` call below,
+        // once every other field has parsed successfully, so there is
+        // never a window where this function owns `path` independently
+        // of `appendUnique`. (An earlier version duped up front and used
+        // `errdefer alloc.free(path)`, but that errdefer was still armed
+        // when `appendUnique` failed with `DuplicatePath` — `appendUnique`
+        // already frees the entry, including `path`, on its own failure,
+        // so the outer errdefer firing too was a double free. Not
+        // allocating until the last possible moment removes the
+        // overlapping-ownership window entirely, rather than trying to
+        // selectively disarm an `errdefer`.)
         const path_slice = bytes[pos..][0..path_len];
         merkle_mod.validatePath(path_slice) catch return error.CorruptStagingEntries;
         pos += path_len;
@@ -711,6 +797,49 @@ test "staging addFile stores blob and upserts entry" {
     try testing.expectEqual(@as(usize, 1), staging.count());
     try testing.expect(!std.mem.eql(u8, &hash1, &hash2));
     try testing.expect(object_store.exists(hash2));
+}
+
+test "staging addContent stages arbitrary bytes without touching the worktree" {
+    const alloc = testing.allocator;
+    var mem_fs = MemoryFs.init(alloc);
+    defer mem_fs.deinit();
+
+    const object_store = Store.init(alloc, mem_fs.fs(), "merk/objects");
+    var staging = Staging.init(alloc, mem_fs.fs(), "merk");
+    defer staging.deinit();
+
+    const hash = try staging.addContent(&object_store, "note.txt", "partial content", 0o100644, 42);
+
+    try testing.expectEqual(@as(usize, 1), staging.count());
+    try testing.expect(object_store.exists(hash));
+    const entry = staging.lookup("note.txt") orelse return error.ExpectedEntry;
+    try testing.expectEqual(@as(u64, "partial content".len), entry.size);
+    try testing.expectEqual(@as(i128, 42), entry.mtime);
+}
+
+test "staging addContent's staged size intentionally diverges from the real file so stateOf still reports modified" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // The real worktree file is longer than what we're about to stage --
+    // simulates staging only some hunks of a larger edit.
+    try tmp_dir.dir.writeFile(.{ .sub_path = "note.txt", .data = "full worktree content, longer than the patch" });
+    const real_stat = try tmp_dir.dir.statFile("note.txt");
+
+    var os_fs = OsFs.init(tmp_dir.dir);
+    const object_store = Store.init(alloc, os_fs.fs(), "merk/objects");
+    var staging = Staging.init(alloc, os_fs.fs(), "merk");
+    defer staging.deinit();
+
+    // Stage a shorter reconstruction (as if only one hunk were selected),
+    // but pass through the real file's current mode/mtime -- this is the
+    // contract addContent documents.
+    _ = try staging.addContent(&object_store, "note.txt", "short patch", real_stat.mode, real_stat.mtime);
+
+    const entry = staging.lookup("note.txt") orelse return error.ExpectedEntry;
+    const state = try staging.stateOfInDir(tmp_dir.dir, "note.txt", entry);
+    try testing.expectEqual(WorktreeState.modified, state);
 }
 
 test "staging stateOf reports deleted file" {

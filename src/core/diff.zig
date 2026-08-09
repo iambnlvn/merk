@@ -1,6 +1,8 @@
 const algorithms = @import("./diff/diff_algorithms.zig");
 const snapshot = @import("./diff/diff_snapshot.zig");
 const render_mod = @import("./diff/diff_render.zig");
+const patch_mod = @import("./diff/diff_patch.zig");
+const interactive_mod = @import("./diff/diff_interactive.zig");
 
 pub const Algorithm = algorithms.Algorithm;
 pub const Op = algorithms.Op;
@@ -19,6 +21,14 @@ pub const FileStatus = render_mod.FileStatus;
 pub const ChangeFilter = render_mod.ChangeFilter;
 pub const DiffSummary = render_mod.DiffSummary;
 pub const DirGroup = render_mod.DirGroup;
+
+pub const HunkRange = patch_mod.HunkRange;
+pub const hunkRanges = patch_mod.hunkRanges;
+pub const applySelected = patch_mod.applySelected;
+
+pub const InteractiveOutcome = interactive_mod.InteractiveOutcome;
+pub const Decision = interactive_mod.Decision;
+pub const runInteractive = interactive_mod.run;
 
 pub const diffFile = algorithms.diffFile;
 pub const diffFileWith = algorithms.diffFileWith;
