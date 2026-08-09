@@ -48,6 +48,22 @@ pub fn build(b: *std.Build) void {
         .{ .name = "merkle", .module = merkle },
     };
 
+    const debug_exe = b.addExecutable(.{
+        .name = "merk-debug",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/merk-debug.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = app_imports,
+        }),
+    });
+    b.installArtifact(debug_exe);
+    b.installArtifact(debug_exe);
+
+    const run_debug = b.addRunArtifact(debug_exe);
+    const run_debug_step = b.step("debug", "Run the repository debug/test harness");
+    run_debug_step.dependOn(&run_debug.step);
+
     const exe = b.addExecutable(.{
         .name = "merk",
         .root_module = b.createModule(.{

@@ -1,5 +1,4 @@
 const std = @import("std");
-const merk = @import("merk");
 
 const registry = @import("cli/registry.zig");
 const usage = @import("cli/usage.zig");
@@ -36,7 +35,8 @@ pub fn main() void {
         },
 
         else => {
-            stderr_writer.interface.print("error: {s}\n", .{@errorName(err)}) catch {};
+            stdout_writer.interface.flush() catch {};
+            stderr_writer.interface.flush() catch {};
             std.process.exit(1);
         },
     };
