@@ -426,6 +426,12 @@ pub const Repository = struct {
         return merkle_mod.build(self.alloc, &self.page_store, self.staging.allEntries());
     }
 
+    /// Public accessor for `stagingTreeRoot`, for plumbing commands (`write-tree`)
+    /// that legitimately need the raw hash rather than a diff or status view of it.
+    pub fn stagedRoot(self: *Repository) !Hash {
+        return self.stagingTreeRoot();
+    }
+
     /// Commit the currently-staged area as a child of the current
     /// track's current (or as a root commit if the track has none yet).
     pub fn commit(self: *Repository, request: CommitRequest) !Hash {
