@@ -18,6 +18,7 @@ const staging_mod = @import("../staging.zig");
 const commit_mod = @import("../commit.zig");
 const history_mod = @import("../history.zig");
 const refs_mod = @import("../refs/refs.zig");
+const diff_mod = @import("../diff.zig");
 
 const options_mod = @import("./options.zig");
 const status_mod = @import("./status.zig");
@@ -223,6 +224,129 @@ pub const Repository = struct {
         try self.staging.save();
     }
 
+    pub const AddPatchOutcome = struct {
+        /// How many independently selectable hunks the diff produced.
+        hunk_count: usize,
+        /// How many of those hunks ended up staged.
+        staged_count: usize,
+        /// True if the user quit (`q`) before every hunk was decided.
+        quit_early: bool,
+    };
+
+    /// Interactively stage hunks of a single path, `git add -p`-style:
+    /// diffs `resolveBaseline(path)` (see that method for exactly what
+    /// "baseline" means) against the worktree's current bytes, prompts
+    /// hunk-by-hunk on `writer`/`reader` via `diff.runInteractive`, and —
+    /// only if at least one hunk was staged — stores the reconstructed
+    /// content through `staging.addContent` (a reconstruction, not a
+    /// straight disk read, so this deliberately does NOT go through
+    /// `staging.addFile`/`addFileFromDir`).
+    ///
+    /// `context` is the number of unchanged lines shown around each hunk
+    /// (passed straight to `diff.hunkRanges` inside `runInteractive`);
+    /// pass whatever `RenderConfig.contextLines()` the CLI's diff display
+    /// already uses, so a hunk numbered N here is the same hunk a
+    /// preceding `merk diff` would show as hunk N.
+    ///
+    /// Leaves the worktree file itself untouched — only staging changes.
+    /// Does not save if nothing was staged, so quitting on hunk 1 of a
+    /// file (`quit_early == true`, `staged_count == 0`) is a true no-op.
+    pub fn addPatch(
+        self: *Repository,
+        path: []const u8,
+        context: u32,
+        writer: anytype,
+        reader: anytype,
+    ) !AddPatchOutcome {
+        try validateRelativePath(path);
+
+        const old_src = try self.resolveBaseline(path);
+        defer self.alloc.free(old_src);
+
+        const full_path = try std.fs.path.join(self.alloc, &.{ self.root, path });
+        defer self.alloc.free(full_path);
+
+        const dir = std.fs.cwd();
+        const stat = dir.statFile(full_path) catch |err| switch (err) {
+            error.FileNotFound => return error.WorktreeFileMissing,
+            else => return err,
+        };
+        if (stat.kind != .file) return error.NotAFile;
+
+        // 100 MiB ceiling matches this being an interactive, human-scale
+        // review flow — a file too big to reasonably read hunk-by-hunk
+        // in a terminal shouldn't silently OOM instead of failing.
+        const new_src = try dir.readFileAlloc(full_path, self.alloc, 100 * 1024 * 1024);
+        defer self.alloc.free(new_src);
+
+        var fd = try diff_mod.diffFile(self.alloc, path, old_src, new_src);
+        defer fd.deinit(self.alloc);
+
+        var outcome = try diff_mod.runInteractive(self.alloc, fd.line_deltas, old_src, new_src, context, writer, reader);
+        defer outcome.deinit(self.alloc);
+
+        if (outcome.staged_count > 0) {
+            _ = try self.staging.addContent(&self.store, path, outcome.content, stat.mode, stat.mtime);
+            try self.staging.save();
+        }
+
+        return .{
+            .hunk_count = outcome.hunk_count,
+            .staged_count = outcome.staged_count,
+            .quit_early = outcome.quit_early,
+        };
+    }
+
+    /// What `addPatch` diffs the worktree against, in priority order:
+    ///   - Already staged — return the *currently staged* blob's
+    ///      content. This is the important one: it's what makes
+    ///      re-running `addPatch` on a file you already partially staged
+    ///      diff against "what's staged" rather than "what's in HEAD",
+    ///      matching `git add -p`'s index-vs-worktree semantics instead
+    ///      of re-offering hunks you already selected last time.
+    ///   - Tracked in the current track's current commit but not
+    ///      staged (e.g. after an `unstage`) — return that commit's blob
+    ///      for this path.
+    ///   - Neither — a brand new, never-staged path. Return an empty
+    ///      slice, so the whole file's content reads as one big
+    ///      insertion (there's no "old" version to diff against).
+    ///
+    /// Case 2 collects every entry in the commit's snapshot tree to find
+    /// one path — the same approach `reset()` uses to materialize a full
+    /// snapshot, reused here for a single lookup because no narrower
+    /// "resolve one path in one snapshot" primitive exists yet on
+    /// `merkle_mod`. Fine for now; worth a dedicated point-lookup if
+    /// `addPatch` on large repos ever shows up in a profile.
+    ///
+    /// Caller owns the returned slice.
+    fn resolveBaseline(self: *Repository, path: []const u8) ![]u8 {
+        if (self.staging.lookup(path)) |entry| {
+            const obj = try self.store.get(entry.blob_hash);
+            return obj.payload;
+        }
+
+        const current_hash = (try self.current()) orelse return try self.alloc.alloc(u8, 0);
+
+        var c = try commit_mod.read(self.alloc, &self.store, current_hash);
+        defer c.deinit(self.alloc);
+
+        var collected: std.ArrayList(merkle_mod.Entry) = .empty;
+        defer {
+            for (collected.items) |*e| e.deinit(self.alloc);
+            collected.deinit(self.alloc);
+        }
+        try merkle_mod.collect(self.alloc, &self.page_store, c.snapshot, &collected);
+
+        for (collected.items) |e| {
+            if (std.mem.eql(u8, e.path, path)) {
+                const obj = try self.store.get(e.blob_hash);
+                return obj.payload;
+            }
+        }
+
+        return try self.alloc.alloc(u8, 0);
+    }
+
     /// Unstage a path (drop it from the staging area without touching
     /// the worktree file). Mirrors `git reset <path>`, not `checkout`.
     pub fn unstage(self: *Repository, path: []const u8) !void {
@@ -303,12 +427,12 @@ pub const Repository = struct {
     }
 
     /// Commit the currently-staged area as a child of the current
-    /// track's HEAD (or as a root commit if the track has none yet).
+    /// track's current (or as a root commit if the track has none yet).
     pub fn commit(self: *Repository, request: CommitRequest) !Hash {
-        const repo_head = try self.ref_store.readChannel(self.channel.get());
+        const repo_current = try self.ref_store.readChannel(self.channel.get());
 
         var parent_buf: [1]ParentInfo = undefined;
-        const parents: []const ParentInfo = if (repo_head) |h| blk: {
+        const parents: []const ParentInfo = if (repo_current) |h| blk: {
             parent_buf[0] = .{ .hash = h, .kind = .normal };
             break :blk parent_buf[0..1];
         } else &.{};
@@ -318,9 +442,9 @@ pub const Repository = struct {
     }
 
     pub fn status(self: *Repository) !Status {
-        const head_snapshot = try self.headSnapshot();
+        const current_snapshot = try self.currentSnapshot();
         const staged_root = try self.stagingTreeRoot();
-        const staged = try merkle_mod.diffRoots(self.alloc, &self.page_store, head_snapshot, staged_root);
+        const staged = try merkle_mod.diffRoots(self.alloc, &self.page_store, current_snapshot, staged_root);
         errdefer merkle_mod.freeChanges(self.alloc, staged);
 
         var unstaged: std.ArrayList(WorktreeEntryStatus) = .empty;
@@ -339,11 +463,11 @@ pub const Repository = struct {
         return merkle_mod.diffRoots(self.alloc, &self.page_store, from, to);
     }
 
-    /// Diff HEAD against the currently staged area — same data as
+    /// Diff current against the currently staged area — same data as
     /// `status().staged`, exposed directly for a plain `merk diff --staged`.
     pub fn diffStaged(self: *Repository) ![]EntryChange {
         const staged_root = try self.stagingTreeRoot();
-        return merkle_mod.diffRoots(self.alloc, &self.page_store, try self.headSnapshot(), staged_root);
+        return merkle_mod.diffRoots(self.alloc, &self.page_store, try self.currentSnapshot(), staged_root);
     }
 
     /// Move the current track to `reset_options.target` per
@@ -507,11 +631,11 @@ pub const Repository = struct {
         return self.history.log(self.channel.get(), filter);
     }
 
-    /// Current track's HEAD commit hash, or `null` if the track has no
+    /// Current track's current commit hash, or `null` if the track has no
     /// commits yet. Every history-facing command (`show`, `commit`,
     /// `uncommit`) needs this — public so they read it here instead of
     /// reaching into `ref_store` directly.
-    pub fn head(self: *Repository) !?Hash {
+    pub fn current(self: *Repository) !?Hash {
         return self.ref_store.readChannel(self.channel.get());
     }
 
@@ -536,7 +660,7 @@ pub const Repository = struct {
         /// `null` means the undone commit was the root commit — the
         /// track now has no commits at all, same as before the first
         /// commit was ever made.
-        new_head: ?Hash,
+        new_current: ?Hash,
     };
 
     pub const UncommitMode = enum {
@@ -629,9 +753,9 @@ pub const Repository = struct {
     }
 
     pub fn uncommit(self: *Repository, uncommit_options: UncommitOptions) !UncommitResult {
-        const head_hash = (try self.head()) orelse return error.NoCommits;
+        const current_hash = (try self.current()) orelse return error.NoCommits;
 
-        var c = try commit_mod.read(self.alloc, &self.store, head_hash);
+        var c = try commit_mod.read(self.alloc, &self.store, current_hash);
         defer c.deinit(self.alloc);
 
         if (c.parents.len > 1) return error.MergeCommit;
@@ -676,12 +800,12 @@ pub const Repository = struct {
             }
         }
 
-        return .{ .undone = head_hash, .new_head = parent_hash };
+        return .{ .undone = current_hash, .new_current = parent_hash };
     }
 
-    fn headSnapshot(self: *Repository) !Hash {
-        const head_hash = (try self.head()) orelse return crypto.zero_hash;
-        var c = try commit_mod.read(self.alloc, &self.store, head_hash);
+    fn currentSnapshot(self: *Repository) !Hash {
+        const current_hash = (try self.current()) orelse return crypto.zero_hash;
+        var c = try commit_mod.read(self.alloc, &self.store, current_hash);
         defer c.deinit(self.alloc);
         return c.snapshot;
     }

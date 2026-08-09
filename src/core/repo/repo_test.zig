@@ -112,7 +112,7 @@ test "commit advances the current track and status goes clean against HEAD" {
 
     const c1 = try repo.commit(testRequest("add a.txt", 1000));
 
-    const h = try repo.head();
+    const h = try repo.current();
     try std.testing.expect(h != null);
     try std.testing.expect(merkle_mod.hashEq(h.?, c1));
 
@@ -165,7 +165,7 @@ test "reset soft moves the track without touching the staging area" {
 
     try repo.reset(.{ .target = c1, .mode = .soft });
 
-    const h = try repo.head();
+    const h = try repo.current();
     try std.testing.expect(merkle_mod.hashEq(h.?, c1));
     // Soft reset leaves the staging area (still holding both entries) alone.
     try std.testing.expectEqual(@as(usize, 2), repo.staging.count());
@@ -192,7 +192,7 @@ test "reset mixed rebuilds the staging area to match the target commit's snapsho
     try std.testing.expectEqual(@as(usize, 1), repo.staging.count());
     try std.testing.expectEqualStrings("a.txt", repo.staging.allEntries()[0].path);
 
-    const h = try repo.head();
+    const h = try repo.current();
     try std.testing.expect(merkle_mod.hashEq(h.?, c1));
 }
 
@@ -579,10 +579,10 @@ test "uncommit on a normal commit moves the track to its parent" {
 
     const result = try repo.uncommit(.{});
     try std.testing.expect(merkle_mod.hashEq(result.undone, c2));
-    try std.testing.expect(result.new_head != null);
-    try std.testing.expect(merkle_mod.hashEq(result.new_head.?, c1));
+    try std.testing.expect(result.new_current != null);
+    try std.testing.expect(merkle_mod.hashEq(result.new_current.?, c1));
 
-    const h = try repo.head();
+    const h = try repo.current();
     try std.testing.expect(merkle_mod.hashEq(h.?, c1));
     // Soft undo: staging area still holds both entries, ready to re-commit
     try std.testing.expectEqual(@as(usize, 2), repo.staging.count());
@@ -602,13 +602,13 @@ test "uncommit on the root commit deletes the track ref, returning to 'no commit
 
     const result = try repo.uncommit(.{});
     try std.testing.expect(merkle_mod.hashEq(result.undone, c1));
-    try std.testing.expectEqual(@as(?Hash, null), result.new_head);
+    try std.testing.expectEqual(@as(?Hash, null), result.new_current);
 
-    try std.testing.expectEqual(@as(?Hash, null), try repo.head());
+    try std.testing.expectEqual(@as(?Hash, null), try repo.current());
 
     // Re-committing goes through the same root-commit path as the first time
     const c1_again = try repo.commit(testRequest("add a.txt again", 3000));
-    try std.testing.expect(try repo.head() != null);
+    try std.testing.expect(try repo.current() != null);
     _ = c1_again;
 }
 
@@ -650,8 +650,8 @@ test "uncommit keep preserves a post-commit worktree edit as the new staged cont
 
     const result = try repo.uncommit(.{ .mode = .keep });
     try std.testing.expect(merkle_mod.hashEq(result.undone, c1));
-    try std.testing.expectEqual(@as(?Hash, null), result.new_head);
-    try std.testing.expectEqual(@as(?Hash, null), try repo.head());
+    try std.testing.expectEqual(@as(?Hash, null), result.new_current);
+    try std.testing.expectEqual(@as(?Hash, null), try repo.current());
 
     try std.testing.expectEqual(@as(usize, 1), repo.staging.count());
     const entry = repo.staging.lookup("hello.txt").?;
@@ -696,7 +696,7 @@ test "uncommit keep errors with TrackedPathsMissing and touches nothing when a t
 
     // Nothing moved: ref, staging, and the (already-deleted) file's
     // tracked status are all exactly as they were before the call.
-    const h = try repo.head();
+    const h = try repo.current();
     try std.testing.expect(merkle_mod.hashEq(h.?, c1));
     try std.testing.expectEqual(@as(usize, 1), repo.staging.count());
     try std.testing.expect(repo.staging.lookup("a.txt") != null);
@@ -719,9 +719,9 @@ test "uncommit mixed with a parent rebuilds staging to match the parent's commit
 
     const result = try repo.uncommit(.{ .mode = .mixed });
     try std.testing.expect(merkle_mod.hashEq(result.undone, c2));
-    try std.testing.expect(merkle_mod.hashEq(result.new_head.?, c1));
+    try std.testing.expect(merkle_mod.hashEq(result.new_current.?, c1));
 
-    const h = try repo.head();
+    const h = try repo.current();
     try std.testing.expect(merkle_mod.hashEq(h.?, c1));
     try std.testing.expectEqual(@as(usize, 1), repo.staging.count());
     try std.testing.expectEqualStrings("a.txt", repo.staging.allEntries()[0].path);
@@ -741,9 +741,9 @@ test "uncommit mixed on the root commit clears staging entirely (no parent tree 
 
     const result = try repo.uncommit(.{ .mode = .mixed });
     try std.testing.expect(merkle_mod.hashEq(result.undone, c1));
-    try std.testing.expectEqual(@as(?Hash, null), result.new_head);
+    try std.testing.expectEqual(@as(?Hash, null), result.new_current);
 
-    try std.testing.expectEqual(@as(?Hash, null), try repo.head());
+    try std.testing.expectEqual(@as(?Hash, null), try repo.current());
     try std.testing.expectEqual(@as(usize, 0), repo.staging.count());
 }
 
@@ -773,7 +773,7 @@ test "uncommit hard with a parent rewrites the worktree to match the parent's co
     _ = try repo.commit(testRequest("add b.txt", 2000));
 
     const result = try repo.uncommit(.{ .mode = .hard });
-    try std.testing.expect(merkle_mod.hashEq(result.new_head.?, c1));
+    try std.testing.expect(merkle_mod.hashEq(result.new_current.?, c1));
 
     // Staging rebuilt from c1's tree: only a.txt is tracked now.
     try std.testing.expectEqual(@as(usize, 1), repo.staging.count());
@@ -815,7 +815,7 @@ test "uncommit hard on the root commit requires confirm_root_hard and otherwise 
     );
 
     // Refused before touching the ref, staging, or the worktree file.
-    const h = try repo.head();
+    const h = try repo.current();
     try std.testing.expect(merkle_mod.hashEq(h.?, c1));
     try std.testing.expectEqual(@as(usize, 1), repo.staging.count());
     try worktree_tmp.dir.access("a.txt", .{});
@@ -843,9 +843,9 @@ test "uncommit hard on the root commit with confirm_root_hard deletes tracked fi
     _ = try repo.commit(testRequest("add a.txt", 1000));
 
     const result = try repo.uncommit(.{ .mode = .hard, .confirm_root_hard = true });
-    try std.testing.expectEqual(@as(?Hash, null), result.new_head);
+    try std.testing.expectEqual(@as(?Hash, null), result.new_current);
 
-    try std.testing.expectEqual(@as(?Hash, null), try repo.head());
+    try std.testing.expectEqual(@as(?Hash, null), try repo.current());
     try std.testing.expectEqual(@as(usize, 0), repo.staging.count());
     try std.testing.expectError(error.FileNotFound, worktree_tmp.dir.access("a.txt", .{}));
 }
