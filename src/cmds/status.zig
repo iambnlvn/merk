@@ -1,7 +1,8 @@
 const std = @import("std");
-const merk = @import("merk");
+const merkle = @import("merkle");
 
 const repo_context = @import("repo_context.zig");
+const errors_mod = @import("../cli/errors.zig");
 
 const cli = @import("../cli/command.zig");
 const Command = cli.Command;
@@ -14,9 +15,11 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     const opened = try repo_context.open(ctx);
     defer opened.deinit(ctx.alloc);
 
-    const index = &opened.repo.index;
+    const result = opened.repo.status() catch |err| return errors_mod.report(ctx, err);
+    defer merkle.freeChanges(ctx.alloc, result.staged);
+    defer ctx.alloc.free(result.unstaged);
 
-    if (index.entries.items.len == 0) {
+    if (result.staged.len == 0 and result.unstaged.len == 0) {
         try ctx.out.writeAll(
             \\Repository
             \\
@@ -26,12 +29,20 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         );
         return;
     }
+
     try ctx.out.writeAll(
         \\Repository
         \\
     );
 
-    var printed_any = false;
+    if (result.staged.len > 0) {
+        try ctx.out.print("Staged for next commit ({d} path{s})\n\n", .{
+            result.staged.len,
+            if (result.staged.len == 1) "" else "s",
+        });
+    }
+
+    var printed_any = result.staged.len > 0;
 
     inline for (.{
         .modified,
@@ -39,10 +50,8 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     }) |wanted_state| {
         var header_printed = false;
 
-        for (index.entries.items) |entry| {
-            const state = try index.stateOf(opened.repo.root, entry);
-
-            if (state != wanted_state)
+        for (result.unstaged) |entry| {
+            if (entry.state != wanted_state)
                 continue;
 
             if (!header_printed) {
