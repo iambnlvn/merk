@@ -120,7 +120,7 @@ pub const command = Command{
         },
         .{
             .long = "yes",
-            .short = "y",
+            .short = 'y',
             .kind = .boolean,
             .help = "confirm a --hard uncommit of the root commit (deletes tracked files)",
         },
