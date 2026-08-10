@@ -328,7 +328,7 @@ The success path frees the snapshot itself (its entries were never needed —
 `self.index` was left untouched by every successful iteration). The failure
 path instead _moves_ the snapshot's entries into `self.index` and then frees
 only the now-empty backing list. A `defer` guards the common ("snapshot
-still owns its entries") case; the failure branch explicitly disarms it
+still owns its entries") case; the failure channel explicitly disarms it
 before returning, precisely because at that point ownership has already
 moved and a second free would be a double-free. See §9 for the same pattern
 stated as a table row.

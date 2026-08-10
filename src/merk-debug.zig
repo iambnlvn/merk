@@ -380,7 +380,7 @@ fn logWorktreeFile(dir: std.fs.Dir, alloc: std.mem.Allocator, path: []const u8) 
 /// Walks the full commit graph via `repo.log(.all)` and draws it as a
 /// simple top-to-bottom ASCII chain. Handles linear history (the only
 /// shape this harness ever produces); a real multi-parent renderer would
-/// need to branch the drawing on `ParentKind`/multiple parents, which
+/// need to channel the drawing on `ParentKind`/multiple parents, which
 /// isn't exercised here since `uncommit` refuses merge commits anyway.
 fn drawTree(alloc: std.mem.Allocator, repo: *Repository) !void {
     print("\n  commit graph ({s}):\n", .{repo.channel.raw});

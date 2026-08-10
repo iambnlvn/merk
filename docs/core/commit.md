@@ -138,7 +138,7 @@ until `.write()`, where a missing one fails loudly:
 | intent                         | `error.MissingIntent`   |
 
 `error.MissingSnapshot` fires specifically on the zero-hash sentinel
-(`hash_mod.zero_hash`). The builder has no way to know whether some
+(`crypto.zero_hash`). The builder has no way to know whether some
 other, non-zero hash is actually valid or saved anywhere — that's the
 snapshot/tree implementation's job — but the zero hash unambiguously
 means "nothing was ever set."
@@ -149,7 +149,7 @@ merges, transplants (cherry-picks), replays (rebases), and reverts:
 
 ```zig
 _ = try b.parentWithKind(base_hash, .normal);
-_ = try b.parentWithKind(other_branch_hash, .merge);
+_ = try b.parentWithKind(other_channel_hash, .merge);
 ```
 
 ### Building from a `CommitRequest`
@@ -157,7 +157,7 @@ _ = try b.parentWithKind(other_branch_hash, .merge);
 Most callers (a CLI command, `Repository.commit`) already have
 author/committer/intent/title/body/labels/trailers bundled up from
 user input, independent of snapshot/parent resolution (which is
-usually a separate step — reading Focus, resolving the current
+usually a separate step — reading Current, resolving the current
 snapshot root). `CommitRequest` captures exactly that bundle:
 
 ```zig
@@ -276,7 +276,7 @@ To add a new field to the commit (say, a detached signature):
    it's something an ordinary caller supplies directly) and fold it
    into `build()`'s required/defaulted-field logic if it needs
    validation beyond what the submodule already does.
-4. Bump `COMMIT_VERSION` and branch on it in `read` if the new field
+4. Bump `COMMIT_VERSION` and channel on it in `read` if the new field
    changes the wire layout for existing commits (as opposed to being
    safely omittable, e.g. an empty count for a brand-new counted
    list).
@@ -291,7 +291,7 @@ through.
 ## Testing
 
 `commit.zig`'s own tests exercise the whole write → store → read →
-assert round-trip using `io.TestFs` (an in-memory filesystem) and a
+assert round-trip using `storage.TestFs` (an in-memory filesystem) and a
 real `Store`. Each submodule additionally unit-tests its own
 `validate`/`serialize`/`deserialize` in isolation, using
 `commit/testing.zig`'s `MockReader` over hand-built byte buffers —

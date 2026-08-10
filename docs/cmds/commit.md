@@ -39,7 +39,7 @@ Record staged changes as a new commit.
 ## Overview
 
 `merk commit` snapshots the current index into a content-addressed commit
-object and advances the current branch ref to point at it. Each commit carries:
+object and advances the current channel ref to point at it. Each commit carries:
 
 - a **title** and optional **body** (the human-readable message)
 - structured **trailers** (key/value metadata at the end of the message)
@@ -116,8 +116,8 @@ and returns the new commit hash.
 
 ### 5. Ref update
 
-The current branch is resolved via `refs.headBranch`. If HEAD is detached or
-no branch can be found, `main` is used as the branch name. The branch ref is
+The current channel is resolved via `refs.headchannel`. If HEAD is detached or
+no channel can be found, `main` is used as the channel name. The channel ref is
 updated atomically to the new commit hash.
 
 ### 6. Summary output

@@ -13,13 +13,13 @@ decent chance the extension point you need already exists.
 
 ## 1. Why two files, and what each one owns
 
-|                    | `object_format.zig`                 | `object.zig`                   |
-| ------------------ | ----------------------------------- | ------------------------------ |
-| Knows about        | bytes in, bytes out                 | the filesystem                 |
-| Doesn't know about | any filesystem, any I/O             | how bytes are encoded          |
-| Given              | a payload + type + codec            | a hash                         |
-| Produces           | encoded bytes + content hash        | a path, then delegates to `fs` |
-| Testable with      | pure `[]u8` fixtures, no I/O at all | `io.TestFs`, an in-memory fake |
+|                    | `object_format.zig`                 | `object.zig`                        |
+| ------------------ | ----------------------------------- | ----------------------------------- |
+| Knows about        | bytes in, bytes out                 | the filesystem                      |
+| Doesn't know about | any filesystem, any I/O             | how bytes are encoded               |
+| Given              | a payload + type + codec            | a hash                              |
+| Produces           | encoded bytes + content hash        | a path, then delegates to `fs`      |
+| Testable with      | pure `[]u8` fixtures, no I/O at all | `storage.TestFs`, an in-memory fake |
 
 This split exists because encode/decode logic and filesystem-placement
 logic have almost nothing in common and fail for completely different
@@ -472,7 +472,7 @@ genuinely different trust model (repo-level key management enters the
 picture) and probably the largest change on this list in terms of what
 it touches outside this module, but the format already has the right
 extension point (`codec` is already a first-class, per-object field) —
-it's a new enum value and a new branch in `compressAlloc`/`decodeAlloc`,
+it's a new enum value and a new channel in `compressAlloc`/`decodeAlloc`,
 not a format redesign.
 
 ---
