@@ -9,7 +9,7 @@ const diff = @import("../cmds/diff.zig");
 const writeTree = @import("../cmds/write-tree.zig");
 const commit = @import("../cmds/commit.zig");
 const uncommit = @import("../cmds/uncommit.zig");
-const show = @import("../cmds/show.zig");
+const inspect = @import("../cmds/inspect.zig");
 const log = @import("../cmds/log.zig");
 const unstage = @import("../cmds/unstage.zig");
 const restore = @import("../cmds/restore.zig");
@@ -29,7 +29,7 @@ pub const commands: []const Command = &[_]Command{
     writeTree.command,
     commit.command,
     uncommit.command,
-    show.command,
+    inspect.command,
     log.command,
 };
 
