@@ -2,7 +2,7 @@ const std = @import("std");
 const crypto = @import("crypto");
 const storage = @import("storage");
 
-const channel_mod = @import("channel_name.zig");
+const channel_mod = @import("channel.zig");
 const current_mod = @import("current.zig");
 
 const testing = std.testing;
@@ -10,7 +10,7 @@ const Allocator = std.mem.Allocator;
 const Vfs = storage.Vfs;
 
 pub const Hash = crypto.Hash;
-pub const ChannelName = channel_mod.ChannelName;
+pub const Channel = channel_mod.Channel;
 pub const Current = current_mod.Current;
 
 const CHANNELS_DIR = channel_mod.CHANNELS_DIR;
@@ -96,14 +96,14 @@ pub const ReferenceStore = struct {
     /// "no resolved commit," not an error. Errors with
     /// `error.CorruptCurrent` if Current itself is unreadable, or if a
     /// symbolic Current names an invalid channel (e.g. hand-edited into
-    /// something `ChannelName.parse` rejects).
+    /// something `Channel.parse` rejects).
     pub fn resolveCurrent(self: RefStore) !?Hash {
         const state = try self.readCurrent() orelse return null;
         switch (state) {
             .detached => |h| return h,
             .symbolic => |channel_name| {
                 defer self.alloc.free(channel_name);
-                const cn = ChannelName.parse(channel_name) catch return error.CorruptCurrent;
+                const cn = Channel.parse(channel_name) catch return error.CorruptCurrent;
                 return try self.readChannel(cn);
             },
         }
@@ -136,18 +136,18 @@ pub const ReferenceStore = struct {
     ///
     /// Errors with `error.CorruptCurrent` if Current exists but is
     /// unreadable.
-    pub fn isCurrentChannel(self: ReferenceStore, channel: ChannelName) !bool {
+    pub fn isCurrentChannel(self: ReferenceStore, channel: Channel) !bool {
         const current = try self.currentChannel();
         const name = current orelse return false;
         defer self.alloc.free(name);
-        return ChannelName.eql(channel, .{ .raw = name });
+        return Channel.eql(channel, .{ .raw = name });
     }
 
     /// Point Current at `channel` (symbolic Current) — the on-disk
-    /// equivalent of `git switch`/`git checkout <branch>`. Does not
+    /// equivalent of `git switch`/`git checkout <channel>`. Does not
     /// require `channel` to already have a reference file; Current can
     /// point at a channel that's never been committed to yet.
-    pub fn setCurrentToChannel(self: ReferenceStore, channel: ChannelName) !void {
+    pub fn setCurrentToChannel(self: ReferenceStore, channel: Channel) !void {
         var buf: [256]u8 = undefined;
         const contents = try std.fmt.bufPrint(&buf, "{s}{s}", .{ current_mod.symbolic_prefix, channel.raw });
         try self.fs.writeFile(self.alloc, CURRENT_FILE, contents);
@@ -163,7 +163,7 @@ pub const ReferenceStore = struct {
 
     /// Point `channel`'s reference file at `hash`, creating the channel
     /// if it doesn't have one yet.
-    pub fn updateChannel(self: ReferenceStore, channel: ChannelName, hash: Hash) !void {
+    pub fn updateChannel(self: ReferenceStore, channel: Channel, hash: Hash) !void {
         var path_buf: [256]u8 = undefined;
         const path = try channel.refPath(&path_buf);
 
@@ -182,7 +182,7 @@ pub const ReferenceStore = struct {
     /// committed to — not an error). Errors with
     /// `error.CorruptChannelRef` if the file exists but isn't a valid
     /// hex hash.
-    pub fn readChannel(self: ReferenceStore, channel: ChannelName) !?Hash {
+    pub fn readChannel(self: ReferenceStore, channel: Channel) !?Hash {
         var path_buf: [256]u8 = undefined;
         const path = try channel.refPath(&path_buf);
 
@@ -196,7 +196,7 @@ pub const ReferenceStore = struct {
 
     /// Whether `channel` currently has a reference file (has ever been
     /// committed to), independent of whether it's currently checked out.
-    pub fn channelExists(self: ReferenceStore, channel: ChannelName) !bool {
+    pub fn channelExists(self: ReferenceStore, channel: Channel) !bool {
         const hash = try self.readChannel(channel);
         return hash != null;
     }
@@ -210,7 +210,7 @@ pub const ReferenceStore = struct {
     /// callers that care (e.g. a `merk channel -d` command refusing to
     /// delete the current channel) should check `isCurrentChannel`
     /// themselves — this is pure reference-file bookkeeping.
-    pub fn deleteChannel(self: ReferenceStore, channel: ChannelName) !void {
+    pub fn deleteChannel(self: ReferenceStore, channel: Channel) !void {
         var path_buf: [256]u8 = undefined;
         const path = try channel.refPath(&path_buf);
 
@@ -223,7 +223,7 @@ pub const ReferenceStore = struct {
     /// Like `deleteChannel`, but a channel with no reference file is
     /// treated as already-deleted rather than an error. Returns whether
     /// a reference file was actually removed.
-    pub fn deleteChannelIfExists(self: ReferenceStore, channel: ChannelName) !bool {
+    pub fn deleteChannelIfExists(self: ReferenceStore, channel: Channel) !bool {
         self.deleteChannel(channel) catch |err| switch (err) {
             error.ChannelNotFound => return false,
             else => return err,
@@ -239,7 +239,7 @@ pub const ReferenceStore = struct {
 
     /// Rename `from` to `to`: `to` ends up with `from`'s current hash,
     /// and `from`'s reference file is removed — the on-disk equivalent
-    /// of `git branch -m`.
+    /// of `git channel -m`.
     ///
     /// NOTE: like `deleteChannel`, this is pure reference-file
     /// bookkeeping. It doesn't touch Current, so a caller renaming the
@@ -249,7 +249,7 @@ pub const ReferenceStore = struct {
     /// Errors with `error.ChannelNotFound` if `from` has no reference
     /// file, or `error.DestinationExists` if `to` already does and
     /// `.force` wasn't set.
-    pub fn renameChannel(self: ReferenceStore, from: ChannelName, to: ChannelName, options: RenameOptions) !void {
+    pub fn renameChannel(self: ReferenceStore, from: Channel, to: Channel, options: RenameOptions) !void {
         const source_hash = try self.readChannel(from);
         const hash = source_hash orelse return error.ChannelNotFound;
 
@@ -304,7 +304,7 @@ test "resolveCurrent - symbolic current with malformed hex in target file errors
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const main = try ChannelName.parse("main");
+    const main = try Channel.parse("main");
 
     try store.setCurrentToChannel(main);
     try mem_fs.fs().writeFile(allocator, "refs/channels/main", "zzz-not-hex-zzz");
@@ -334,7 +334,7 @@ test "updateChannel overwrites previous hash on the same channel" {
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const main = try ChannelName.parse("main");
+    const main = try Channel.parse("main");
 
     var hash_a: Hash = undefined;
     @memset(std.mem.asBytes(&hash_a), 0x11);
@@ -359,7 +359,7 @@ test "readChannel returns null for a channel that was never created" {
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const never = try ChannelName.parse("never-existed");
+    const never = try Channel.parse("never-existed");
 
     const result = try store.readChannel(never);
     try testing.expectEqual(@as(?Hash, null), result);
@@ -371,7 +371,7 @@ test "switching current from detached to symbolic changes currentChannel result"
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const main = try ChannelName.parse("main");
+    const main = try Channel.parse("main");
 
     var mock_hash: Hash = undefined;
     @memset(std.mem.asBytes(&mock_hash), 0x55);
@@ -392,8 +392,8 @@ test "switching channels via setCurrentToChannel changes what resolveCurrent fol
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const main = try ChannelName.parse("main");
-    const develop = try ChannelName.parse("develop");
+    const main = try Channel.parse("main");
+    const develop = try Channel.parse("develop");
 
     var hash_main: Hash = undefined;
     @memset(std.mem.asBytes(&hash_main), 0x66);
@@ -423,7 +423,7 @@ test "updateChannel handles deeply nested channel names with multiple path segme
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const nested = try ChannelName.parse("release/2026/q3-hardening");
+    const nested = try Channel.parse("release/2026/q3-hardening");
 
     var mock_hash: Hash = undefined;
     @memset(std.mem.asBytes(&mock_hash), 0x88);
@@ -446,7 +446,7 @@ test "hash round-trip preserves non-uniform byte patterns" {
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const main = try ChannelName.parse("main");
+    const main = try Channel.parse("main");
 
     var mock_hash: Hash = undefined;
     for (std.mem.asBytes(&mock_hash), 0..) |*b, i| {
@@ -465,9 +465,9 @@ test "distinct channels with distinct hashes do not clobber each other" {
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const main = try ChannelName.parse("main");
-    const develop = try ChannelName.parse("develop");
-    const feature_x = try ChannelName.parse("feature/x");
+    const main = try Channel.parse("main");
+    const develop = try Channel.parse("develop");
+    const feature_x = try Channel.parse("feature/x");
 
     var hash_a: Hash = undefined;
     @memset(std.mem.asBytes(&hash_a), 0x99);
@@ -496,7 +496,7 @@ test "setCurrentToChannel followed by setDetachedCurrent correctly overwrites sy
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const main = try ChannelName.parse("main");
+    const main = try Channel.parse("main");
 
     var mock_hash: Hash = undefined;
     @memset(std.mem.asBytes(&mock_hash), 0x12);
@@ -524,7 +524,7 @@ test "currentState distinguishes symbolic from detached without resolving" {
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const main = try ChannelName.parse("main");
+    const main = try Channel.parse("main");
 
     try testing.expectEqual(@as(?Current, null), try store.currentState());
 
@@ -554,7 +554,7 @@ test "channelExists reflects whether a channel has ever been committed to" {
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const main = try ChannelName.parse("main");
+    const main = try Channel.parse("main");
 
     try testing.expect(!try store.channelExists(main));
 
@@ -571,7 +571,7 @@ test "deleteChannel removes the reference and errors on a repeat delete" {
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const feature = try ChannelName.parse("feature/x");
+    const feature = try Channel.parse("feature/x");
 
     var mock_hash: Hash = undefined;
     @memset(std.mem.asBytes(&mock_hash), 0x66);
@@ -590,7 +590,7 @@ test "deleteChannelIfExists reports whether it actually deleted anything" {
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const feature = try ChannelName.parse("feature/y");
+    const feature = try Channel.parse("feature/y");
 
     // Nothing to delete yet — false, not an error.
     try testing.expectEqual(false, try store.deleteChannelIfExists(feature));
@@ -609,8 +609,8 @@ test "renameChannel moves the hash and removes the old reference file" {
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const old_name = try ChannelName.parse("old-name");
-    const new_name = try ChannelName.parse("new-name");
+    const old_name = try Channel.parse("old-name");
+    const new_name = try Channel.parse("new-name");
 
     var mock_hash: Hash = undefined;
     @memset(std.mem.asBytes(&mock_hash), 0xAA);
@@ -630,9 +630,9 @@ test "renameChannel errors on a missing source and on an existing destination wi
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const missing = try ChannelName.parse("does-not-exist");
-    const main = try ChannelName.parse("main");
-    const develop = try ChannelName.parse("develop");
+    const missing = try Channel.parse("does-not-exist");
+    const main = try Channel.parse("main");
+    const develop = try Channel.parse("develop");
 
     var hash_a: Hash = undefined;
     @memset(std.mem.asBytes(&hash_a), 0xBB);
@@ -663,8 +663,8 @@ test "listChannels finds nested channels and is empty for a fresh repo" {
     defer allocator.free(empty);
     try testing.expectEqual(@as(usize, 0), empty.len);
 
-    const main = try ChannelName.parse("main");
-    const nested = try ChannelName.parse("release/2026/q3-hardening");
+    const main = try Channel.parse("main");
+    const nested = try Channel.parse("release/2026/q3-hardening");
     var mock_hash: Hash = undefined;
     @memset(std.mem.asBytes(&mock_hash), 0x77);
     try store.updateChannel(main, mock_hash);
@@ -706,8 +706,8 @@ test "isCurrentChannel is true only for the channel Current symbolically points 
     defer mem_fs.deinit();
 
     const store = RefStore.init(allocator, mem_fs.fs());
-    const main = try ChannelName.parse("main");
-    const develop = try ChannelName.parse("develop");
+    const main = try Channel.parse("main");
+    const develop = try Channel.parse("develop");
 
     // No Current yet — nothing is "the current channel".
     try testing.expect(!try store.isCurrentChannel(main));
@@ -731,7 +731,7 @@ test "os_fs: RefStore end-to-end with real filesystem" {
 
     var real_fs = storage.OsFs.init(tmp.dir);
     const store = RefStore.init(allocator, real_fs.fs());
-    const main = try ChannelName.parse("main");
+    const main = try Channel.parse("main");
 
     var hash: Hash = undefined;
     @memset(std.mem.asBytes(&hash), 0xAB);
@@ -749,7 +749,7 @@ test "os_fs: current round-trips between symbolic and detached on real disk" {
 
     var real_fs = storage.OsFs.init(tmp.dir);
     const store = RefStore.init(allocator, real_fs.fs());
-    const main = try ChannelName.parse("main");
+    const main = try Channel.parse("main");
 
     var hash: Hash = undefined;
     @memset(std.mem.asBytes(&hash), 0xCD);
@@ -774,8 +774,8 @@ test "os_fs: listChannels with nested paths on real disk" {
     var real_fs = storage.OsFs.init(tmp.dir);
     const store = RefStore.init(allocator, real_fs.fs());
 
-    const main = try ChannelName.parse("main");
-    const nested = try ChannelName.parse("release/2026/q3-hardening");
+    const main = try Channel.parse("main");
+    const nested = try Channel.parse("release/2026/q3-hardening");
     var hash: Hash = undefined;
     @memset(std.mem.asBytes(&hash), 0xCD);
 

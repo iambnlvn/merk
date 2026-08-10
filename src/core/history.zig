@@ -26,7 +26,7 @@ const CommitRequest = commit_mod.CommitRequest;
 const ParentInfo = commit_mod.ParentInfo;
 const ParentKind = commit_mod.ParentKind;
 const ReferenceStore = refs_mod.ReferenceStore;
-const ChannelName = refs_mod.ChannelName;
+const Channel = refs_mod.Channel;
 const Current = refs_mod.Current;
 
 /// Controls which parent edges a `RevWalk` is willing to descend into.
@@ -263,9 +263,9 @@ pub const PathHistory = struct {
     }
 };
 
-/// Top-level history facade: writes commits, advances branch refs, and
+/// Top-level history facade: writes commits, advances channel refs, and
 /// keeps the per-path change logs in sync. Composes a `Store` (object
-/// storage), a `ReferenceStore` (branch heads), and a `PathHistory`
+/// storage), a `ReferenceStore` (channel heads), and a `PathHistory`
 /// (per-path logs) into one entry point.
 pub const History = struct {
     alloc: Allocator,
@@ -313,11 +313,11 @@ pub const History = struct {
     /// Writes a new commit object with the given `tree_root` and
     /// `parents`, records its path-level changes (diffed against the
     /// mainline parent's snapshot, or the zero tree if there is no
-    /// mainline parent), advances `branch` to point at it, and returns
+    /// mainline parent), advances `channel` to point at it, and returns
     /// the new commit's hash.
     pub fn commit(
         self: *History,
-        branch: ChannelName,
+        channel: Channel,
         tree_root: Hash,
         parents: []const ParentInfo,
         request: CommitRequest,
@@ -337,14 +337,14 @@ pub const History = struct {
         const timestamp_ms = request.committer_timestamp_ms orelse request.author_timestamp_ms;
         try self.path_history.recordCommit(new_hash, timestamp_ms, changes);
 
-        try self.ref_store.updateChannel(branch, new_hash);
+        try self.ref_store.updateChannel(channel, new_hash);
         return new_hash;
     }
 
-    /// Newest-first history of `branch`, following edges per `filter`.
-    /// Returns null if `branch` has no commits yet.
-    pub fn log(self: *History, branch: ChannelName, filter: EdgeFilter) !?RevWalk {
-        const head = (try self.ref_store.readChannel(branch)) orelse return null;
+    /// Newest-first history of `channel`, following edges per `filter`.
+    /// Returns null if `channel` has no commits yet.
+    pub fn log(self: *History, channel: Channel, filter: EdgeFilter) !?RevWalk {
+        const head = (try self.ref_store.readChannel(channel)) orelse return null;
         return try RevWalk.init(self.alloc, self.store, head, filter);
     }
 
@@ -475,21 +475,21 @@ test "RevWalk with mainline_only still follows a merge's typed second parent" {
     _ = base_b.title("base");
     const base_hash = try base_b.write(&obj_store);
 
-    var branch_b = CommitBuilder.init(alloc, tree_hash);
-    defer branch_b.deinit();
-    _ = try branch_b.parent(base_hash);
-    _ = branch_b.author("bnlvn", "bnlvn@merk.dev", 150);
-    _ = branch_b.intent(.feature);
-    _ = branch_b.title("side branch");
-    const branch_hash = try branch_b.write(&obj_store);
+    var channel_b = CommitBuilder.init(alloc, tree_hash);
+    defer channel_b.deinit();
+    _ = try channel_b.parent(base_hash);
+    _ = channel_b.author("bnlvn", "bnlvn@merk.dev", 150);
+    _ = channel_b.intent(.feature);
+    _ = channel_b.title("side channel");
+    const channel_hash = try channel_b.write(&obj_store);
 
     var merge_b = CommitBuilder.init(alloc, tree_hash);
     defer merge_b.deinit();
     _ = try merge_b.parentWithKind(base_hash, .normal);
-    _ = try merge_b.parentWithKind(branch_hash, .merge);
+    _ = try merge_b.parentWithKind(channel_hash, .merge);
     _ = merge_b.author("bnlvn", "bnlvn@merk.dev", 200);
     _ = merge_b.intent(.chore);
-    _ = merge_b.title("merge branch");
+    _ = merge_b.title("merge channel");
     const merge_hash = try merge_b.write(&obj_store);
 
     var walk = try RevWalk.init(alloc, &obj_store, merge_hash, .mainline_only);
@@ -499,16 +499,16 @@ test "RevWalk with mainline_only still follows a merge's typed second parent" {
     defer visited.deinit(alloc);
     while (try walk.next()) |visited_hash| try visited.append(alloc, visited_hash);
 
-    // merge, base, and branch (via the .merge-typed edge) should all show
+    // merge, base, and channel (via the .merge-typed edge) should all show
     try testing.expectEqual(@as(usize, 3), visited.items.len);
-    var saw_branch = false;
+    var saw_channel = false;
     for (visited.items) |visited_hash| {
-        if (hashEq(visited_hash, branch_hash)) saw_branch = true;
+        if (hashEq(visited_hash, channel_hash)) saw_channel = true;
     }
-    try testing.expect(saw_branch);
+    try testing.expect(saw_channel);
 }
 
-test "History.commit records path history and advances the branch ref" {
+test "History.commit records path history and advances the channel ref" {
     const alloc = testing.allocator;
     var mem_fs = MemoryFs.init(alloc);
     defer mem_fs.deinit();
@@ -519,7 +519,7 @@ test "History.commit records path history and advances the branch ref" {
     var history = try History.init(alloc, mem_fs.fs(), "history", &obj_store, &page_store);
     defer history.deinit();
 
-    const main = try ChannelName.parse("main");
+    const main = try Channel.parse("main");
 
     const tree1 = try makeTree(alloc, &page_store, &.{"a.txt"});
     const c1 = try history.commit(main, tree1, &.{}, testRequest("add a.txt", 1000));
@@ -566,12 +566,12 @@ test "History.commit on a commit with only a cherry-pick parent diffs against th
     var history = try History.init(alloc, mem_fs.fs(), "history", &obj_store, &page_store);
     defer history.deinit();
 
-    const donor_branch = try ChannelName.parse("donor-branch");
-    const main = try ChannelName.parse("main");
+    const donor_channel = try Channel.parse("donor-channel");
+    const main = try Channel.parse("main");
 
-    // A donor commit elsewhere in the object store, never on this branch
+    // A donor commit elsewhere in the object store, never on this channel
     const donor_tree = try makeTree(alloc, &page_store, &.{"donor.txt"});
-    const donor_hash = try history.commit(donor_branch, donor_tree, &.{}, testRequest("donor commit", 500));
+    const donor_hash = try history.commit(donor_channel, donor_tree, &.{}, testRequest("donor commit", 500));
 
     const tree1 = try makeTree(alloc, &page_store, &.{"donor.txt"});
     const c1 = try history.commit(

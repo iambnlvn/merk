@@ -29,7 +29,7 @@ const Store = object_mod.Store;
 const Staging = staging_mod.Staging;
 const History = history_mod.History;
 const ReferenceStore = refs_mod.ReferenceStore;
-const ChannelName = refs_mod.ChannelName;
+const Channel = refs_mod.Channel;
 pub const CommitRequest = commit_mod.CommitRequest;
 const ParentInfo = commit_mod.ParentInfo;
 const EntryChange = merkle_mod.EntryChange;
@@ -53,12 +53,12 @@ const OwnedChannel = struct {
     /// Backing storage `parsed` borrows from. Never read directly by
     /// callers outside this type — go through `get()`.
     raw: []u8,
-    parsed: ChannelName,
+    parsed: Channel,
 
     fn init(alloc: Allocator, name: []const u8) !OwnedChannel {
         const owned = try alloc.dupe(u8, name);
         errdefer alloc.free(owned);
-        return .{ .raw = owned, .parsed = try ChannelName.parse(owned) };
+        return .{ .raw = owned, .parsed = try Channel.parse(owned) };
     }
 
     /// Reparses and swaps in `name` as the new active channel,
@@ -69,14 +69,14 @@ const OwnedChannel = struct {
     fn set(self: *OwnedChannel, alloc: Allocator, name: []const u8) !void {
         const owned = try alloc.dupe(u8, name);
         errdefer alloc.free(owned);
-        const parsed = try ChannelName.parse(owned);
+        const parsed = try Channel.parse(owned);
 
         alloc.free(self.raw);
         self.raw = owned;
         self.parsed = parsed;
     }
 
-    fn get(self: *const OwnedChannel) ChannelName {
+    fn get(self: *const OwnedChannel) Channel {
         return self.parsed;
     }
 

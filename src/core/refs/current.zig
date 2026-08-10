@@ -1,6 +1,6 @@
 const std = @import("std");
 const crypto = @import("crypto");
-const channel_mod = @import("channel_name.zig");
+const channel_mod = @import("channel.zig");
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -12,7 +12,7 @@ pub const Hash = crypto.Hash;
 pub const CURRENT_FILE = "refs/CURRENT";
 
 /// The on-disk prefix marking a symbolic Current. Built from
-/// `ChannelName.CHANNELS_DIR` rather than duplicated as a separate
+/// `Channel.CHANNELS_DIR` rather than duplicated as a separate
 /// literal, so the two can't silently drift apart if the channels
 /// directory ever moves.
 pub const symbolic_prefix = "ref: " ++ channel_mod.CHANNELS_DIR ++ "/";
@@ -24,9 +24,9 @@ pub const Current = union(enum) {
     /// Current is on a channel, by name. Owned.
     ///
     /// Deliberately a raw, unvalidated string rather than a
-    /// `ChannelName`: `Current.parse` only knows how to split the
+    /// `Channel`: `Current.parse` only knows how to split the
     /// on-disk format apart, not whether the result is a well-formed
-    /// channel name. That check belongs to `ChannelName.parse`, applied
+    /// channel name. That check belongs to `Channel.parse`, applied
     /// by callers (e.g. `RefStore.resolveCurrent`) that need a validated
     /// channel to act on — see its doc comment for how an invalid name
     /// here surfaces as `error.CorruptCurrent` one layer up.
@@ -116,7 +116,7 @@ test "parse treats an empty current file as corrupt, not a valid state" {
     } else |_| {}
 }
 
-test "symbolic_prefix stays derived from ChannelName.CHANNELS_DIR, not duplicated" {
+test "symbolic_prefix stays derived from Channel.CHANNELS_DIR, not duplicated" {
     try testing.expect(std.mem.startsWith(u8, symbolic_prefix, "ref: "));
     try testing.expect(std.mem.endsWith(u8, symbolic_prefix, channel_mod.CHANNELS_DIR ++ "/"));
 }
@@ -124,7 +124,7 @@ test "symbolic_prefix stays derived from ChannelName.CHANNELS_DIR, not duplicate
 test "parse accepts an empty channel name right after the prefix" {
     // refs.zig relies on this: a symbolic Current with nothing after the
     // prefix parses successfully as symbolic with an empty name — it's
-    // ChannelName.parse's job (one layer up) to reject that as invalid,
+    // Channel.parse's job (one layer up) to reject that as invalid,
     // not Current.parse's.
     const alloc = testing.allocator;
     var current = try Current.parse(alloc, symbolic_prefix);
