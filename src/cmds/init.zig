@@ -106,7 +106,7 @@ fn printSuccess(
     }
 
     try ctx.out.writeAll(
-        \\  merk snapshot --all
+        \\  merk stage --all
         \\  merk commit -m "Initial commit"
         \\
     );
