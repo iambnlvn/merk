@@ -1,16 +1,34 @@
 const std = @import("std");
-const merk = @import("merk");
-const diff_mod = @import("../core/diff.zig");
-const diff_algorithms = diff_mod.diff_algorithms;
-const diff_snapshot = diff_mod.diff_snapshot;
-const diff_render = diff_mod.diff_render;
-const repo_context = @import("repo_context.zig");
+const crypto = @import("crypto");
+const merkle_mod = @import("merkle");
+
 const cli = @import("../cli/command.zig");
+const errors_mod = @import("../cli/errors.zig");
+const diff_mod = @import("../core/diff.zig");
+const repo_context = @import("repo_context.zig");
+
 const Command = cli.Command;
+const Context = cli.Context;
 const Flag = cli.Flag;
 const Invocation = cli.Invocation;
-const Context = cli.Context;
 
+const Algorithm = diff_mod.Algorithm;
+const ChangeFilter = diff_mod.ChangeFilter;
+const CommitDiff = diff_mod.CommitDiff;
+const DiffContext = diff_mod.Context;
+const FileDiff = diff_mod.FileDiff;
+const Format = diff_mod.Format;
+const GroupBy = diff_mod.GroupBy;
+const Level = diff_mod.Level;
+const RenderConfig = diff_mod.RenderConfig;
+
+const diffCommitAgainstParent = diff_mod.diffCommitAgainstParent;
+const diffCommits = diff_mod.diffCommits;
+const diffFileWith = diff_mod.diffFileWith;
+const fileStatus = diff_mod.fileStatus;
+const groupByDirectory = diff_mod.groupByDirectory;
+const renderFileDiff = diff_mod.renderFileDiff;
+const renderFiltered = diff_mod.renderFiltered;
 /// CLI-only: whether to emit ANSI color codes. The core renderers are
 /// colorless; if/when color support is added to rendering, it should take
 /// a plain `bool` derived from this, not this enum directly
@@ -22,8 +40,13 @@ const ColorMode = enum {
 
 const Profile = enum { review, ci, debug };
 
-fn parseFormat(s: []const u8) ?diff_render.Format {
-    const map = std.StaticStringMap(diff_render.Format).initComptime(.{
+fn parseFormat(s: []const u8) ?Format {
+    // Can't use std.meta.stringToEnum here: "side-by-side" (the CLI
+    // spelling) isn't a legal Zig identifier, so it can't be the tag name
+    // (side_by_side) that maps to. Every other flag below whose CLI
+    // strings match their enum's tag names verbatim uses stringToEnum
+    // instead of a hand-written table like this one.
+    const map = std.StaticStringMap(Format).initComptime(.{
         .{ "unified", .unified },
         .{ "side-by-side", .side_by_side },
         .{ "blocks", .blocks },
@@ -33,17 +56,7 @@ fn parseFormat(s: []const u8) ?diff_render.Format {
     return map.get(s);
 }
 
-fn parseLevel(s: []const u8) ?diff_render.Level {
-    const map = std.StaticStringMap(diff_render.Level).initComptime(.{
-        .{ "file", .file },
-        .{ "hunk", .hunk },
-        .{ "line", .line },
-        .{ "word", .word },
-    });
-    return map.get(s);
-}
-
-fn parseContext(s: []const u8) ?diff_render.Context {
+fn parseContext(s: []const u8) ?DiffContext {
     if (std.mem.eql(u8, s, "minimal")) return .minimal;
     if (std.mem.eql(u8, s, "normal")) return .normal;
     if (std.mem.eql(u8, s, "full")) return .full;
@@ -51,42 +64,7 @@ fn parseContext(s: []const u8) ?diff_render.Context {
     return .{ .exact = n };
 }
 
-fn parseGroupBy(s: []const u8) ?diff_render.GroupBy {
-    const map = std.StaticStringMap(diff_render.GroupBy).initComptime(.{
-        .{ "none", .none },
-        .{ "files", .files },
-        .{ "dirs", .dirs },
-    });
-    return map.get(s);
-}
-
-fn parseAlgorithm(s: []const u8) ?diff_algorithms.Algorithm {
-    const map = std.StaticStringMap(diff_algorithms.Algorithm).initComptime(.{
-        .{ "myers", .myers },
-        .{ "patience", .patience },
-        .{ "histogram", .histogram },
-    });
-    return map.get(s);
-}
-
-fn parseColorMode(raw: []const u8) ?ColorMode {
-    if (std.mem.eql(u8, raw, "auto")) return .auto;
-    if (std.mem.eql(u8, raw, "always")) return .always;
-    if (std.mem.eql(u8, raw, "never")) return .never;
-    return null;
-}
-
-/// Resolves `auto` against whether stdout is a TTY. CLI-only — core has no
-/// concept of a terminal.
-fn resolveColor(mode: ColorMode, stdout_is_tty: bool) bool {
-    return switch (mode) {
-        .always => true,
-        .never => false,
-        .auto => stdout_is_tty,
-    };
-}
-
-fn applyProfile(p: Profile, config: *diff_render.RenderConfig) void {
+fn applyProfile(p: Profile, config: *RenderConfig) void {
     switch (p) {
         .review => {
             config.format = .side_by_side;
@@ -104,8 +82,18 @@ fn applyProfile(p: Profile, config: *diff_render.RenderConfig) void {
     }
 }
 
+/// Resolves `auto` against whether stdout is a TTY. CLI-only — core has no
+/// concept of a terminal.
+fn resolveColor(mode: ColorMode, stdout_is_tty: bool) bool {
+    return switch (mode) {
+        .always => true,
+        .never => false,
+        .auto => stdout_is_tty,
+    };
+}
+
 pub fn run(ctx: Context, inv: *Invocation) !void {
-    var config = diff_render.RenderConfig{};
+    var config = RenderConfig{};
     var color_mode: ColorMode = .auto;
 
     if (inv.flags.string("format")) |v|
@@ -115,7 +103,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         };
 
     if (inv.flags.string("level")) |v|
-        config.level = parseLevel(v) orelse {
+        config.level = std.meta.stringToEnum(Level, v) orelse {
             ctx.err.print("error: invalid level '{s}'\n", .{v}) catch {};
             return error.InvalidLevel;
         };
@@ -127,13 +115,13 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         };
 
     if (inv.flags.string("group")) |v|
-        config.group_by = parseGroupBy(v) orelse {
+        config.group_by = std.meta.stringToEnum(GroupBy, v) orelse {
             ctx.err.print("error: invalid group '{s}'\n", .{v}) catch {};
             return error.InvalidGroup;
         };
 
     if (inv.flags.string("algo")) |v|
-        config.algorithm = parseAlgorithm(v) orelse {
+        config.algorithm = std.meta.stringToEnum(Algorithm, v) orelse {
             ctx.err.print("error: invalid algorithm '{s}'\n", .{v}) catch {};
             return error.InvalidAlgorithm;
         };
@@ -150,14 +138,14 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         config.filter = .{ .show_added = false, .show_deleted = false, .show_modified = true };
 
     if (inv.flags.string("show")) |v|
-        config.filter = diff_render.ChangeFilter.parse(v) catch {
+        config.filter = ChangeFilter.parse(v) catch {
             ctx.err.print("error: invalid --show value '{s}'\n", .{v}) catch {};
             return error.InvalidChangeFilter;
         };
 
     // --color overrides --no-color if both are given
     if (inv.flags.string("color")) |v|
-        color_mode = parseColorMode(v) orelse {
+        color_mode = std.meta.stringToEnum(ColorMode, v) orelse {
             ctx.err.print("error: invalid color mode '{s}'\n", .{v}) catch {};
             return error.InvalidColorMode;
         };
@@ -186,7 +174,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
             const trimmed = std.mem.trim(u8, part, " \t");
             if (trimmed.len == 0) continue;
 
-            merk.crypto.hash.parseHexPrefix(trimmed) catch {
+            crypto.parseHexPrefix(trimmed) catch {
                 ctx.err.print("error: invalid --rev '{s}' (expected 8-64 hex chars)\n", .{trimmed}) catch {};
                 return error.InvalidRev;
             };
@@ -203,12 +191,6 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         ctx.err.print("error: --staged and --rev are mutually exclusive\n", .{}) catch {};
         return error.ConflictingDiffMode;
     }
-    if (staged) {
-        ctx.err.print("error: --staged is not yet implemented\n", .{}) catch {};
-        return error.NotImplemented;
-    }
-    // --working is the default behaviour (and currently the only one with no
-    // --rev given); accepted as a no-op
 
     // Resolved here, in the CLI layer, since "is stdout a tty" is a CLI
     // concern the core renderers don't need to know about.
@@ -220,85 +202,71 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     const opened = try repo_context.open(ctx);
     defer opened.deinit(ctx.alloc);
 
-    // Resolve rev strings (full or short hashes) to actual Hash objects.
+    if (staged) {
+        // Structural (Merkle-tree) diff between HEAD's snapshot and the
+        // staged tree — same data `status` shows under "staged". This is
+        // deliberately a summary, not the full line-level render the
+        // working-tree and --rev paths below produce: EntryChange only
+        // carries the "what changed" shape, not old/new blob content to
+        // diff line-by-line.
+        const changes = opened.repo.diffStaged() catch |err| return errors_mod.report(ctx, err);
+        defer merkle_mod.freeChanges(inv.alloc, changes);
+
+        if (changes.len == 0) return;
+
+        try ctx.out.print("{d} path{s} staged\n", .{ changes.len, if (changes.len == 1) "" else "s" });
+        return;
+    }
+    // --working is the default behaviour (and currently the only one with no
+    // --rev given); accepted as a no-op
+
     // --rev refers to *commits* (see the flag help text), so these are
-    // commit hashes, not snapshot/index-tree roots — that distinction
+    // commit hashes, not snapshot/staging-tree roots — that distinction
     // matters below, since diff_snapshot's commit-level helpers resolve
     // a commit to its snapshot root themselves.
-    var revs: std.ArrayListUnmanaged(merk.crypto.hash.Hash) = .empty;
+    var revs: std.ArrayListUnmanaged(crypto.Hash) = .empty;
     defer revs.deinit(inv.alloc);
 
+    // `Repository.resolveRev` accepts both a full 64-char hash and an 8+
+    // char prefix — the same resolution `show` uses, so a hash that works
+    // in one command works in the other.
     for (rev_strs.items) |rev_str| {
-        const h = merk.crypto.hash.fromHex(rev_str) catch {
-            // Not a full hash: resolve the short hash prefix against the object store
-            const resolved = opened.repo.store.resolveHashPrefix(rev_str) catch |e| {
-                switch (e) {
-                    error.Ambiguous => ctx.err.print("error: ambiguous --rev '{s}' (matches multiple objects)\n", .{rev_str}) catch {},
-                    error.NotFound => ctx.err.print("error: --rev '{s}' not found\n", .{rev_str}) catch {},
-                    else => ctx.err.print("error: invalid --rev '{s}'\n", .{rev_str}) catch {},
-                }
-                return error.InvalidRev;
-            };
-            try revs.append(inv.alloc, resolved);
-            continue;
+        const resolved = opened.repo.resolveRev(rev_str) catch |e| {
+            switch (e) {
+                error.AmbiguousRev => ctx.err.print("error: ambiguous --rev '{s}' (matches multiple objects)\n", .{rev_str}) catch {},
+                error.RevNotFound => ctx.err.print("error: --rev '{s}' not found\n", .{rev_str}) catch {},
+                else => ctx.err.print("error: invalid --rev '{s}'\n", .{rev_str}) catch {},
+            }
+            return error.InvalidRev;
         };
-        try revs.append(inv.alloc, h);
+        try revs.append(inv.alloc, resolved);
     }
 
     const writer = ctx.out;
 
     if (revs.items.len > 0) {
-        var cd: diff_algorithms.CommitDiff = if (revs.items.len == 1)
-            try diff_snapshot.diffCommitAgainstParent(inv.alloc, &opened.repo.store, &opened.repo.page_store, revs.items[0], config.algorithm)
+        var cd: CommitDiff = if (revs.items.len == 1)
+            try diffCommitAgainstParent(inv.alloc, &opened.repo.store, &opened.repo.page_store, revs.items[0], config.algorithm)
         else
-            try diff_snapshot.diffCommits(inv.alloc, &opened.repo.store, &opened.repo.page_store, revs.items[0], revs.items[1], config.algorithm);
+            try diffCommits(inv.alloc, &opened.repo.store, &opened.repo.page_store, revs.items[0], revs.items[1], config.algorithm);
         defer cd.deinit(inv.alloc);
 
-        var visible: std.ArrayListUnmanaged(*const diff_algorithms.FileDiff) = .empty;
-        defer visible.deinit(inv.alloc);
-
-        for (cd.files) |*fd| {
-            if (!config.filter.allows(diff_render.fileStatus(fd))) continue;
-
-            if (paths.len > 0) {
-                const included = for (paths) |p| {
-                    if (std.mem.startsWith(u8, fd.path, p)) break true;
-                } else false;
-                if (!included) continue;
-            }
-
-            try visible.append(inv.alloc, fd);
-        }
-
-        if (visible.items.len == 0) return;
-
-        if (config.group_by == .dirs) {
-            const groups = try diff_render.groupByDirectory(inv.alloc, visible.items);
-            defer {
-                for (groups) |g| inv.alloc.free(g.files);
-                inv.alloc.free(groups);
-            }
-            for (groups) |g| {
-                try writer.print("{s}/\n", .{g.dir});
-                for (g.files) |fd|
-                    try writer.print("  {s}\n", .{std.fs.path.basename(fd.path)});
-                try writer.writeByte('\n');
-            }
-        } else {
-            for (visible.items) |fd|
-                try diff_render.renderFileDiff(writer, fd, config);
-        }
-
+        // Filtering by `config.filter`, restricting to `paths`, grouping
+        // by directory or not, and rendering each visible file all lives
+        // in `renderFiltered` now — the same routine `merk show` (via
+        // `renderCommit`) uses. This and the working-tree branch below
+        // used to each carry their own copy of that logic.
+        try renderFiltered(writer, cd.files, config, inv.alloc, paths);
         return;
     }
 
-    // No --rev given: existing working-tree-vs-index behavior, unchanged.
-    // Index was already loaded by Repository.open.
-    const index = &opened.repo.index;
+    // No --rev given: default working-tree-vs-staging behavior, unchanged.
+    // Staging was already loaded by Repository.open.
+    const staging = &opened.repo.staging;
 
     const cwd = std.fs.cwd();
 
-    var file_diffs: std.ArrayListUnmanaged(diff_algorithms.FileDiff) = .empty;
+    var file_diffs: std.ArrayListUnmanaged(FileDiff) = .empty;
     var source_buffers: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
         for (file_diffs.items) |*fd| fd.deinit(inv.alloc);
@@ -307,21 +275,21 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         source_buffers.deinit(inv.alloc);
     }
 
-    for (index.entries.items) |entry| {
-        const state = try index.stateOf(opened.repo.root, entry);
+    for (staging.allEntries()) |entry| {
+        const state = try staging.stateOf(opened.repo.root, entry);
         if (state == .clean) continue;
 
         const obj = try opened.repo.store.get(entry.blob_hash);
         try source_buffers.append(inv.alloc, obj.payload);
 
-        var fd: diff_algorithms.FileDiff = if (state == .deleted)
-            try diff_algorithms.diffFileWith(inv.alloc, entry.path, obj.payload, "", config.algorithm)
+        var fd: FileDiff = if (state == .deleted)
+            try diffFileWith(inv.alloc, entry.path, obj.payload, "", config.algorithm)
         else blk: {
             var file = try cwd.openFile(entry.path, .{});
             defer file.close();
             const new_src = try file.readToEndAlloc(inv.alloc, 64 * 1024 * 1024);
             try source_buffers.append(inv.alloc, new_src);
-            break :blk try diff_algorithms.diffFileWith(inv.alloc, entry.path, obj.payload, new_src, config.algorithm);
+            break :blk try diffFileWith(inv.alloc, entry.path, obj.payload, new_src, config.algorithm);
         };
 
         if (fd.line_deltas.len != 0) {
@@ -333,45 +301,12 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
     if (file_diffs.items.len == 0) return;
 
-    var visible: std.ArrayListUnmanaged(*const diff_algorithms.FileDiff) = .empty;
-    defer visible.deinit(inv.alloc);
-
-    for (file_diffs.items) |*fd| {
-        if (!config.filter.allows(diff_render.fileStatus(fd))) continue;
-
-        if (paths.len > 0) {
-            const included = for (paths) |p| {
-                if (std.mem.startsWith(u8, fd.path, p)) break true;
-            } else false;
-            if (!included) continue;
-        }
-
-        try visible.append(inv.alloc, fd);
-    }
-
-    if (visible.items.len == 0) return;
-
-    if (config.group_by == .dirs) {
-        const groups = try diff_render.groupByDirectory(inv.alloc, visible.items);
-        defer {
-            for (groups) |g| inv.alloc.free(g.files);
-            inv.alloc.free(groups);
-        }
-        for (groups) |g| {
-            try writer.print("{s}/\n", .{g.dir});
-            for (g.files) |fd|
-                try writer.print("  {s}\n", .{std.fs.path.basename(fd.path)});
-            try writer.writeByte('\n');
-        }
-    } else {
-        for (visible.items) |fd|
-            try diff_render.renderFileDiff(writer, fd, config);
-    }
+    try renderFiltered(writer, file_diffs.items, config, inv.alloc, paths);
 }
 
 pub const command = Command{
     .name = "diff",
-    .description = "Show changes between the index and working tree, or between commits with --rev.",
+    .description = "Show changes between staging and the working tree, or between commits with --rev.",
     .usage = "[options] [<path>...]",
     .category = .history,
     .flags = &[_]Flag{
@@ -380,7 +315,7 @@ pub const command = Command{
         .{ .short = 'c', .long = "context", .kind = .value, .value_name = "n", .help = "context lines (number, minimal, normal, full)" },
         .{ .short = 'g', .long = "group", .kind = .value, .value_name = "mode", .help = "none, files, dirs" },
         .{ .long = "algo", .kind = .value, .value_name = "name", .help = "myers, patience, histogram (default: histogram)" },
-        .{ .long = "rev", .kind = .value, .value_name = "hash", .help = "commit hash to compare; repeat for two commits (default: working tree vs index)" },
+        .{ .long = "rev", .kind = .value, .value_name = "hash", .help = "commit hash to compare; repeat for two commits (default: working tree vs staging)" },
         .{ .long = "word", .kind = .boolean, .help = "enable inline word highlighting" },
         .{ .long = "only-added", .kind = .boolean, .help = "show only added files" },
         .{ .long = "only-deleted", .kind = .boolean, .help = "show only deleted files" },
@@ -390,7 +325,7 @@ pub const command = Command{
         .{ .long = "no-color", .kind = .boolean, .help = "disable color" },
         .{ .long = "color", .kind = .value, .value_name = "when", .help = "auto, always, never" },
         .{ .long = "profile", .kind = .value, .value_name = "name", .help = "review, ci, debug" },
-        .{ .long = "staged", .kind = .boolean, .help = "diff staged changes (not yet implemented; mutually exclusive with --rev)" },
+        .{ .long = "staged", .kind = .boolean, .help = "summarize staged changes (structural only; mutually exclusive with --rev)" },
         .{ .long = "working", .kind = .boolean, .help = "diff working tree changes (default)" },
     },
     .run = run,

@@ -100,32 +100,62 @@ pub const RenderConfig = struct {
 };
 
 pub fn renderCommit(writer: *std.Io.Writer, cd: *const CommitDiff, config: RenderConfig, alloc: Allocator) !void {
-    var filtered: ArrayList(*const FileDiff) = .empty;
-    defer filtered.deinit(alloc);
+    try renderFiltered(writer, cd.files, config, alloc, &.{});
+}
 
-    for (cd.files) |*fd| {
-        const status = fileStatus(fd);
-        if (!config.filter.allows(status)) continue;
-        try filtered.append(alloc, fd);
+/// Filter `files` down to what `config` and `paths` allow, then render
+/// exactly the way `renderCommit` always has: grouped by directory when
+/// `config.group_by == .dirs`, otherwise one `renderFileDiff` call per
+/// visible file.
+///
+/// `paths`, if non-empty, keeps only files whose path starts with one of
+/// them — repo-relative path arguments a CLI command might take (e.g.
+/// `merk diff src/`). Pass `&.{}` for "no path restriction", which is all
+/// `renderCommit` itself ever needs. This is the one place both a
+/// commit-vs-commit diff's `CommitDiff.files` and a hand-assembled
+/// working-tree `[]FileDiff` go through, so there's a single filter+group
+/// implementation instead of each caller reimplementing it.
+pub fn renderFiltered(
+    writer: *std.Io.Writer,
+    files: []const FileDiff,
+    config: RenderConfig,
+    alloc: Allocator,
+    paths: []const []const u8,
+) !void {
+    var visible: ArrayList(*const FileDiff) = .empty;
+    defer visible.deinit(alloc);
+
+    for (files) |*fd| {
+        if (!config.filter.allows(fileStatus(fd))) continue;
+
+        if (paths.len > 0) {
+            const included = for (paths) |p| {
+                if (std.mem.startsWith(u8, fd.path, p)) break true;
+            } else false;
+            if (!included) continue;
+        }
+
+        try visible.append(alloc, fd);
     }
 
+    if (visible.items.len == 0) return;
+
     if (config.group_by == .dirs) {
-        const groups = try groupByDirectory(alloc, filtered.items);
+        const groups = try groupByDirectory(alloc, visible.items);
         defer {
             for (groups) |g| alloc.free(g.files);
             alloc.free(groups);
         }
         for (groups) |g| {
             try writer.print("{s}/\n", .{g.dir});
-            for (g.files) |fd| {
+            for (g.files) |fd|
                 try writer.print("  {s}\n", .{std.fs.path.basename(fd.path)});
-            }
             try writer.writeByte('\n');
         }
         return;
     }
 
-    for (filtered.items) |fd| {
+    for (visible.items) |fd| {
         try renderFileDiff(writer, fd, config);
     }
 }

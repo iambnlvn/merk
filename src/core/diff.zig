@@ -25,7 +25,7 @@ pub const fileStatus = render_mod.fileStatus;
 pub const groupByDirectory = render_mod.groupByDirectory;
 pub const renderCommit = render_mod.renderCommit;
 pub const renderFileDiff = render_mod.renderFileDiff;
-
+pub const renderFiltered = render_mod.renderFiltered;
 pub const diffCommitAgainstParent = snapshot.diffCommitAgainstParent;
 pub const diffCommits = snapshot.diffCommits;
 
