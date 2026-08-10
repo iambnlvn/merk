@@ -47,6 +47,78 @@ pub const TrailerInfo = struct {
         try wire.writeBytes(u8, writer, self.key);
         try wire.writeBytes(u16, writer, self.value);
     }
+
+    /// Scan `body` for git-style trailers at its tail and split them off.
+    pub fn parseTrailingBlock(
+        alloc: Allocator,
+        body: []const u8,
+        out: *std.ArrayListUnmanaged(TrailerInfo),
+    ) ![]const u8 {
+        // Collect lines so we can find the contiguous trailer tail by
+        // walking backwards from the end.
+        var lines = std.ArrayListUnmanaged([]const u8){};
+        defer lines.deinit(alloc);
+
+        var it = std.mem.splitScalar(u8, body, '\n');
+        while (it.next()) |line| try lines.append(alloc, line);
+
+        // Walk backwards, collecting trailers (scanned back-to-front) until
+        // a blank line or a line that fails validation ends the block.
+        var found = std.ArrayListUnmanaged(TrailerInfo){};
+        defer found.deinit(alloc);
+
+        var trailer_start: usize = lines.items.len; // index of first trailer line
+
+        var i: usize = lines.items.len;
+        while (i > 0) {
+            i -= 1;
+            const line = std.mem.trimRight(u8, lines.items[i], " \t\r");
+
+            // A blank line ends the backwards scan; everything below it is
+            // the trailer block (if any were found).
+            if (line.len == 0) break;
+
+            // Must look like `key: value` — key, then ": ", then the rest.
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse break;
+            const rest = line[colon + 1 ..];
+            if (rest.len < 2 or rest[0] != ' ') break;
+
+            const candidate = TrailerInfo{
+                .key = line[0..colon],
+                .value = std.mem.trim(u8, rest[1..], " \t"),
+            };
+            candidate.validate() catch break;
+
+            try found.append(alloc, candidate);
+            trailer_start = i;
+        }
+
+        if (trailer_start == lines.items.len) return body; // nothing found
+
+        // `found` was built back-to-front; append to `out` in source order.
+        var idx = found.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            try out.append(alloc, found.items[idx]);
+        }
+
+        // Strip the trailer block and the blank line above it from the
+        // body. Find the last non-trailer, non-blank line.
+        var end = trailer_start;
+        while (end > 0 and std.mem.trimRight(u8, lines.items[end - 1], " \t\r").len == 0) {
+            end -= 1;
+        }
+
+        if (end == 0) return "";
+
+        var kept = std.ArrayListUnmanaged(u8){};
+        errdefer kept.deinit(alloc);
+        for (lines.items[0..end], 0..) |line, li| {
+            if (li > 0) try kept.append(alloc, '\n');
+            try kept.appendSlice(alloc, line);
+        }
+        return kept.toOwnedSlice(alloc);
+    }
 };
 
 pub const Trailer = struct {
@@ -412,6 +484,67 @@ test "Message lifecycle via initDupe" {
     try testing.expectEqual(@as(usize, 1), msg.trailers.len);
     try testing.expectEqualStrings("reviewed-by", msg.trailers[0].key);
     try testing.expectEqualStrings("carol@corp.com", msg.trailers[0].value);
+}
+
+test "TrailerInfo.parseTrailingBlock - splits a trailing trailer block" {
+    const alloc = testing.allocator;
+    const body = "Fixes the thing.\n\nMore detail here.\n\ncloses: #42\nreviewed-by: alice@corp.com";
+
+    var out = std.ArrayListUnmanaged(TrailerInfo){};
+    defer out.deinit(alloc);
+
+    const rest = try TrailerInfo.parseTrailingBlock(alloc, body, &out);
+    defer if (rest.ptr != body.ptr) alloc.free(rest);
+
+    try testing.expectEqualStrings("Fixes the thing.\n\nMore detail here.", rest);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    try testing.expectEqualStrings("closes", out.items[0].key);
+    try testing.expectEqualStrings("#42", out.items[0].value);
+    try testing.expectEqualStrings("reviewed-by", out.items[1].key);
+    try testing.expectEqualStrings("alice@corp.com", out.items[1].value);
+}
+
+test "TrailerInfo.parseTrailingBlock - no trailer block returns body unchanged" {
+    const alloc = testing.allocator;
+    const body = "Just a description, no trailers here.";
+
+    var out = std.ArrayListUnmanaged(TrailerInfo){};
+    defer out.deinit(alloc);
+
+    const rest = try TrailerInfo.parseTrailingBlock(alloc, body, &out);
+
+    try testing.expectEqual(body.ptr, rest.ptr);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "TrailerInfo.parseTrailingBlock - invalid key stops the scan" {
+    const alloc = testing.allocator;
+    // "bad key" has a space in the key, so it fails TrailerInfo.validate()
+    // and isn't treated as a trailer — nor is "closes" below it, since the
+    // block must be contiguous from the bottom up.
+    const body = "Body text.\n\nbad key: nope\ncloses: #1";
+
+    var out = std.ArrayListUnmanaged(TrailerInfo){};
+    defer out.deinit(alloc);
+
+    const rest = try TrailerInfo.parseTrailingBlock(alloc, body, &out);
+
+    try testing.expectEqual(body.ptr, rest.ptr);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "TrailerInfo.parseTrailingBlock - whole body is a trailer block" {
+    const alloc = testing.allocator;
+    const body = "closes: #1\nbreaks: api.v1";
+
+    var out = std.ArrayListUnmanaged(TrailerInfo){};
+    defer out.deinit(alloc);
+
+    const rest = try TrailerInfo.parseTrailingBlock(alloc, body, &out);
+    defer if (rest.ptr != body.ptr) alloc.free(rest);
+
+    try testing.expectEqualStrings("", rest);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
 }
 
 test "Message deserialization from binary stream - legacy no trailers" {
