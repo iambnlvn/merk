@@ -1,5 +1,8 @@
+//TODO!: this is an initial version, this should be cleaned up asap
+
 const std = @import("std");
-const merk = @import("merk");
+const crypto = @import("crypto");
+const merkle = @import("merkle");
 
 const cli = @import("../cli/command.zig");
 const flags = @import("../cli/flags.zig");
@@ -7,6 +10,7 @@ const Command = cli.Command;
 const Invocation = cli.Invocation;
 
 const repo_context = @import("repo_context.zig");
+const errors_mod = @import("../cli/errors.zig");
 const commit_mod = @import("../core/commit.zig");
 const metadata_mod = @import("../core/commit/metadata.zig");
 const message_mod = @import("../core/commit/message.zig");
@@ -72,87 +76,18 @@ fn parseIntent(raw: []const u8) Intent {
     };
 }
 
-/// Scan the body for git-style trailers at the tail.
-///
-/// Trailers are lines of the form `key: value` after a blank-line separator.
-/// The block must be contiguous and at the end of the body — any non-trailer
-/// line in the candidate block terminates the scan.
-///
-/// Parsed trailers are appended to `out`; the function returns the body with
-/// the trailer block (and the blank line above it) stripped.
-fn extractBodyTrailers(
-    alloc: std.mem.Allocator,
-    body: []const u8,
-    out: *std.ArrayListUnmanaged(TrailerInfo),
-) ![]const u8 {
-    // Collect lines in reverse so we can find the contiguous trailer tail.
-    var lines = std.ArrayListUnmanaged([]const u8){};
-    defer lines.deinit(alloc);
-
-    var it = std.mem.splitScalar(u8, body, '\n');
-    while (it.next()) |line| try lines.append(alloc, line);
-
-    // Walk backwards, collecting trailer lines until we hit a blank or
-    // a line that doesn't match the `key: value` pattern.
-    var trailer_start: usize = lines.items.len; // index of first trailer line
-
-    var i: usize = lines.items.len;
-    while (i > 0) {
-        i -= 1;
-        const line = std.mem.trimRight(u8, lines.items[i], " \t\r");
-
-        // A blank line ends the backwards scan; everything below it is the
-        // trailer block (if any were found).
-        if (line.len == 0) break;
-
-        // Must match `key: value` — key is non-empty, no spaces/colons, then ": "
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse break;
-        if (colon == 0) break; // empty key
-        const key = line[0..colon];
-        const rest = line[colon + 1 ..];
-        if (rest.len < 2 or rest[0] != ' ') break; // need ": "
-
-        // Validate key chars (same rules as TrailerInfo.validate)
-        var key_ok = true;
-        for (key) |c| {
-            if (c < 0x21 or c > 0x7E or c == ':') {
-                key_ok = false;
-                break;
-            }
-        }
-        if (!key_ok) break;
-
-        trailer_start = i;
-    }
-
-    if (trailer_start == lines.items.len) return body; // nothing found
-
-    // Append trailers in forward order (they were scanned backwards).
-    for (lines.items[trailer_start..]) |line| {
-        const trimmed = std.mem.trimRight(u8, line, " \t\r");
-        if (trimmed.len == 0) continue;
-        const colon = std.mem.indexOfScalar(u8, trimmed, ':').?;
-        const value = std.mem.trim(u8, trimmed[colon + 2 ..], " \t");
-        try out.append(alloc, .{ .key = trimmed[0..colon], .value = value });
-    }
-
-    // Strip the trailer block and the blank line above it from the body.
-    // Find the last non-trailer, non-blank line.
-    var end = trailer_start;
-    while (end > 0 and std.mem.trimRight(u8, lines.items[end - 1], " \t\r").len == 0) {
-        end -= 1;
-    }
-
-    if (end == 0) return "";
-
-    // Re-join the kept lines.
-    var kept = std.ArrayListUnmanaged(u8){};
-    errdefer kept.deinit(alloc);
-    for (lines.items[0..end], 0..) |line, idx| {
-        if (idx > 0) try kept.append(alloc, '\n');
-        try kept.appendSlice(alloc, line);
-    }
-    return kept.toOwnedSlice(alloc);
+fn describeMessageError(err: message_mod.MessageError) []const u8 {
+    return switch (err) {
+        error.EmptyCommitMessage => "commit message must not be empty",
+        error.TitleTooLong => "commit title is too long",
+        error.BodyTooLong => "commit body is too long",
+        error.TitleContainsIllegalCharacters => "commit title must not contain newlines",
+        error.TooManyTrailers => "too many trailers on this commit (max 255)",
+        error.TrailerKeyEmpty => "a trailer key must not be empty",
+        error.TrailerKeyTooLong => "a trailer key is too long",
+        error.TrailerValueTooLong => "a trailer value is too long",
+        error.TrailerKeyContainsIllegalCharacters => "a trailer key contains illegal characters (printable ASCII, no colon or whitespace)",
+    };
 }
 
 pub fn run(ctx: Context, inv: *Invocation) !void {
@@ -233,7 +168,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     const skip_body_trailers = inv.flags.boolean("no-body-trailers");
 
     const body: []const u8 = if (!skip_body_trailers)
-        try extractBodyTrailers(inv.alloc, body_raw, &trailer_list)
+        try TrailerInfo.parseTrailingBlock(inv.alloc, body_raw, &trailer_list)
     else
         body_raw;
 
@@ -285,11 +220,21 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         }
     }
 
+    const draft_message = message_mod.MessageInfo{
+        .title = title_raw,
+        .body = body,
+        .trailers = trailer_list.items,
+    };
+    draft_message.validate() catch |err| {
+        try ctx.err.print("error: {s}\n", .{describeMessageError(err)});
+        return err;
+    };
+
     const opened = try repo_context.open(ctx);
     defer opened.deinit(ctx.alloc);
 
-    if (opened.repo.index.entries.items.len == 0) {
-        try ctx.err.print("error: nothing to commit (index is empty — run `merk add <path>` first)\n", .{});
+    if (opened.repo.staging.allEntries().len == 0) {
+        try ctx.err.print("error: nothing to commit (staging is empty — run `merk snapshot <path>` first)\n", .{});
         return error.NothingToCommit;
     }
 
@@ -297,21 +242,24 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     // may also independently reject a no-op commit (per project notes,
     // duplicate-commit detection was added at that layer) — this check
     // just gets a friendlier, specific message out before that happens.
-    const maybe_head = try opened.repo.ref_store.readTrack(opened.repo.current_track);
-    if (maybe_head) |head_hash| {
-        var parent_c = try commit_mod.read(inv.alloc, &opened.repo.store, head_hash);
-        defer parent_c.deinit(inv.alloc);
+    // `status().staged` is exactly the "current HEAD snapshot vs staged
+    // tree" diff, so an empty list here means the two are identical.
+    const maybe_head = try opened.repo.current();
+    if (maybe_head != null) {
+        const current_status = opened.repo.status() catch |err| return errors_mod.report(ctx, err);
+        defer merkle.freeChanges(inv.alloc, current_status.staged);
+        defer inv.alloc.free(current_status.unstaged);
 
-        if (std.mem.eql(u8, &parent_c.snapshot, &opened.repo.index.index_root)) {
+        if (current_status.staged.len == 0) {
             try ctx.err.print(
-                "error: nothing to commit — staged tree is identical to HEAD (stage changes with `merk add` first)\n",
+                "error: nothing to commit — staged tree is identical to CURRENT (stage changes with `merk stage` first)\n",
                 .{},
             );
             return error.NothingToCommit;
         }
     }
 
-    const commit_hash = try opened.repo.commit(.{
+    const commit_hash = opened.repo.commit(.{
         .author_name = author_name,
         .author_email = author_email,
         .author_timestamp_ms = author_date,
@@ -323,10 +271,10 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         .body = body,
         .trailers = trailer_list.items,
         .labels = label_list.items,
-    });
+    }) catch |err| return errors_mod.report(ctx, err);
 
-    const track_name = opened.repo.current_track.raw;
-    const short = merk.crypto.hash.shortHex(commit_hash);
+    const track_name = opened.repo.channel.raw;
+    const short = crypto.shortHex(commit_hash);
 
     try ctx.out.print("✓ Commit created\n\n", .{});
 
@@ -370,10 +318,11 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         }
     }
 
+    const staged_count = opened.repo.staging.allEntries().len;
     try ctx.out.print("\n  Changes\n", .{});
     try ctx.out.print("    {} staged file{s}\n", .{
-        opened.repo.index.entries.items.len,
-        if (opened.repo.index.entries.items.len == 1) "" else "s",
+        staged_count,
+        if (staged_count == 1) "" else "s",
     });
 }
 
