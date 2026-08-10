@@ -1,5 +1,4 @@
 const std = @import("std");
-const merk = @import("merk");
 
 const repo_context = @import("repo_context.zig");
 
@@ -21,14 +20,14 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     const opened = try repo_context.open(ctx);
     defer opened.deinit(ctx.alloc);
 
-    const index = &opened.repo.index;
+    const staging = &opened.repo.staging;
     const cwd = std.fs.cwd();
 
     // Validate every path is tracked before mutating anything, so a typo
     // partway through a multi-path `rm` doesn't leave the repo (or the
     // worktree) half-mutated.
     for (inv.positional.items) |path| {
-        if (index.lookup(path) == null) {
+        if (staging.lookup(path) == null) {
             try ctx.err.print("error: '{s}' is not tracked\n", .{path});
             return error.NotTracked;
         }
@@ -41,18 +40,18 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
             cwd.deleteFile(full_path) catch |err| switch (err) {
                 // Already gone from the worktree (e.g. deleted by hand) —
-                // still drop it from the index below.
+                // still drop it from the staging below.
                 error.FileNotFound => {},
                 else => return err,
             };
         }
-        // `Index.remove` shifts `entries` in place, so removing one path
+        // `staging.remove` shifts `entries` in place, so removing one path
         // at a time here is fine; `path_index` gets rebuilt once inside
         // `remove` and once more in `save` below — cheap relative to the
         // I/O either side of it.
-        try index.remove(path);
+        try staging.remove(path);
     }
-    try index.save();
+    try staging.save();
 
     for (inv.positional.items) |path| {
         if (cached) {
@@ -64,12 +63,16 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 }
 
 pub const command = Command{
-    .name = "rm",
-    .description = "Remove paths from the index and, unless --cached, the working tree.",
+    .name = "unstage",
+    .description = "Remove paths from the staging and, unless --cached, the working tree.",
     .usage = "<path>...",
     .category = .snapshot,
     .flags = &.{
-        .{ .long = "cached", .kind = .boolean, .help = "only unstage; leave the working tree file alone" },
+        .{
+            .long = "cached",
+            .kind = .boolean,
+            .help = "only unstage; leave the working tree file alone",
+        },
     },
     .run = run,
 };
