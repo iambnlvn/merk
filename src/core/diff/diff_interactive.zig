@@ -36,10 +36,11 @@ pub const InteractiveOutcome = struct {
     /// be a no-op that still touches the entry's mtime bookkeeping for
     /// no reason).
     staged_count: usize,
-    /// True if the user answered 'q' before every hunk was decided.
-    /// Hunks not yet reached are treated as skipped in `content` --
-    /// same semantics as `git add -p`'s "q" ("quit; do not stage this
-    /// hunk or any of the remaining ones").
+    /// True if the user answered 'q' (or ran out of input entirely --
+    /// see `readAnswer`) before every hunk was decided. Hunks not yet
+    /// reached are treated as skipped in `content` -- same semantics
+    /// as `git add -p`'s "q" ("quit; do not stage this hunk or any of
+    /// the remaining ones").
     quit_early: bool,
 
     pub fn deinit(self: *InteractiveOutcome, alloc: Allocator) void {
@@ -62,8 +63,8 @@ pub fn run(
     old_src: []const u8,
     new_src: []const u8,
     context: u32,
-    writer: anytype,
-    reader: anytype,
+    writer: *std.Io.Writer,
+    reader: *std.Io.Reader,
 ) !InteractiveOutcome {
     const hunks = try hunkRanges(alloc, line_deltas, context);
     defer alloc.free(hunks);
@@ -89,8 +90,34 @@ pub fn run(
 
         prompt: while (true) {
             try writer.writeAll("Stage this hunk [y,n,q,a,d,?]? ");
-            var line_buf: [256]u8 = undefined;
-            const raw = try readLine(reader, &line_buf);
+            // Must flush before reading: the prompt above (and, on the
+            // first iteration for this hunk, writeHunk's output too)
+            // is still sitting in writer's buffer at this point --
+            // reader.takeDelimiterExclusive below blocks for input, and
+            // nothing forces a flush on its own. See this function's
+            // own doc comment.
+            try writer.flush();
+
+            const raw = readAnswer(reader) catch |err| switch (err) {
+                // Genuinely nothing left to read (as opposed to a final
+                // unterminated line, which takeDelimiterExclusive still
+                // returns successfully) -- treat like an explicit 'q'
+                // rather than looping forever re-prompting a reader
+                // that can never answer.
+                error.EndOfStream => {
+                    quit_early = true;
+                    break :prompt;
+                },
+                // A line longer than reader's own buffer. Reprompt
+                // rather than aborting the whole session over one
+                // garbage line -- see readAnswer's doc comment for the
+                // known limitation this leaves.
+                error.StreamTooLong => {
+                    try writeHelp(writer);
+                    continue :prompt;
+                },
+                else => return err,
+            };
             const answer = std.mem.trim(u8, raw, " \t\r\n");
 
             switch (decide(answer)) {
@@ -150,7 +177,7 @@ fn decide(answer: []const u8) Decision {
     };
 }
 
-fn writeHelp(writer: anytype) !void {
+fn writeHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\y - stage this hunk
         \\n - do not stage this hunk
@@ -163,7 +190,7 @@ fn writeHelp(writer: anytype) !void {
 }
 
 fn writeHunk(
-    writer: anytype,
+    writer: *std.Io.Writer,
     line_deltas: []const LineDelta,
     hunk: HunkRange,
     index: usize,
@@ -193,41 +220,35 @@ fn displayLineNum(deltas: []const LineDelta) u32 {
     return deltas[0].new_lineno;
 }
 
-/// Reads one line (up to `buf.len` bytes, excluding the delimiter) from
-/// `reader`, stopping at `\n` or EOF. Returns the bytes read into `buf`
-/// -- not an owned allocation, since a fixed stack buffer is enough for
-/// single-character-plus-newline answers and the caller only needs the
-/// trimmed content transiently.
+/// Reads one line of user input via `reader.takeDelimiterExclusive('\n')`
+/// and discards the newline itself with `.toss(1)` -- the standard
+/// std.Io.Reader idiom for line-oriented input (see e.g. the REPL
+/// pattern in std.Io.Reader's own doc comments). The returned slice
+/// borrows from `reader`'s internal buffer and is only valid until the
+/// next read call; `run` only ever inspects it (via `decide`) before
+/// reading again, so nothing here holds onto it longer than that.
 ///
-/// NOTE: uses `reader.readByte()`, the one Reader method stable enough
-/// across the std.io -> std.Io churn to lean on directly (see
-/// staging.zig's `addContent` for this codebase's existing TODO about
-/// that churn elsewhere). A real caller wiring this to stdin should
-/// pass `std.fs.File.reader()` (or whatever this repo's CLI I/O layer
-/// wraps it as) here; tests below use `std.Io.fixedBufferStream`.
-fn readLine(reader: anytype, buf: []u8) ![]u8 {
-    var n: usize = 0;
-    while (n < buf.len) {
-        const byte = reader.readByte() catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (byte == '\n') break;
-        buf[n] = byte;
-        n += 1;
-    }
-    return buf[0..n];
+/// `takeDelimiterExclusive` itself treats a final, non-newline-terminated
+/// line as a successful read (not an error) -- `error.EndOfStream` only
+/// comes back when there is truly nothing left to read at all. `run`
+/// relies on that distinction to tell "last line, no trailing newline"
+/// (answer it normally) apart from "reader is exhausted" (treat as an
+/// implicit quit).
+///
+/// No local buffer is owned or sized here -- unlike the byte-at-a-time
+/// version this replaced, buffer sizing is entirely the caller's
+/// concern via whatever backs `reader` (e.g. the CLI's own stdin
+/// buffer). `error.StreamTooLong` -- a single line longer than that
+/// buffer -- is possible but is handled by `run`'s caller, not here.
+fn readAnswer(reader: *std.Io.Reader) ![]const u8 {
+    const line = try reader.takeDelimiterExclusive('\n');
+    reader.toss(1);
+    return line;
 }
 
 const testing = std.testing;
 
-test "run stages only the hunks answered y, in order" {
-    const alloc = testing.allocator;
-    var old_buf: std.ArrayList(u8) = .empty;
-    defer old_buf.deinit(alloc);
-    var new_buf: std.ArrayList(u8) = .empty;
-    defer new_buf.deinit(alloc);
-
+fn buildTwoHunkDiff(alloc: Allocator, old_buf: *std.ArrayList(u8), new_buf: *std.ArrayList(u8)) !diff_algorithms.FileDiff {
     for (0..20) |i| {
         if (i == 2) {
             try old_buf.appendSlice(alloc, "old-a\n");
@@ -240,15 +261,25 @@ test "run stages only the hunks answered y, in order" {
             try new_buf.writer(alloc).print("line{d}\n", .{i});
         }
     }
+    return diff_algorithms.diffFileWith(alloc, "f.txt", old_buf.items, new_buf.items, .myers);
+}
 
-    var fd = try diff_algorithms.diffFileWith(alloc, "f.txt", old_buf.items, new_buf.items, .myers);
+test "run stages only the hunks answered y, in order" {
+    const alloc = testing.allocator;
+    var old_buf: std.ArrayList(u8) = .empty;
+    defer old_buf.deinit(alloc);
+    var new_buf: std.ArrayList(u8) = .empty;
+    defer new_buf.deinit(alloc);
+
+    var fd = try buildTwoHunkDiff(alloc, &old_buf, &new_buf);
     defer fd.deinit(alloc);
 
-    var out_buf: std.ArrayList(u8) = .empty;
-    defer out_buf.deinit(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
 
-    var stream = std.Io.fixedBufferStream("y\nn\n");
-    var outcome = try run(alloc, fd.line_deltas, old_buf.items, new_buf.items, 2, out_buf.writer(alloc), stream.reader());
+    var in: std.Io.Reader = .fixed("y\nn\n");
+
+    var outcome = try run(alloc, fd.line_deltas, old_buf.items, new_buf.items, 2, &out.writer, &in);
     defer outcome.deinit(alloc);
 
     try testing.expectEqual(@as(usize, 2), outcome.hunk_count);
@@ -265,29 +296,17 @@ test "run 'a' stages the current hunk and every remaining one without prompting"
     var new_buf: std.ArrayList(u8) = .empty;
     defer new_buf.deinit(alloc);
 
-    for (0..20) |i| {
-        if (i == 2) {
-            try old_buf.appendSlice(alloc, "old-a\n");
-            try new_buf.appendSlice(alloc, "new-a\n");
-        } else if (i == 17) {
-            try old_buf.appendSlice(alloc, "old-b\n");
-            try new_buf.appendSlice(alloc, "new-b\n");
-        } else {
-            try old_buf.writer(alloc).print("line{d}\n", .{i});
-            try new_buf.writer(alloc).print("line{d}\n", .{i});
-        }
-    }
-
-    var fd = try diff_algorithms.diffFileWith(alloc, "f.txt", old_buf.items, new_buf.items, .myers);
+    var fd = try buildTwoHunkDiff(alloc, &old_buf, &new_buf);
     defer fd.deinit(alloc);
 
-    var out_buf: std.ArrayList(u8) = .empty;
-    defer out_buf.deinit(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
 
     // Only one answer supplied -- 'a' on the first hunk must decide
     // the second without reading further input.
-    var stream = std.Io.fixedBufferStream("a\n");
-    var outcome = try run(alloc, fd.line_deltas, old_buf.items, new_buf.items, 2, out_buf.writer(alloc), stream.reader());
+    var in: std.Io.Reader = .fixed("a\n");
+
+    var outcome = try run(alloc, fd.line_deltas, old_buf.items, new_buf.items, 2, &out.writer, &in);
     defer outcome.deinit(alloc);
 
     try testing.expectEqual(@as(usize, 2), outcome.staged_count);
@@ -302,33 +321,45 @@ test "run 'q' stops prompting and stages nothing further" {
     var new_buf: std.ArrayList(u8) = .empty;
     defer new_buf.deinit(alloc);
 
-    for (0..20) |i| {
-        if (i == 2) {
-            try old_buf.appendSlice(alloc, "old-a\n");
-            try new_buf.appendSlice(alloc, "new-a\n");
-        } else if (i == 17) {
-            try old_buf.appendSlice(alloc, "old-b\n");
-            try new_buf.appendSlice(alloc, "new-b\n");
-        } else {
-            try old_buf.writer(alloc).print("line{d}\n", .{i});
-            try new_buf.writer(alloc).print("line{d}\n", .{i});
-        }
-    }
-
-    var fd = try diff_algorithms.diffFileWith(alloc, "f.txt", old_buf.items, new_buf.items, .myers);
+    var fd = try buildTwoHunkDiff(alloc, &old_buf, &new_buf);
     defer fd.deinit(alloc);
 
-    var out_buf: std.ArrayList(u8) = .empty;
-    defer out_buf.deinit(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
 
-    var stream = std.Io.fixedBufferStream("y\nq\n");
-    var outcome = try run(alloc, fd.line_deltas, old_buf.items, new_buf.items, 2, out_buf.writer(alloc), stream.reader());
+    var in: std.Io.Reader = .fixed("y\nq\n");
+
+    var outcome = try run(alloc, fd.line_deltas, old_buf.items, new_buf.items, 2, &out.writer, &in);
     defer outcome.deinit(alloc);
 
     try testing.expect(outcome.quit_early);
     try testing.expectEqual(@as(usize, 1), outcome.staged_count);
     try testing.expect(std.mem.indexOf(u8, outcome.content, "new-a") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.content, "old-b") != null);
+}
+
+test "run runs out of input mid-file and treats it as an implicit quit, not an infinite loop" {
+    const alloc = testing.allocator;
+    var old_buf: std.ArrayList(u8) = .empty;
+    defer old_buf.deinit(alloc);
+    var new_buf: std.ArrayList(u8) = .empty;
+    defer new_buf.deinit(alloc);
+
+    var fd = try buildTwoHunkDiff(alloc, &old_buf, &new_buf);
+    defer fd.deinit(alloc);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+
+    // One answer for the first hunk, then nothing -- no second line,
+    // not even an unterminated one.
+    var in: std.Io.Reader = .fixed("y\n");
+
+    var outcome = try run(alloc, fd.line_deltas, old_buf.items, new_buf.items, 2, &out.writer, &in);
+    defer outcome.deinit(alloc);
+
+    try testing.expect(outcome.quit_early);
+    try testing.expectEqual(@as(usize, 1), outcome.staged_count);
 }
 
 test "run '?' prints help and re-prompts the same hunk" {
@@ -339,15 +370,16 @@ test "run '?' prints help and re-prompts the same hunk" {
     var fd = try diff_algorithms.diffFileWith(alloc, "f.txt", old, new, .myers);
     defer fd.deinit(alloc);
 
-    var out_buf: std.ArrayList(u8) = .empty;
-    defer out_buf.deinit(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
 
-    var stream = std.Io.fixedBufferStream("?\ny\n");
-    var outcome = try run(alloc, fd.line_deltas, old, new, 1, out_buf.writer(alloc), stream.reader());
+    var in: std.Io.Reader = .fixed("?\ny\n");
+
+    var outcome = try run(alloc, fd.line_deltas, old, new, 1, &out.writer, &in);
     defer outcome.deinit(alloc);
 
     try testing.expectEqual(@as(usize, 1), outcome.staged_count);
-    try testing.expect(std.mem.indexOf(u8, out_buf.items, "stage this hunk") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "stage this hunk") != null);
 }
 
 test "run with zero hunks (identical files) stages nothing and needs no input" {
@@ -357,11 +389,12 @@ test "run with zero hunks (identical files) stages nothing and needs no input" {
     var fd = try diff_algorithms.diffFileWith(alloc, "f.txt", src, src, .myers);
     defer fd.deinit(alloc);
 
-    var out_buf: std.ArrayList(u8) = .empty;
-    defer out_buf.deinit(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
 
-    var stream = std.Io.fixedBufferStream("");
-    var outcome = try run(alloc, fd.line_deltas, src, src, 1, out_buf.writer(alloc), stream.reader());
+    var in: std.Io.Reader = .fixed("");
+
+    var outcome = try run(alloc, fd.line_deltas, src, src, 1, &out.writer, &in);
     defer outcome.deinit(alloc);
 
     try testing.expectEqual(@as(usize, 0), outcome.hunk_count);

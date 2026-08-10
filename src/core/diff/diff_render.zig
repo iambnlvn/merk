@@ -3,7 +3,6 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 
 const diff_algorithms = @import("./diff_algorithms.zig");
-const diff_patch = @import("./diff_patch.zig");
 
 const LineDelta = diff_algorithms.LineDelta;
 const FileDiff = diff_algorithms.FileDiff;
@@ -100,7 +99,7 @@ pub const RenderConfig = struct {
     }
 };
 
-pub fn renderCommit(writer: anytype, cd: *const CommitDiff, config: RenderConfig, alloc: Allocator) !void {
+pub fn renderCommit(writer: *std.Io.Writer, cd: *const CommitDiff, config: RenderConfig, alloc: Allocator) !void {
     var filtered: ArrayList(*const FileDiff) = .empty;
     defer filtered.deinit(alloc);
 
@@ -131,7 +130,7 @@ pub fn renderCommit(writer: anytype, cd: *const CommitDiff, config: RenderConfig
     }
 }
 
-pub fn renderFileDiff(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
+pub fn renderFileDiff(writer: *std.Io.Writer, fd: *const FileDiff, config: RenderConfig) !void {
     if (config.level == .file) {
         try writeFileHeaderLine(writer, fd, fileStatus(fd));
         return;
@@ -151,7 +150,7 @@ pub fn renderFileDiff(writer: anytype, fd: *const FileDiff, config: RenderConfig
     }
 }
 
-pub fn renderUnified(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
+pub fn renderUnified(writer: *std.Io.Writer, fd: *const FileDiff, config: RenderConfig) !void {
     try writer.print("FILE  {s}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{fd.path});
     if (fd.line_deltas.len == 0) return;
 
@@ -171,7 +170,7 @@ pub fn renderUnified(writer: anytype, fd: *const FileDiff, config: RenderConfig)
     }
 }
 
-fn renderSideBySide(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
+fn renderSideBySide(writer: *std.Io.Writer, fd: *const FileDiff, config: RenderConfig) !void {
     const col_width = maxLineWidth(fd.line_deltas, @as(usize, @intCast(config.max_width)));
     const sep = " │ ";
 
@@ -199,7 +198,7 @@ fn renderSideBySide(writer: anytype, fd: *const FileDiff, config: RenderConfig) 
     try writer.writeByte('\n');
 }
 
-fn renderBlockOriented(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
+fn renderBlockOriented(writer: *std.Io.Writer, fd: *const FileDiff, config: RenderConfig) !void {
     try writer.print("FILE: {s}\n", .{fd.path});
     if (fd.line_deltas.len == 0) return;
 
@@ -217,7 +216,7 @@ fn renderBlockOriented(writer: anytype, fd: *const FileDiff, config: RenderConfi
     }
 }
 
-fn renderOperations(writer: anytype, fd: *const FileDiff, config: RenderConfig) !void {
+fn renderOperations(writer: *std.Io.Writer, fd: *const FileDiff, config: RenderConfig) !void {
     try writer.print("FILE  {s}\n", .{fd.path});
     try writer.print("STATUS: {s}\n\n", .{statusString(fileStatus(fd))});
     if (fd.line_deltas.len == 0) return;
@@ -233,24 +232,24 @@ fn renderOperations(writer: anytype, fd: *const FileDiff, config: RenderConfig) 
     }
 }
 
-fn renderSummary(writer: anytype, fd: *const FileDiff) !void {
+fn renderSummary(writer: *std.Io.Writer, fd: *const FileDiff) !void {
     try writeFileHeaderLine(writer, fd, fileStatus(fd));
 }
 
-fn writeFileHeaderLine(writer: anytype, fd: *const FileDiff, status: FileStatus) !void {
+fn writeFileHeaderLine(writer: *std.Io.Writer, fd: *const FileDiff, status: FileStatus) !void {
     try writer.print("{s} {s} (+{d} -{d})\n", .{ statusString(status), fd.path, fd.lines_added, fd.lines_removed });
 }
 
-fn renderWordHighlight(writer: anytype, fd: *const FileDiff) !void {
+fn renderWordHighlight(writer: *std.Io.Writer, fd: *const FileDiff) !void {
     try renderWordDiff(writer, fd);
 }
 
-pub fn renderWordDiff(writer: anytype, fd: *const FileDiff) !void {
+pub fn renderWordDiff(writer: *std.Io.Writer, fd: *const FileDiff) !void {
     try writer.print("WORD HIGHLIGHT: {s}\n", .{fd.path});
     try renderWordDeltas(writer, fd.word_deltas);
 }
 
-fn renderWordDeltas(writer: anytype, word_deltas: []const diff_algorithms.WordDelta) !void {
+fn renderWordDeltas(writer: *std.Io.Writer, word_deltas: []const diff_algorithms.WordDelta) !void {
     var current_line: u32 = 0;
     for (word_deltas) |d| {
         if (d.lineno != current_line) {
@@ -280,22 +279,43 @@ const Hunk = struct {
     }
 };
 
-// Boundary computation itself lives in diff_patch.zig, shared with
-// patch-selection — see that module's top-of-file comment for why this
-// isn't reimplemented here. This iterator is just that shared walk,
-// re-attached to `deltas` so `displayLineNum` (a rendering-only need)
-// has something to index into.
 const HunkIterator = struct {
     deltas: []const LineDelta,
-    inner: diff_patch.HunkRangeIterator,
+    context: u32,
+    i: usize,
 
     fn init(deltas: []const LineDelta, context: u32) HunkIterator {
-        return .{ .deltas = deltas, .inner = diff_patch.HunkRangeIterator.init(deltas, context) };
+        return .{ .deltas = deltas, .context = context, .i = 0 };
     }
 
     fn next(self: *HunkIterator) ?Hunk {
-        const r = self.inner.next() orelse return null;
-        return Hunk{ .start = r.start, .end = r.end, .deltas = self.deltas };
+        while (self.i < self.deltas.len and self.deltas[self.i].op == .eq) self.i += 1;
+        if (self.i >= self.deltas.len) return null;
+
+        const start = if (self.i >= self.context) self.i - self.context else 0;
+        var hunk_end: usize = self.i;
+
+        while (hunk_end < self.deltas.len) {
+            if (self.deltas[hunk_end].op != .eq) {
+                hunk_end = @min(hunk_end + @as(usize, @intCast(self.context)) + 1, self.deltas.len);
+            } else {
+                var lookahead = hunk_end;
+                var eq_run: u32 = 0;
+                while (lookahead < self.deltas.len and self.deltas[lookahead].op == .eq) {
+                    lookahead += 1;
+                    eq_run += 1;
+                }
+                if (eq_run > self.context * 2 or lookahead >= self.deltas.len) {
+                    hunk_end = @min(hunk_end + @as(usize, @intCast(self.context)), self.deltas.len);
+                    break;
+                }
+                hunk_end = lookahead;
+            }
+        }
+
+        const result = Hunk{ .start = start, .end = hunk_end, .deltas = self.deltas };
+        self.i = hunk_end;
+        return result;
     }
 };
 
@@ -402,20 +422,20 @@ fn maxLineWidth(deltas: []const LineDelta, max_width: usize) usize {
     return if (max < max_width) max else max_width;
 }
 
-fn writePadded(writer: anytype, text: []const u8, width: usize) !void {
+fn writePadded(writer: *std.Io.Writer, text: []const u8, width: usize) !void {
     try writer.writeAll(text);
     if (text.len < width) {
         for (0..width - text.len) |_| try writer.writeByte(' ');
     }
 }
 
-fn padTo(writer: anytype, width: usize, already_written: usize) void {
+fn padTo(writer: *std.Io.Writer, width: usize, already_written: usize) void {
     if (width > already_written) {
         for (0..width - already_written) |_| writer.writeByte(' ') catch {};
     }
 }
 
-fn writeSectionDivider(writer: anytype, width: usize) !void {
+fn writeSectionDivider(writer: *std.Io.Writer, width: usize) !void {
     for (0..width) |_| try writer.writeAll("━");
     try writer.writeByte('\n');
 }
