@@ -1,7 +1,7 @@
 //TODO: wip for implementing a pager like less for long outputs
 
 const std = @import("std");
-const merk = @import("merk");
+const crypto = @import("crypto");
 
 const repo_context = @import("repo_context.zig");
 const commit_mod = @import("../core/commit.zig");
@@ -58,7 +58,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         var commit = try commit_mod.read(inv.alloc, &opened.repo.store, current_hash);
         defer commit.deinit(inv.alloc);
 
-        const hash_hex = try merk.crypto.hash.toHex(inv.alloc, current_hash);
+        const hash_hex = try crypto.toHex(inv.alloc, current_hash);
         defer inv.alloc.free(hash_hex);
 
         const author = try std.fmt.allocPrint(inv.alloc, "{s} <{s}>", .{
@@ -79,7 +79,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         var parent_hexes = std.ArrayList([]u8).empty;
         defer parent_hexes.deinit(inv.alloc);
         for (commit.parents) |parent| {
-            const parent_hex = try merk.crypto.hash.toHex(inv.alloc, parent.hash);
+            const parent_hex = try crypto.toHex(inv.alloc, parent.hash);
             errdefer inv.alloc.free(parent_hex);
             try parent_hexes.append(inv.alloc, parent_hex);
         }

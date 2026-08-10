@@ -1,5 +1,4 @@
 const std = @import("std");
-const merk = @import("merk");
 
 const repo_context = @import("repo_context.zig");
 
