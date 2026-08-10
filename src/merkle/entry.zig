@@ -20,6 +20,18 @@ pub const Entry = struct {
     pub fn deinit(self: *Entry, alloc: Allocator) void {
         alloc.free(self.path);
     }
+
+    /// True if this entry's path lives under `dir` — i.e. `dir` is a
+    /// proper path-*segment* prefix of `path`, not just a string prefix.
+    /// "docs" matches "docs/readme.md" but not "docs-old/readme.md".
+    /// The empty string is treated as the repository root, under which
+    /// every entry lives.
+    pub fn isUnder(self: Entry, dir: []const u8) bool {
+        if (dir.len == 0) return true;
+        return self.path.len > dir.len and
+            std.mem.startsWith(u8, self.path, dir) and
+            self.path[dir.len] == '/';
+    }
 };
 
 /// Worktree status of an indexed entry relative to the filesystem
@@ -120,4 +132,20 @@ test "pathKey is deterministic big-endian prefix" {
     var expected: PathKey = 0;
     for (h[0..8]) |byte| expected = (expected << 8) | byte;
     try testing.expectEqual(expected, pathKey("src/main.zig"));
+}
+
+test "Entry.isUnder matches path-segment prefixes, not string prefixes" {
+    var e = Entry{
+        .path = @constCast("docs/readme.md"),
+        .blob_hash = std.mem.zeroes(Hash),
+        .size = 0,
+        .mode = 0,
+        .mtime = 0,
+    };
+
+    try testing.expect(e.isUnder("docs"));
+    try testing.expect(e.isUnder("")); // root contains everything
+    try testing.expect(!e.isUnder("docs-old")); // string prefix, not a segment prefix
+    try testing.expect(!e.isUnder("docs/readme.md")); // an entry isn't "under" its own exact path
+    try testing.expect(!e.isUnder("other"));
 }
