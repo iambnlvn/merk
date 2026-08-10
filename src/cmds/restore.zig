@@ -47,7 +47,7 @@ pub const command = Command{
     .name = "restore",
     .description = "Restore working tree paths from the index, or unstage them with --staged.",
     .usage = "<path>...",
-    .category = .snapshot,
+    .category = .staging,
     .flags = &.{
         .{
             .long = "staged",

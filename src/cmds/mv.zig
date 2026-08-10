@@ -149,7 +149,7 @@ pub const command = Command{
     .name = "mv",
     .description = "Move or rename tracked files or directories, updating both the staging area and working tree.",
     .usage = "<from>... <to>",
-    .category = .snapshot,
+    .category = .staging,
     .flags = &.{
         .{ .long = "force", .kind = .boolean, .help = "overwrite an already-tracked destination path" },
     },

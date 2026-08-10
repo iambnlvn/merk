@@ -1,18 +1,19 @@
 const std = @import("std");
-const merk = @import("merk");
+const Allocator = std.mem.Allocator;
+const storage = @import("storage");
 
 const repository_mod = @import("../core/repository.zig");
 const Repository = repository_mod.Repository;
 
 const cli = @import("../cli/command.zig");
 const Context = cli.Context;
-
+const OsFs = storage.OsFs;
 /// Everything a repo-touching command needs to open, use, and tear down
 /// a `Repository` — bundled behind one call instead of two loosely
 /// coupled pieces (`real_fs` and an opened-repo handle) a caller had to
 /// declare separately and wire together by hand.
 ///
-/// `Repository` embeds the `io.FileSystem` interface built from
+/// `Repository` embeds the `storage.FileSystem` interface built from
 /// `real_fs.fs()` — `{ ptr, vtable }` pointing back at `real_fs` itself —
 /// and holds onto it for as long as `Repository` lives. `real_fs` is
 /// therefore heap-allocated here (not stored inline in `Opened`), so the
@@ -25,23 +26,23 @@ const Context = cli.Context;
 ///     defer opened.deinit(ctx.alloc);
 ///     try opened.repo.add(inv.positional.items);
 pub const Opened = struct {
-    real_fs: *merk.io.RealFs,
+    real_fs: *OsFs,
     repo: *Repository,
     /// Absolute path of the directory containing `.merk`, as found by
     /// `discoverRoot`. Owned by `Opened`; may differ from `ctx.repo_root`
     /// when the command was run from a subdirectory of the repo.
     root: []const u8,
 
-    pub fn deinit(self: Opened, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: Opened, alloc: Allocator) void {
         self.repo.deinit();
         alloc.destroy(self.real_fs);
         alloc.free(self.root);
     }
 };
 
-pub const DiscoverError = error{NotARepository} || std.mem.Allocator.Error;
+pub const DiscoverError = error{NotARepository} || Allocator.Error;
 
-pub fn discoverRoot(alloc: std.mem.Allocator, start_dir: []const u8) DiscoverError![]const u8 {
+pub fn discoverRoot(alloc: Allocator, start_dir: []const u8) DiscoverError![]const u8 {
     var current = std.fs.cwd().realpathAlloc(alloc, start_dir) catch return error.NotARepository;
     errdefer alloc.free(current);
 
@@ -89,17 +90,17 @@ pub fn open(ctx: Context) !Opened {
         else => return err,
     };
 
-    const real_fs = try ctx.alloc.create(merk.io.RealFs);
+    const real_fs = try ctx.alloc.create(OsFs);
     errdefer ctx.alloc.destroy(real_fs);
-    real_fs.* = merk.io.RealFs.init(control_dir);
+    real_fs.* = OsFs.init(control_dir);
 
     const repo = Repository.open(ctx.alloc, real_fs.fs(), root) catch |err| switch (err) {
         error.NotARepository => {
-            ctx.err.print("error: not a merk repository (.merk exists but has no Focus yet)\n", .{}) catch {};
+            ctx.err.print("error: not a merk repository (.merk exists but has no Current yet)\n", .{}) catch {};
             return err;
         },
-        error.DetachedFocus => {
-            ctx.err.print("error: Focus is detached; this command needs a track checked out\n", .{}) catch {};
+        error.DetachedCurrent => {
+            ctx.err.print("error: Current is detached; this command needs a track checked out\n", .{}) catch {};
             return err;
         },
         else => return err,

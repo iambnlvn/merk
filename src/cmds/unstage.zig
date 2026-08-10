@@ -66,7 +66,7 @@ pub const command = Command{
     .name = "unstage",
     .description = "Remove paths from the staging and, unless --cached, the working tree.",
     .usage = "<path>...",
-    .category = .snapshot,
+    .category = .staging,
     .flags = &.{
         .{
             .long = "cached",

@@ -9,14 +9,14 @@ pub const FlagKind = enum { boolean, value };
 /// only, no behavioral effect on parsing.
 pub const Category = enum {
     repository,
-    snapshot,
+    staging,
     history,
     plumbing,
 
     pub fn label(self: Category) []const u8 {
         return switch (self) {
             .repository => "Repository",
-            .snapshot => "Snapshot",
+            .staging => "Staging",
             .history => "History",
             .plumbing => "Plumbing",
         };
@@ -234,7 +234,7 @@ pub const Command = struct {
     /// Parses `args` (already past the binary + command name tokens) into an
     /// `Invocation`. Parse failures are reported to `err_writer` with enough
     /// context (which flag, what was wrong) to act on, then surfaced as a
-    /// plain `Error` for the caller to branch on.
+    /// plain `Error` for the caller to channel on.
     ///
     /// The caller owns the returned value and must call `inv.deinit()`.
     pub fn parseArgs(

@@ -3,7 +3,7 @@ const Command = @import("command.zig").Command;
 const Category = @import("command.zig").Category;
 
 const init = @import("../cmds/init.zig");
-const add = @import("../cmds/add.zig");
+const stage = @import("../cmds/stage.zig");
 const status = @import("../cmds/status.zig");
 const diff = @import("../cmds/diff.zig");
 const writeTree = @import("../cmds/write-tree.zig");
@@ -11,7 +11,7 @@ const commit = @import("../cmds/commit.zig");
 const uncommit = @import("../cmds/uncommit.zig");
 const show = @import("../cmds/show.zig");
 const log = @import("../cmds/log.zig");
-const rm = @import("../cmds/rm.zig");
+const unstage = @import("../cmds/unstage.zig");
 const restore = @import("../cmds/restore.zig");
 const mv = @import("../cmds/mv.zig");
 
@@ -20,8 +20,8 @@ const mv = @import("../cmds/mv.zig");
 /// correctly in `merk help`
 pub const commands: []const Command = &[_]Command{
     init.command,
-    add.command,
-    rm.command,
+    stage.command,
+    unstage.command,
     mv.command,
     restore.command,
     status.command,
@@ -42,7 +42,7 @@ pub fn find(name: []const u8) ?*const Command {
 }
 
 /// All categories, in the order they should be displayed in help output.
-pub const category_order = [_]Category{ .repository, .snapshot, .history, .plumbing };
+pub const category_order = [_]Category{ .repository, .staging, .history, .plumbing };
 
 /// Zero-allocation iterator over commands belonging to a single category,
 /// preserving registration order within that category.

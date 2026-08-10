@@ -86,7 +86,7 @@ pub const command = Command{
     .name = "status",
     .description = "Show the repository status.",
     .usage = "",
-    .category = .snapshot,
+    .category = .staging,
     .flags = &.{},
     .run = run,
 };
