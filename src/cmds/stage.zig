@@ -1,4 +1,5 @@
 const std = @import("std");
+const merkle = @import("merkle");
 
 const repo_context = @import("repo_context.zig");
 const errors_mod = @import("../cli/errors.zig");
@@ -18,11 +19,102 @@ const StageAction = enum {
             .updated => "update",
         };
     }
+
+    fn pastLabel(self: StageAction) []const u8 {
+        return switch (self) {
+            .added => "staged",
+            .updated => "updated",
+        };
+    }
 };
 
+/// Last path component, or the whole string if there's no '/'.
+fn basenameOf(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| return path[i + 1 ..];
+    return path;
+}
+
+/// Prints up to 3 tracked paths that look like they might be what the
+/// caller meant by `missing` — same basename, or `missing` appears
+/// somewhere inside the tracked path. Catches the common "typed the
+/// filename without its directory prefix" typo (e.g. `stage main.zig`
+/// when the tracked path is `src/main.zig`).
+fn printDidYouMean(ctx: Context, entries: []const merkle.Entry, missing: []const u8) !void {
+    const wanted = basenameOf(missing);
+    var header_printed = false;
+    var count: usize = 0;
+
+    for (entries) |e| {
+        if (count >= 3) break;
+        const matches = std.mem.eql(u8, basenameOf(e.path), wanted) or
+            std.mem.indexOf(u8, e.path, missing) != null;
+        if (!matches) continue;
+
+        if (!header_printed) {
+            try ctx.err.writeAll("  did you mean:\n");
+            header_printed = true;
+        }
+        try ctx.err.print("    {s}\n", .{e.path});
+        count += 1;
+    }
+}
+
+/// Recursively walks `repo_root/rel_dir` (rel_dir == "" means repo root),
+/// appending every regular file found — as a path relative to repo
+/// root — into `out`. Skips the `.merk` control directory. Every
+/// resulting string is freshly allocated and also pushed onto `owned`
+/// so the caller can free it later; `seen` is shared with the caller's
+/// dedup pass so a file reachable both explicitly and via a directory
+/// only gets staged once.
+fn expandDirectory(
+    alloc: std.mem.Allocator,
+    repo_root: []const u8,
+    rel_dir: []const u8,
+    out: *std.ArrayListUnmanaged([]const u8),
+    owned: *std.ArrayListUnmanaged([]const u8),
+    seen: *std.StringHashMapUnmanaged(void),
+) !void {
+    const full_dir = try std.fs.path.join(alloc, &.{ repo_root, rel_dir });
+    defer alloc.free(full_dir);
+
+    var dir = std.fs.cwd().openDir(full_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return, // dir vanished between stat and open; nothing to stage
+        else => return err,
+    };
+    defer dir.close();
+
+    var walker = try dir.walk(alloc);
+    defer walker.deinit();
+
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.startsWith(u8, entry.path, ".merk/") or std.mem.eql(u8, entry.path, ".merk")) continue;
+
+        const rel_path = if (rel_dir.len == 0)
+            try alloc.dupe(u8, entry.path)
+        else
+            try std.fmt.allocPrint(alloc, "{s}/{s}", .{ rel_dir, entry.path });
+
+        const gop = try seen.getOrPut(alloc, rel_path);
+        if (gop.found_existing) {
+            alloc.free(rel_path);
+            continue;
+        }
+
+        try owned.append(alloc, rel_path);
+        try out.append(alloc, rel_path);
+    }
+}
+
+fn lessThanPath(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
 pub fn run(ctx: Context, inv: *Invocation) !void {
-    if (inv.positional.items.len == 0) {
-        try ctx.err.writeAll("error: expected at least one path\n\n");
+    const all = inv.flags.boolean("all");
+
+    if (inv.positional.items.len == 0 and !all) {
+        try ctx.err.writeAll("error: expected at least one path (or --all)\n\n");
         command.printHelp(ctx.err) catch {};
         return error.MissingPath;
     }
@@ -31,7 +123,10 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     const patch = inv.flags.boolean("patch");
     const context_lines = inv.flags.unsignedOr(u32, "context", 3);
 
-    // Remove duplicate paths while preserving the original order.
+    // Remove duplicate paths while preserving the original order. This
+    // same map is reused below when expanding directories, so a file
+    // reachable both explicitly and through a directory argument (or
+    // through --all) only ever gets staged once.
     var seen = std.StringHashMapUnmanaged(void){};
     defer seen.deinit(inv.alloc);
 
@@ -48,12 +143,47 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     const opened = try repo_context.open(ctx);
     defer opened.deinit(ctx.alloc);
 
-    // Validate every path exists and isn't a directory before touching
-    // staging at all, so a bad path later in the list doesn't leave
-    // earlier paths half-applied.
-    //
-    // NOTE: abs-path / path-escape validation is handled by
-    // Repository.add/addPatch themselves.
+    // --all restages every already-tracked path with a pending
+    // modification (i.e. everything `status` would list as Modified).
+    // It does NOT discover files that have never been staged — for
+    // that, pass a directory (or `.`) as a path instead; see below.
+    // It also skips Deleted entries: the exists-check further down
+    // rejects any path missing on disk, and `stage` currently has no
+    // way to record a deletion at all (explicit or via --all).
+    if (all) {
+        const status_result = opened.repo.status() catch |err| return errors_mod.report(ctx, err);
+        defer merkle.freeChanges(inv.alloc, status_result.staged);
+        defer inv.alloc.free(status_result.unstaged);
+
+        for (status_result.unstaged) |entry| {
+            if (entry.state != .modified) continue;
+
+            const gop = try seen.getOrPut(inv.alloc, entry.path);
+            if (!gop.found_existing) {
+                try paths.append(inv.alloc, entry.path);
+            }
+        }
+    }
+
+    if (paths.items.len == 0) {
+        try ctx.out.writeAll("nothing to stage\n");
+        return;
+    }
+
+    // Resolve `paths` into `expanded`: plain files pass through as-is;
+    // directories (including `.`) are walked recursively, picking up
+    // every file underneath — tracked or not — which is what makes
+    // `merk stage .` behave like `git add .` rather than being limited
+    // to already-tracked paths the way `--all` is.
+    var expanded = std.ArrayListUnmanaged([]const u8){};
+    defer expanded.deinit(inv.alloc);
+
+    var owned = std.ArrayListUnmanaged([]const u8){};
+    defer {
+        for (owned.items) |p| inv.alloc.free(p);
+        owned.deinit(inv.alloc);
+    }
+
     var bad = false;
 
     for (paths.items) |path| {
@@ -69,6 +199,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
                     "error: path '{s}' does not exist\n",
                     .{path},
                 );
+                printDidYouMean(ctx, opened.repo.staging.allEntries(), path) catch {};
                 bad = true;
                 continue;
             },
@@ -76,15 +207,27 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         };
 
         if (stat.kind == .directory) {
-            try ctx.err.print(
-                "error: directories are not supported yet: '{s}'\n",
-                .{path},
-            );
-            bad = true;
+            const trimmed = std.mem.trimRight(u8, path, "/");
+            const rel_dir = if (std.mem.eql(u8, trimmed, ".")) "" else trimmed;
+            expandDirectory(inv.alloc, opened.repo.root, rel_dir, &expanded, &owned, &seen) catch |err| {
+                try ctx.err.print("error: could not read directory '{s}': {s}\n", .{ path, @errorName(err) });
+                bad = true;
+            };
+            continue;
         }
+
+        try expanded.append(inv.alloc, path);
     }
 
     if (bad) return error.InvalidPath;
+
+    if (expanded.items.len == 0) {
+        try ctx.out.writeAll("nothing to stage\n");
+        return;
+    }
+
+    // Stable, predictable ordering regardless of directory-walk order.
+    std.mem.sort([]const u8, expanded.items, {}, lessThanPath);
 
     if (patch) {
         if (dry_run) {
@@ -97,20 +240,20 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         return runPatch(
             ctx,
             opened.repo,
-            paths.items,
+            expanded.items,
             context_lines,
         );
     }
 
-    // Determine the staging action up front so dry-run and the real
-    // operation report the same result.
+    // Determine the staging action up front so dry-run, the success
+    // output, and the real operation all agree on what happened.
     var actions = try inv.alloc.alloc(
         StageAction,
-        paths.items.len,
+        expanded.items.len,
     );
     defer inv.alloc.free(actions);
 
-    for (paths.items, 0..) |path, i| {
+    for (expanded.items, 0..) |path, i| {
         actions[i] = if (opened.repo.staging.lookup(path) == null)
             .added
         else
@@ -118,7 +261,7 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     }
 
     if (dry_run) {
-        for (paths.items, 0..) |path, i| {
+        for (expanded.items, 0..) |path, i| {
             try ctx.out.print(
                 "would {s:<8} {s}\n",
                 .{ actions[i].label(), path },
@@ -127,8 +270,22 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         return;
     }
 
-    opened.repo.add(paths.items) catch |err|
+    opened.repo.add(expanded.items) catch |err|
         return errors_mod.report(ctx, err);
+
+    // Real, non-dry-run staging used to exit silently on success —
+    // confirm what actually happened instead of leaving the caller to
+    // go run `status` to find out.
+    for (expanded.items, 0..) |path, i| {
+        try ctx.out.print(
+            "{s:<8} {s}\n",
+            .{ actions[i].pastLabel(), path },
+        );
+    }
+    try ctx.out.print(
+        "\n{d} path{s} staged\n",
+        .{ expanded.items.len, if (expanded.items.len == 1) "" else "s" },
+    );
 }
 
 /// Interactive hunk staging.
@@ -178,9 +335,15 @@ fn runPatch(
 pub const command = Command{
     .name = "stage",
     .description = "Stage changes from one or more paths.",
-    .usage = "[options] ...",
+    .usage = "[options] [<path>|<dir>...]",
     .category = .staging,
     .flags = &.{
+        .{
+            .short = 'A',
+            .long = "all",
+            .kind = .boolean,
+            .help = "Restage every already-tracked path with a pending modification. Use a directory path (or '.') to also pick up new, never-staged files.",
+        },
         .{
             .short = 'n',
             .long = "dry-run",
