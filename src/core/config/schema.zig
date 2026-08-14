@@ -27,6 +27,13 @@ pub const Schema = struct {
     @"commit.no_body_trailers": ?bool = null,
 };
 
+pub fn isKnownKey(key: []const u8) bool {
+    inline for (std.meta.fields(Schema)) |field| {
+        if (std.mem.eql(u8, key, field.name)) return true;
+    }
+    return false;
+}
+
 pub fn reflect(comptime T: type, cf: *const ConfigFormat) !T {
     var result: T = .{};
     inline for (std.meta.fields(T)) |field| {
