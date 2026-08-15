@@ -3,6 +3,7 @@ const Command = @import("command.zig").Command;
 const Category = @import("command.zig").Category;
 
 const init = @import("../cmds/init.zig");
+const config = @import("../cmds/config.zig");
 const stage = @import("../cmds/stage.zig");
 const status = @import("../cmds/status.zig");
 const diff = @import("../cmds/diff.zig");
@@ -20,6 +21,7 @@ const mv = @import("../cmds/mv.zig");
 /// correctly in `merk help`
 pub const commands: []const Command = &[_]Command{
     init.command,
+    config.command,
     stage.command,
     unstage.command,
     mv.command,

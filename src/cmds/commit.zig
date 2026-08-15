@@ -14,6 +14,7 @@ const errors_mod = @import("../cli/errors.zig");
 const commit_mod = @import("../core/commit.zig");
 const metadata_mod = @import("../core/commit/metadata.zig");
 const message_mod = @import("../core/commit/message.zig");
+const config_mod = @import("../core/config/config.zig");
 
 const Intent = metadata_mod.Intent;
 const IntentTag = metadata_mod.IntentTag;
@@ -102,18 +103,6 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         return error.EmptyMessage;
     }
 
-    const intent_raw = inv.flags.string("intent") orelse "feature";
-    const intent = parseIntent(intent_raw);
-
-    const author_name = inv.flags.string("author") orelse
-        std.posix.getenv("merk_AUTHOR_NAME") orelse
-        std.posix.getenv("USER") orelse
-        "unknown";
-
-    const author_email = inv.flags.string("author-email") orelse
-        std.posix.getenv("merk_AUTHOR_EMAIL") orelse
-        "unknown@local";
-
     const author_date: i64 = blk: {
         const raw = inv.flags.string("date") orelse inv.flags.string("author-date") orelse break :blk 0;
         break :blk parseTimestamp(raw) orelse {
@@ -129,8 +118,6 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     // --committer* flags — otherwise CommitRequest mirrors committer from
     // author (same "committer defaults to author" behavior the old code
     // had, just resolved by the request layer now instead of here).
-    const committer_name = inv.flags.string("committer") orelse inv.flags.string("committer-name");
-    const committer_email = inv.flags.string("committer-email");
     const committer_date_raw = inv.flags.string("committer-date");
 
     const committer_timestamp_ms: ?i64 = if (committer_date_raw) |raw|
@@ -143,6 +130,14 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         }
     else
         null;
+
+    const opened = try repo_context.open(ctx);
+    defer opened.deinit(ctx.alloc);
+
+    const user_config_path = try config_mod.defaultUserConfigPath(inv.alloc);
+    defer if (user_config_path) |path| inv.alloc.free(path);
+    var config = try config_mod.Config.load(inv.alloc, user_config_path, opened.repo.fs);
+    defer config.deinit();
 
     const label_raw = inv.flags.string("label");
 
@@ -165,7 +160,8 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
 
     //  body-embedded trailers (parsed first so --trailer flags can override/append).
     const body_raw = inv.flags.string("body") orelse "";
-    const skip_body_trailers = inv.flags.boolean("no-body-trailers");
+    const skip_body_trailers = inv.flags.boolean("no-body-trailers") or
+        (config.settings.@"commit.no_body_trailers" orelse false);
 
     const body: []const u8 = if (!skip_body_trailers)
         try TrailerInfo.parseTrailingBlock(inv.alloc, body_raw, &trailer_list)
@@ -230,8 +226,21 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
         return err;
     };
 
-    const opened = try repo_context.open(ctx);
-    defer opened.deinit(ctx.alloc);
+    const intent_raw = inv.flags.string("intent") orelse config.settings.@"commit.intent" orelse "feature";
+    const intent = parseIntent(intent_raw);
+    const author_name = inv.flags.string("author") orelse
+        config.settings.@"commit.author" orelse
+        config.settings.@"identity.name" orelse
+        std.posix.getenv("merk_AUTHOR_NAME") orelse
+        std.posix.getenv("USER") orelse
+        "unknown";
+    const author_email = inv.flags.string("author-email") orelse
+        config.settings.@"commit.author_email" orelse
+        config.settings.@"identity.email" orelse
+        std.posix.getenv("merk_AUTHOR_EMAIL") orelse
+        "unknown@local";
+    const committer_name = inv.flags.string("committer") orelse inv.flags.string("committer-name") orelse config.settings.@"commit.committer";
+    const committer_email = inv.flags.string("committer-email") orelse config.settings.@"commit.committer_email";
 
     if (opened.repo.staging.allEntries().len == 0) {
         try ctx.err.print("error: nothing to commit (staging is empty — run `merk snapshot <path>` first)\n", .{});
