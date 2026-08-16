@@ -185,6 +185,11 @@ const test_groups = [_]TestGroup{
                 .path = "src/core/history.zig",
             },
             .{
+                .name = "test-config",
+                .desc = "Run repo config unit tests",
+                .path = "src/core/config/config.zig",
+            },
+            .{
                 .name = "test-repo",
                 .desc = "Run repo unit tests",
                 .path = "src/core/repository.zig",
