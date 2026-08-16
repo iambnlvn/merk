@@ -5,8 +5,6 @@ It focuses on a clean core/CLI separation, structured commit metadata, and an ex
 
 If you know git, you already know most of merk's mental model. A few things are deliberately different — see [Terminology](#terminology-if-youre-coming-from-git) below before you go looking for `branch` or `HEAD`.
 
-> **Status note:** configuration (default identity, default diff settings, aliases) is under active development and not implemented yet — see [Configuration](#configuration-work-in-progress).
-
 ## Features
 
 - Content-addressed object store using BLAKE3
@@ -56,6 +54,19 @@ Initialize a new repository (default: current directory).
 
 - `-f`, `--force` — reinitialize an existing repository (resets the current position and index; does **not** delete existing objects or commits)
 - `-q`, `--quiet` — only print errors and warnings
+
+#### `merk config [--global] <setting> [value]`
+
+Read or set a configuration value. Repository settings are stored in
+`.merk/config/settings`; add `--global` to store a default in
+`$XDG_CONFIG_HOME/merk/config` (or `~/.config/merk/config`).
+
+For example: `merk config --global name "Ada Lovelace"` and
+`merk config --global email "ada@example.com"`. Run `merk config help`
+to see every available setting.
+
+Repository values override global ones. A configured identity is used for new
+commits unless the corresponding commit flag is supplied.
 
 ### Staging
 
@@ -205,18 +216,17 @@ It covers, roughly:
 
 If you're adding a new command or flag, extending this harness alongside the unit tests is the easiest way to catch cross-cutting bugs a unit test in isolation wouldn't — several real bugs (including a crash-free-but-wrong default-identity path on commit) were only found by driving the real binary this way.
 
-## Configuration (work in progress)
+## Configuration
 
-A configuration module is currently under active development and isn't implemented yet — there's no config file merk reads today, and every example in this README that doesn't pass `--author`/`--author-email` explicitly is relying on whatever default identity resolution exists in the meantime.
+`merk config help` lists every available setting. The most useful are:
 
-The intent, once it lands, is a `.merk/config` (repository-level) with a user-level fallback, covering at minimum:
+- `name`, `email` — default author identity
+- `author-name`, `author-email` — commit-specific author defaults
+- `committer-name`, `committer-email`, `intent`, `no-body-trailers`
+- `channel`, `ignore`, `sign-history`
 
-- Default author/committer identity, so `commit` doesn't require `--author-email` on every invocation
-- Default diff algorithm and render profile (today's defaults — `histogram`, `unified` — are hardcoded)
-- Color preferences (today's `--color`/`--no-color` are per-invocation only)
-- Command aliases
-
-If you're interested in this piece specifically, it's a good area to check in on before starting — the shape above is a starting intent, not a finalized design.
+Settings are layered: repository configuration (`.merk/config/settings`) wins over the
+user configuration file. Commit flags win over either configuration layer.
 
 ## Planned
 

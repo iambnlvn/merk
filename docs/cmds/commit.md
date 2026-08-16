@@ -56,7 +56,7 @@ object and advances the current channel ref to point at it. Each commit carries:
 The index must be non-empty. Stage files first:
 
 ```
-merk add <path>
+merk stage <path>
 ```
 
 Running `merk commit` against an empty index returns an error immediately.
