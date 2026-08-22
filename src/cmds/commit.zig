@@ -230,15 +230,16 @@ pub fn run(ctx: Context, inv: *Invocation) !void {
     const intent = parseIntent(intent_raw);
     const author_name = inv.flags.string("author") orelse
         config.settings.@"commit.author" orelse
-        config.settings.@"identity.name" orelse
-        std.posix.getenv("merk_AUTHOR_NAME") orelse
-        std.posix.getenv("USER") orelse
-        "unknown";
+        config.settings.@"identity.name" orelse {
+        try ctx.err.writeAll("error: author name is not configured; run `merk config --global name \"Your Name\"` or pass --author\n");
+        return error.MissingAuthorName;
+    };
     const author_email = inv.flags.string("author-email") orelse
         config.settings.@"commit.author_email" orelse
-        config.settings.@"identity.email" orelse
-        std.posix.getenv("merk_AUTHOR_EMAIL") orelse
-        "unknown@local";
+        config.settings.@"identity.email" orelse {
+        try ctx.err.writeAll("error: author email is not configured; run `merk config --global email \"you@example.com\"` or pass --author-email\n");
+        return error.MissingAuthorEmail;
+    };
     const committer_name = inv.flags.string("committer") orelse inv.flags.string("committer-name") orelse config.settings.@"commit.committer";
     const committer_email = inv.flags.string("committer-email") orelse config.settings.@"commit.committer_email";
 
@@ -387,13 +388,13 @@ pub const command = Command{
             .long = "author",
             .kind = .value,
             .value_name = "name",
-            .help = "author name  ($merk_AUTHOR_NAME / $USER fallback)",
+            .help = "author name  (overrides configured identity)",
         },
         .{
             .long = "author-email",
             .kind = .value,
             .value_name = "addr",
-            .help = "author email  ($merk_AUTHOR_EMAIL fallback)",
+            .help = "author email  (overrides configured identity)",
         },
         .{
             .long = "author-date",
